@@ -1,0 +1,251 @@
+import { refreshMediaTask } from './media-task-sync.mjs';
+import { publicImageTask, imageUrls, fetchResultImage } from './image-results.mjs';
+import { adaptModelRequest } from './model-catalog.mjs';
+import { reserveRequest, settleRequest } from './billing.mjs';
+import { customerOrigin } from './customer-auth.mjs';
+import { randomUUID } from 'node:crypto';
+import { checkDesktopSession } from './desktop.mjs';
+import { Readable } from 'node:stream';
+import { hash, httpError, RateLimiter } from './security.mjs';
+import { UsageReader, extractUsage, extractBillingUsage } from './usage.mjs';
+import { estimateTextCost } from './text-pricing.mjs';
+import { agentRequest, agentResponse, agentHeaders } from './agent-protocols.mjs';
+import { uuid } from './validation.mjs';
+import { listRequests } from './admin.mjs';
+import { audioRequest } from './audio.mjs';
+import { imageUpload } from './image-upload.mjs';
+
+async function boundedJson(response, max = 8_000_000) {
+  const chunks = []; let size = 0;
+  for await (const chunk of response.body) {
+    size += chunk.length;
+    if (size > max) throw new Error('upstream_response_too_large');
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+function stable(value) {
+  if (Array.isArray(value)) return value.map(stable);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map((k) => [k, stable(value[k])]));
+  return value;
+}
+export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, origin, requestTimeoutMs = 180_000 }) {
+  const limiter = new RateLimiter();
+  app.decorateRequest('apiUser', null);
+  app.addHook('onRequest', async (req) => {
+    if (!req.url.startsWith('/v1/') && !req.url.startsWith('/api/me/')) return;
+    if(req.url.startsWith('/api/me/')&&!req.headers.authorization&&customerAuth){
+      if(!['GET','HEAD'].includes(req.method)&&![origin,customerOrigin].includes(req.headers.origin))throw httpError(403,'origin_denied');
+      req.apiUser=await customerAuth.identify(req.headers);
+      limiter.take('all:'+req.apiUser.id,120);
+      return;
+    }
+    const header = req.headers.authorization ?? (req.url.startsWith('/v1/messages')&&typeof req.headers['x-api-key']==='string' ? 'Bearer '+req.headers['x-api-key'] : undefined);
+    if (typeof header !== 'string' || !/^Bearer ipz_[A-Za-z0-9_-]{43}$/.test(header)) throw httpError(401,'invalid_api_token');
+    const tokenHash = hash(header.slice(7));
+    const { rows } = await db.query(`SELECT u.id,u.name,u.rpm,t.rpm AS token_rpm,t.id AS token_id,t.auth_session_id,t.plugin_id FROM access_tokens t
+      JOIN users u ON u.id=t.user_id WHERE t.token_hash=$1 AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at>now()) AND u.enabled`, [tokenHash]);
+    if (!rows.length) throw httpError(401,'invalid_api_token');
+    await checkDesktopSession(db,rows[0]);
+    if(rows[0].plugin_id && req.url.startsWith('/api/me/'))throw httpError(403,'plugin_scope_denied');
+    req.apiUser = rows[0];
+    limiter.take('all:' + rows[0].id, 120);
+    if (req.method === 'POST') {limiter.take('chat:' + rows[0].id, rows[0].rpm);if(rows[0].token_rpm)limiter.take('key:'+rows[0].token_id,rows[0].token_rpm);}
+  });
+  app.get('/v1/models', async () => {
+    const { rows } = await db.query(`SELECT DISTINCT unnest(k.models) AS model FROM upstream_keys k
+      JOIN upstream_accounts a ON a.id=k.account_id WHERE k.enabled AND a.enabled ORDER BY model`);
+    return { object: 'list', data: rows.map((r) => ({ id:r.model, object:'model', owned_by:'ipzsk' })) };
+  });
+  app.get('/api/me/usage', async (req) => {
+    const records = await listRequests(db, req.query, req.apiUser.id);
+    // Public user responses do not expose the upstream pool's identity.
+    records.rows = records.rows.map(({ key_name, upstream_id, cost_cny, cost_reference, cost_recorded_at, estimated_cost_cny, pricing_details, ...row }) => row);
+    const summary = (await db.query(`SELECT count(*) AS requests,coalesce(sum(input_tokens),0) AS input_tokens,
+      coalesce(sum(output_tokens),0) AS output_tokens,coalesce(sum(total_tokens),0) AS total_tokens,
+      count(*) FILTER(WHERE usage_state='unknown') AS unknown FROM requests WHERE user_id=$1`, [req.apiUser.id])).rows[0];
+    return { ...records, summary };
+  });
+  app.get('/v1/tasks/:id/image/:index', async (req,reply) => {
+    const id=uuid(req.params.id);
+    if(!/^[0-9]{1,2}$/.test(req.params.index))throw httpError(404,'image_not_found');
+    const task=(await db.query(`SELECT t.result FROM media_tasks t JOIN requests r ON r.id=t.id
+      WHERE t.id=$1 AND r.user_id=$2 AND t.status='completed' AND ($3::uuid IS NULL OR r.plugin_id=$3)`,[id,req.apiUser.id,req.apiUser.plugin_id??null])).rows[0];
+    const url=imageUrls(task?.result)[Number(req.params.index)];
+    if(!url)throw httpError(404,'image_not_found');
+    const image=await fetchResultImage(url);
+    return reply.type(image.type).send(image.body);
+  });
+  app.get('/v1/tasks/:id', async (req) => {
+    const id=uuid(req.params.id);
+    const task=(await db.query(`SELECT t.*,k.secret_ref FROM media_tasks t
+      JOIN requests r ON r.id=t.id JOIN upstream_keys k ON k.id=r.key_id
+      WHERE t.id=$1 AND r.user_id=$2 AND ($3::uuid IS NULL OR r.plugin_id=$3)`,[id,req.apiUser.id,req.apiUser.plugin_id??null])).rows[0];
+    if(!task)throw httpError(404,'task_not_found');
+    await refreshMediaTask(db,upstream,id).catch(()=>{});
+    const saved=(await db.query('SELECT status,result FROM media_tasks WHERE id=$1',[id])).rows[0];
+    return {code:200,data:publicImageTask(saved.result??{id,status:saved.status,progress:0,result:null},origin)};
+  });
+  app.addContentTypeParser(/^multipart\/form-data(?:;|$)/i,{parseAs:'buffer'},(req,body,done)=>{
+    if(!['/v1/audio/transcriptions','/v1/images/edits','/v1/images/generations'].includes(req.url.split('?')[0]))return done(httpError(415,'unsupported_content_type'));
+    done(null,body);
+  });
+  for (const routePath of ['/v1/chat/completions','/v1/responses','/v1/messages','/v1/images/generations','/v1/images/edits','/v1/videos/generations','/v1/audio/transcriptions']) app.post(routePath, {bodyLimit:routePath==='/v1/audio/transcriptions'?26_000_000:32_000_000}, async (req, reply) => {
+    const path=routePath==='/v1/images/edits'?'/v1/images/generations':routePath;
+    const image=path==='/v1/images/generations'&&Buffer.isBuffer(req.body)?await imageUpload(req.body,req.headers['content-type']):null;
+    if(routePath==='/v1/images/edits'&&!image)throw httpError(400,'invalid_image_upload');
+    const audio=path==='/v1/audio/transcriptions'?await audioRequest(req.body,req.headers['content-type']):null;
+    const body = audio?.metadata??adaptModelRequest(path,agentRequest(path,image??req.body));
+    let plugin;
+    if(req.apiUser.plugin_id){
+      plugin=(await db.query('SELECT id,publisher_ref,allowed_models,owner_user_id,revenue_share_bps FROM plugins WHERE id=$1 AND enabled',[req.apiUser.plugin_id])).rows[0];
+      if(!plugin || !plugin.allowed_models.includes(body.model))throw httpError(403,'plugin_model_denied');
+    }
+    const protocolHeaders=agentHeaders(path,req.headers);
+    if(audio)protocolHeaders['Content-Type']=audio.contentType;
+    const id = randomUUID(), started = Date.now();
+    const idempotency = req.headers['idempotency-key'] ?? null;
+    if (idempotency !== null && (typeof idempotency !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(idempotency))) {
+      throw httpError(400,'invalid_idempotency_key');
+    }
+    const fingerprint = hash(JSON.stringify(stable({path,body,...(plugin?{plugin_id:plugin.id}:{})})));
+    const inserted = await db.query(`INSERT INTO requests (id,user_id,model,idempotency_key,fingerprint,stream,access_token_id,plugin_id,plugin_publisher_ref,plugin_owner_user_id,plugin_share_bps)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(user_id,idempotency_key) DO NOTHING RETURNING id`,
+    [id,req.apiUser.id,body.model,idempotency,fingerprint,body.stream,req.apiUser.token_id,plugin?.id??null,plugin?.publisher_ref??null,plugin?.owner_user_id??null,plugin?.revenue_share_bps??null]);
+    if (!inserted.rowCount) {
+      const old = (await db.query('SELECT id,fingerprint,status FROM requests WHERE user_id=$1 AND idempotency_key=$2',
+        [req.apiUser.id,idempotency])).rows[0];
+      reply.header('X-Request-Id', old.id);
+      return reply.code(409).send({ error: { code:old.fingerprint === fingerprint ? 'request_already_received' : 'idempotency_conflict',
+        message:'Request already recorded; inspect its status before retrying.', request_id:old.id, status:old.status } });
+    }
+    reply.header('X-Request-Id',id);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(new Error('request_timeout')), requestTimeoutMs);
+    const disconnect = () => { if (!reply.raw.writableFinished) controller.abort(new Error('client_disconnected')); };
+    reply.raw.on('close', disconnect);
+    let lease, attemptId, submitted = false, finalized = false;
+    let upstreamId, httpStatus, observedUsage,billingUsage,responseTier;
+    const cleanup = () => { clearTimeout(timeout); reply.raw.off('close',disconnect); lease?.release(); if (submitted) upstream.refreshSoon(); };
+    const finalize = async (status, usage, errorCode = null) => {
+      if (finalized) return;
+      const estimate=estimateTextCost(body.model,billingUsage,{status,serviceTier:responseTier??body.service_tier,
+        billableTools:body.tools?.some(t=>typeof t.type==='string'&&t.type!=='function')});
+      // Commit before setting finalized, so an uncertain result remains visible on failure.
+      await db.tx(async (c) => {
+        await c.query(`UPDATE requests SET status=$2,usage_state=$3,input_tokens=$4,output_tokens=$5,total_tokens=$6,
+          upstream_id=$7,upstream_http=$8,error_code=$9,duration_ms=$10,completed_at=now(),
+          estimated_cost_cny=$11,pricing_details=$12 WHERE id=$1`,
+        [id,status,usage ? 'reported' : (submitted ? 'unknown' : 'not_executed'),usage?.input ?? null,
+          usage?.output ?? null,usage?.total ?? null,upstreamId ?? null,httpStatus ?? null,errorCode,Date.now()-started,
+          estimate.amount,JSON.stringify(estimate.details)]);
+        await settleRequest(c,id,{status,submitted,usage:billingUsage,serviceTier:responseTier??body.service_tier,billableTools:body.tools?.some(t=>t.type!=='function')});
+        if (attemptId) await c.query(`UPDATE request_attempts SET upstream_id=$2,http_status=$3,error_code=$4,
+          usage=$5,completed_at=now() WHERE id=$1`, [attemptId,upstreamId ?? null,httpStatus ?? null,errorCode,usage ? JSON.stringify(usage) : null]);
+      });
+      finalized = true;
+    };
+    try {
+      await reserveRequest(db,id,req.apiUser.id,body,path);
+      lease = await scheduler.acquire(() => upstream.candidates(body.model), controller.signal);
+      controller.signal.throwIfAborted();
+      const stillValid = await db.query(`SELECT t.id,t.user_id,t.auth_session_id,t.plugin_id FROM access_tokens t JOIN users u ON u.id=t.user_id
+        WHERE t.id=$1 AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at>now()) AND u.enabled`, [req.apiUser.token_id]);
+      if (!stillValid.rowCount) throw httpError(401,'invalid_api_token');
+      await checkDesktopSession(db,stillValid.rows[0]);
+      attemptId = randomUUID();
+      await db.tx(async (c) => {
+        await c.query('UPDATE access_tokens SET last_used_at=now() WHERE id=$1',[req.apiUser.token_id]);
+        await c.query("UPDATE requests SET status='running',key_id=$2 WHERE id=$1", [id,lease.row.id]);
+        await c.query('INSERT INTO request_attempts (id,request_id,key_id) VALUES ($1,$2,$3)', [attemptId,id,lease.row.id]);
+      });
+      const payload = { ...body };
+      const media=path==='/v1/images/generations'||path==='/v1/videos/generations';
+      if(media)delete payload.stream;
+      // Require usage for SSE. Models that omit it remain explicitly unverified.
+      if (payload.stream && path==='/v1/chat/completions') payload.stream_options = { ...payload.stream_options, include_usage:true };
+      submitted = true;
+      const response = await upstream.request(lease.row.secret_ref, path, {
+        method:'POST', body:audio?.payload??JSON.stringify(payload), headers:protocolHeaders, signal:controller.signal,
+      });
+      httpStatus = response.status;
+      upstreamId = response.headers.get('x-oneapi-request-id')?.slice(0,200);
+      if (!response.ok) {
+        await response.body?.cancel();
+        await upstream.markFailure(lease.row,response.status,response.headers.get('retry-after'));
+        await finalize('failed',null,`upstream_http_${response.status}`);
+        cleanup();
+        const status = response.status === 429 ? 429 : 502;
+        return reply.code(status).send({ error: { code:`upstream_http_${response.status}`,message:'Upstream request failed.',request_id:id } });
+      }
+      if (body.stream) {
+        if (!response.headers.get('content-type')?.includes('text/event-stream')) {
+          await response.body?.cancel(); throw new Error('invalid_stream_response');
+        }
+        const parser = new UsageReader(path==='/v1/messages'?'messages':path==='/v1/responses'?'responses':'chat');
+        reply.type('text/event-stream').header('Cache-Control','no-store').header('X-Accel-Buffering','no');
+        async function* relay() {
+          let totalBytes = 0;
+          try {
+            for await (const chunk of response.body) {
+              totalBytes += chunk.length;
+              if (totalBytes > 16_000_000) throw new Error('upstream_response_too_large');
+              parser.push(chunk);
+              billingUsage=parser.billingUsage;responseTier=parser.serviceTier;
+              // The source and destination both use backpressure through Readable.from.
+              yield chunk;
+            }
+            parser.finish();
+            billingUsage=parser.billingUsage;responseTier=parser.serviceTier;
+            observedUsage = parser.usage;
+            upstreamId = parser.upstreamId ?? upstreamId;
+            const complete = parser.done && !parser.failed;
+            await finalize(complete ? 'succeeded' : 'uncertain',parser.usage,complete ? null : 'stream_incomplete');
+          } catch {
+            upstreamId = parser.upstreamId ?? upstreamId;
+            await finalize('uncertain',parser.usage,'stream_interrupted');
+          } finally {
+            if (!finalized) await finalize('uncertain',parser.usage,'stream_interrupted').catch(() => app.log.error({request_id:id},'accounting_failed'));
+            controller.abort(); cleanup();
+          }
+        }
+        const output = Readable.from(relay());
+        output.once('close', () => {
+          controller.abort();
+          if (!finalized) finalize('uncertain',parser.usage,'stream_interrupted')
+            .catch(() => app.log.error({request_id:id},'accounting_failed')).finally(cleanup);
+          else cleanup();
+        });
+        return reply.send(output);
+      }
+      if(audio&&!['json','verbose_json'].includes(body.response_format)){
+        const chunks=[];let size=0;
+        for await(const chunk of response.body){size+=chunk.length;if(size>8_000_000)throw new Error('upstream_response_too_large');chunks.push(chunk);}
+        await finalize('succeeded',null);cleanup();
+        return reply.type(body.response_format==='vtt'?'text/vtt; charset=utf-8':'text/plain; charset=utf-8').send(Buffer.concat(chunks).toString('utf8'));
+      }
+      const raw = await boundedJson(response);
+      const value = agentResponse(path,raw);
+      if(media) {
+        const taskId=value.data[0].task_id;
+        upstreamId=taskId;
+        await db.query('INSERT INTO media_tasks(id,upstream_task_id,kind) VALUES($1,$2,$3)',[id,taskId,path.includes('/images/')?'image':'video']);
+        await finalize('succeeded',null);
+        cleanup();
+        return reply.send({code:200,data:[{status:'submitted',task_id:id}]});
+      }
+      observedUsage = extractUsage(value);
+      billingUsage = extractBillingUsage(value);responseTier=value.service_tier;
+      upstreamId = typeof value.id === 'string' ? value.id.slice(0,200) : upstreamId;
+      await finalize('succeeded',observedUsage);
+      cleanup();
+      return reply.send(value);
+    } catch (error) {
+      await finalize(submitted ? 'uncertain' : 'failed',observedUsage,
+        submitted ? 'upstream_result_uncertain' : (error.statusCode ? error.code : 'request_cancelled'))
+        .catch(() => app.log.error({request_id:id},'accounting_failed'));
+      controller.abort(); cleanup();
+      throw httpError(submitted ? 502 : (error.statusCode ?? 408),submitted ? 'upstream_result_uncertain' : (error.code ?? 'request_cancelled'));
+    }
+  });
+}

@@ -1,0 +1,18 @@
+api.ipzsk.com {
+  header Strict-Transport-Security "max-age=31536000"
+  handle_path /downloads/* {
+    root * /srv/downloads
+    header Cache-Control "public, max-age=86400"
+    header Content-Disposition "attachment"
+    file_server
+  }
+  handle {
+   reverse_proxy gateway:3000 {
+    flush_interval -1
+    transport http {
+      dial_timeout 5s
+      response_header_timeout 190s
+    }
+  }
+  }
+}

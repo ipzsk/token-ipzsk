@@ -1,0 +1,106 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GPT 请求费用计算说明 · IPZSK</title><link rel="stylesheet" href="/admin/style.css"><body><main class="redeem-main"><a href="/admin">返回管理后台</a>
+<h1>GPT 请求费用计算说明</h1>
+<p>价格快照：2026-09-06，版本 `apimart-gpt-2026-09-06-v1`。</p>
+<p>来源：[APIMart 定价中心](https://apimart.ai/zh/pricing)，切换 LLM 后搜索 GPT，采用“我们的价格”。</p>
+<h2>记账单位与费用性质</h2>
+<p>页面按 Credits / 百万 token 报价，旁边的美元价格只是另一种显示。沿用本账户所有者确认的口径：1 Credit 在本后台记为 1 元；这不是美元兑人民币汇率，也不代表所有 APIMart 账户的充值成本相同。页面价格已经含 20% 优惠，不再乘一次 0.8。</p>
+<p>文字计算结果是价目表估算，保存在 estimated_cost_cny；上游返回或人工核对的实际费用保存在 cost_cny。两者分列展示，不覆盖、不相加，也不会自动扣减用户钱包。专属渠道折扣、调价、额外工具调用费用可能使实际账单不同。</p>
+<h2>每次请求如何复算</h2>
+<p>1. 使用提交给 APIMart 的精确模型 ID 查价，不用响应中可能被映射的模型名替换，也不模糊匹配未知版本。</p>
+<p>2. 从 usage 读取输入总数 I、输出总数 O、缓存命中 R、缓存写入 W。标准 OpenAI 协议中 R 和 W 属于输入总数，普通输入 U = I - R - W。</p>
+<p>3. 以完整输入总数 I（包含缓存）选择档位：I ≤ 272000 用普通档，I &gt; 272000 用长输入档。跨档后整次请求使用该档单价，不仅给超出部分加价。</p>
+<p>4. 费用（Credits）= (U × 输入单价 + R × 缓存输入单价 + W × 缓存写入单价 + O × 输出单价) / 1000000。按本账户口径得到元。</p>
+<p>5. 各项先精确相加，最后一次四舍五入到小数点后 8 位。系统使用 BigInt 定点计算，避免浮点累积误差。</p>
+<p>例如 gpt-5.6-sol：I=10000、R=6000、W=1000、O=2000，则 U=3000。</p>
+<p>`(3000×32 + 6000×3.2 + 1000×40 + 2000×160) / 1000000 = 0.47520000 元`</p>
+<p>同样 I=10000、O=2000，但无任何缓存，则为 `0.64000000 元`。</p>
+<p>长输入示例 I=273000、O=2000、无缓存：`(273000×64 + 2000×240)/1000000 = 17.95200000 元`。</p>
+<h2>用量字段与边界</h2>
+<p>- Chat Completions：I=prompt_tokens，O=completion_tokens，R=prompt_tokens_details.cached_tokens，W=prompt_tokens_details.cache_write_tokens。</p>
+<p>- Responses：I=input_tokens，O=output_tokens，R=input_tokens_details.cached_tokens，W=input_tokens_details.cache_write_tokens（若上游提供）。</p>
+<p>- Messages：input_tokens 通常不含缓存；系统先加 cache_read_input_tokens 和 cache_creation_input_tokens 得到 I，再拆分三个输入类别。</p>
+<p>- reasoning_tokens 已包含在输出总数中，不额外加一次；total_tokens 仅供统计，不可再单独计费。</p>
+<p>- 流式响应采用最后一份累计 usage，不能把每个事件的累计数相加。重复事件不会重复计算。</p>
+<p>- 缓存字段缺失时，以 0 估算，并在 pricing_details.warnings 明确记录假设；不把缺失值宣称为真实的零。</p>
+<p>- 如果已知有缓存命中/写入，但价目表没公布相应单价，保持待核实；不擅自借用另一模型或 OpenAI 官方价格。</p>
+<p>- 输入、输出或缓存数量异常；缓存之和超过输入；未知模型；非默认服务档；已识别的图片/音频 token；额外计费工具或搜索模型：不生成完整费用估算，记录原因。</p>
+<p>- 请求中断但已有 usage 时可记录估算，同时保留“请求结果不确定”提示；失败且无 usage 的请求不算作零元。</p>
+<p>- 这里仅收录 GPT/ChatGPT 文字模型。Realtime、语音转写、图片模型不套用文字公式；图片/视频任务仍按上游最终 credits_cost 记录实际费用。</p>
+<h2>在后台和程序中查看</h2>
+<p>后台“调用记录”同时显示实际扣费、估算费用。点击请求 ID 查看 pricing_details：包括价格版本、来源、模型、原始计费用量、拆分数量、选定档位、单价和假设。CSV 导出也包含这些字段。</p>
+<p>鉴权后的 GET /api/me/usage 可查询自己的记录；管理接口 GET /admin/api/requests/:id 可查看某次请求的完整计算依据。原模型响应协议保持兼容。</p>
+<p>本地复算（在 api-gateway 目录运行，Node.js 24）：</p>
+<pre><code>
+node ops/calculate-price.mjs gpt-5.6-sol 10000 2000 6000 1000
+
+</code></pre>
+<p>参数顺序为模型、输入总数、输出总数、缓存输入数、缓存写入数；缓存参数省略会留下“假设为零”的提示。</p>
+<h2>历史记录与调价</h2>
+<p>旧记录只保存了输入/输出总数，无法恢复真实缓存明细。补算使用本次价格快照并明确标注“历史用量按当前价目表估算、缓存按零假设”，不可当作历史实际账单。没有 usage 的记录仍待核实。已有实际金额不受影响。</p>
+<p>更新 src/gpt-prices.json 时必须重新核对来源、递增 version、更新日期、执行定价测试并部署。新请求使用新快照；已完成请求保存的单价和版本不会因调价而变化。本次没有启用自动抓价，避免上游页面变化直接改动账本。</p>
+<h2>提取的完整文字价表</h2>
+<p>单位：Credits / 百万 token。“—”表示页面未公布该项，并非免费。仅使用“我们的价格”，不重复折扣。</p>
+<p><a href="https://apimart.ai/zh/pricing">核对 APIMart 最新价格</a></p><table><thead><tr><th>模型 ID</th><th>输入档位</th><th>输入</th><th>缓存输入</th><th>缓存写入</th><th>输出</th></tr></thead><tbody>
+<tr><td>gpt-5-nano</td><td>全部</td><td>0.4</td><td>—</td><td>—</td><td>3.2</td></tr>
+<tr><td>gpt-5-nano-2025-08-07</td><td>全部</td><td>0.4</td><td>—</td><td>—</td><td>3.2</td></tr>
+<tr><td>gpt-4.1-nano</td><td>全部</td><td>0.8</td><td>—</td><td>—</td><td>3.2</td></tr>
+<tr><td>gpt-4.1-nano-2025-04-14</td><td>全部</td><td>0.8</td><td>—</td><td>—</td><td>3.2</td></tr>
+<tr><td>gpt-4o-mini</td><td>全部</td><td>1.2</td><td>—</td><td>—</td><td>4.8</td></tr>
+<tr><td>gpt-5.4-nano</td><td>全部</td><td>1.6</td><td>—</td><td>—</td><td>10</td></tr>
+<tr><td>gpt-5-mini</td><td>全部</td><td>2</td><td>—</td><td>—</td><td>16</td></tr>
+<tr><td>gpt-5-mini-2025-08-07</td><td>全部</td><td>2</td><td>—</td><td>—</td><td>16</td></tr>
+<tr><td>gpt-5.1-codex-mini</td><td>全部</td><td>2</td><td>—</td><td>—</td><td>16</td></tr>
+<tr><td>gpt-4.1-mini</td><td>全部</td><td>3.2</td><td>—</td><td>—</td><td>12.8</td></tr>
+<tr><td>gpt-4.1-mini-2025-04-14</td><td>全部</td><td>3.2</td><td>—</td><td>—</td><td>12.8</td></tr>
+<tr><td>gpt-3.5-turbo</td><td>全部</td><td>4</td><td>—</td><td>—</td><td>8</td></tr>
+<tr><td>gpt-3.5-turbo-0125</td><td>全部</td><td>4</td><td>—</td><td>—</td><td>8</td></tr>
+<tr><td>gpt-5.4-mini</td><td>全部</td><td>6</td><td>—</td><td>—</td><td>36</td></tr>
+<tr><td>gpt-3.5-turbo-1106</td><td>全部</td><td>8</td><td>—</td><td>—</td><td>16</td></tr>
+<tr><td>gpt-5</td><td>全部</td><td>10</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-5-2025-08-07</td><td>全部</td><td>10</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-5-chat-latest</td><td>全部</td><td>10</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-5-codex</td><td>全部</td><td>10</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-5-search-api</td><td>全部</td><td>10</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-5-search-api-2025-10-14</td><td>全部</td><td>10</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-5.1</td><td>全部</td><td>10</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-5.1-2025-11-13</td><td>全部</td><td>10</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-5.1-chat-latest</td><td>全部</td><td>10</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-5.1-codex</td><td>全部</td><td>10</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-5.1-codex-max</td><td>全部</td><td>10</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-3.5-turbo-0613</td><td>全部</td><td>12</td><td>—</td><td>—</td><td>24</td></tr>
+<tr><td>gpt-3.5-turbo-instruct</td><td>全部</td><td>12</td><td>—</td><td>—</td><td>15.96</td></tr>
+<tr><td>gpt-5.2</td><td>全部</td><td>14</td><td>—</td><td>—</td><td>112</td></tr>
+<tr><td>gpt-5.2-chat-latest</td><td>全部</td><td>14</td><td>—</td><td>—</td><td>112</td></tr>
+<tr><td>gpt-5.2-codex</td><td>全部</td><td>14</td><td>—</td><td>—</td><td>112</td></tr>
+<tr><td>gpt-5.3-codex</td><td>全部</td><td>14</td><td>—</td><td>—</td><td>112</td></tr>
+<tr><td>gpt-4.1</td><td>全部</td><td>16</td><td>—</td><td>—</td><td>64</td></tr>
+<tr><td>gpt-4.1-2025-04-14</td><td>全部</td><td>16</td><td>—</td><td>—</td><td>64</td></tr>
+<tr><td>gpt-4-32k</td><td>全部</td><td>20</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-4-32k-0613</td><td>全部</td><td>20</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-4-vision-preview</td><td>全部</td><td>20</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-4o</td><td>全部</td><td>20</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-4o-2024-11-20</td><td>全部</td><td>20</td><td>—</td><td>—</td><td>80</td></tr>
+<tr><td>gpt-3.5-turbo-16k</td><td>全部</td><td>24</td><td>—</td><td>—</td><td>72</td></tr>
+<tr><td>gpt-3.5-turbo-16k-0613</td><td>全部</td><td>24</td><td>—</td><td>—</td><td>72</td></tr>
+<tr><td>chatgpt-4o-latest</td><td>全部</td><td>40</td><td>—</td><td>—</td><td>120</td></tr>
+<tr><td>gpt-4o-2024-05-13</td><td>全部</td><td>40</td><td>—</td><td>—</td><td>120</td></tr>
+<tr><td>gpt-4-0125-preview</td><td>全部</td><td>80</td><td>—</td><td>—</td><td>160</td></tr>
+<tr><td>gpt-4-1106-preview</td><td>全部</td><td>80</td><td>—</td><td>—</td><td>160</td></tr>
+<tr><td>gpt-5-pro</td><td>全部</td><td>120</td><td>—</td><td>—</td><td>960</td></tr>
+<tr><td>gpt-5-pro-2025-10-06</td><td>全部</td><td>120</td><td>—</td><td>—</td><td>960</td></tr>
+<tr><td>gpt-5.2-pro</td><td>全部</td><td>168</td><td>—</td><td>—</td><td>1344</td></tr>
+<tr><td>gpt-4.5-preview</td><td>全部</td><td>600</td><td>—</td><td>—</td><td>1200</td></tr>
+<tr><td>gpt-4.5-preview-2025-02-27</td><td>全部</td><td>600</td><td>—</td><td>—</td><td>1200</td></tr>
+<tr><td>gpt-5.6-luna</td><td>≤272000</td><td>1.6</td><td>0.16</td><td>2</td><td>9.6</td></tr>
+<tr><td>gpt-5.6-luna</td><td>&gt;272000</td><td>3.2</td><td>0.32</td><td>4</td><td>14.4</td></tr>
+<tr><td>gpt-5.6-terra</td><td>≤272000</td><td>16</td><td>1.6</td><td>20</td><td>96</td></tr>
+<tr><td>gpt-5.6-terra</td><td>&gt;272000</td><td>32</td><td>3.2</td><td>40</td><td>144</td></tr>
+<tr><td>gpt-5.6-sol</td><td>≤272000</td><td>32</td><td>3.2</td><td>40</td><td>160</td></tr>
+<tr><td>gpt-5.6-sol</td><td>&gt;272000</td><td>64</td><td>6.4</td><td>80</td><td>240</td></tr>
+<tr><td>gpt-5.4</td><td>≤272000</td><td>20</td><td>2</td><td>—</td><td>120</td></tr>
+<tr><td>gpt-5.4</td><td>&gt;272000</td><td>40</td><td>4</td><td>—</td><td>180</td></tr>
+<tr><td>gpt-5.5</td><td>≤272000</td><td>40</td><td>4</td><td>—</td><td>240</td></tr>
+<tr><td>gpt-5.5</td><td>&gt;272000</td><td>80</td><td>8</td><td>—</td><td>360</td></tr>
+<tr><td>gpt-5.4-pro</td><td>≤272000</td><td>240</td><td>—</td><td>—</td><td>1440</td></tr>
+<tr><td>gpt-5.4-pro</td><td>&gt;272000</td><td>480</td><td>—</td><td>—</td><td>2160</td></tr>
+</tbody></table></main></body></html>

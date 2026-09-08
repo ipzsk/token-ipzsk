@@ -1,0 +1,169 @@
+# IPZSK API 网关
+
+IPZSK 平台后端：号池调度、统一账户、模型代理、钱包计费、插件审核与开发者用量归属。
+
+源码仓库：`JayceHuang/ipzsk-api-gateway`。本地目录：`/Users/jaycehuang/Projects/ipzsk-api-gateway`。服务器目录仍为 `/home/ubuntu/api-gateway`。
+
+Codex 分工与操作步骤见 [Codex 开发执行手册](docs/CODEX-DEVELOPMENT.md)，开发入口见 [开发指南](docs/DEVELOPMENT.md)，AI 协作规则见 [AGENTS.md](AGENTS.md)。下文包含历史追加记录，当前行为请结合较新的专门文档和源码核对。
+
+独立仓库中的 Node.js 服务，管理 APIMart 号池、账户余额、用户访问凭证和文本调用用量。前端使用原生 HTML/CSS/JavaScript，后端模块为原生 ESM，避免增加前端构建链。数据库使用 PostgreSQL，入口使用 Caddy。
+
+## 功能
+
+- 管理员登录、12 小时会话、同源写请求检查、登录限流。
+- 上游账户分组，Key 新增/启停/模型配置，账户与 Key 两级并发限制。
+- 用户创建、停用、限流与访问凭证轮换；凭证完整值只显示一次。
+- OpenAI 格式 `/v1/chat/completions`、`/v1/responses` 与 Anthropic `/v1/messages`，支持原生工具调用和 SSE；`/v1/models` 返回已开放模型。
+- 图片/视频异步生成与用户隔离的 `/v1/tasks/:id` 查询；`/v1/audio/transcriptions` 支持最大 25 MB 的音频文件，返回 JSON、纯文本或字幕。
+- 输入/输出/总 token、请求归属、状态、耗时、上游尝试记录。
+- 账户去重的余额同步；区分未知余额、无限 Key 额度、过期快照。
+- 查询筛选、分页和最多 10,000 行 CSV 导出，CSV 单元格公式防护。
+- Docker 持久化、日志轮转、数据库备份脚本和每日 systemd 定时器。
+
+已支持兑换码充值入账，尚未实现在线支付和自动扣费。token 统计不等同于财务账本。新增工作台协议已通过隔离环境测试，正式环境尚未发布；生产模型仍须在号池中显式开放。仅部署一个网关进程；内存队列不能用于多副本部署。
+
+## 本地检查
+
+```sh
+npm ci --ignore-scripts
+npm rebuild skia-canvas
+npm test
+```
+
+集成测试需要独立的 `gateway_test` PostgreSQL 数据库，应用角色必须有创建 schema 的权限。每次测试创建随机 schema，并在结束时删除该测试 schema。绝不使用生产 `gateway` 数据库作为测试目标。
+
+```sh
+# TEST_DB_PASSWORD 由本地安全方式注入，不写到仓库。
+TEST_DB_HOST=127.0.0.1 TEST_DB_PORT=5432 npm run test:integration
+```
+
+## 服务器部署
+
+工作目录 `/home/ubuntu/api-gateway`。部署只上传本目录源码、锁文件和运维文件，禁止上传或覆盖已有 `secrets/`、`backups/`。
+
+```sh
+python3 ops/prepare-secrets.py
+sudo docker compose up -d --build
+sudo docker compose ps
+```
+
+准备脚本仅生成缺失的随机凭证，不打印或覆盖已有凭证。首次运行将先前单独保存的 APIMart 凭证移至 `secrets/upstream/apimart-primary.key`，容器启动时自动导入；默认仅开放 `gpt-4o-mini`，其他模型在号池设置中显式添加并联调。
+
+- 管理入口：`https://api.ipzsk.com/admin`
+- 管理员用户名：`admin`
+- 初始随机密码：服务器 `secrets/admin-password`，由管理员在自己的终端查看。
+- 应用数据库密码：`secrets/db-password`。
+- 数据库管理员密码：`secrets/db-admin-password`，与应用密码独立。
+- 上游 Key 文件：`secrets/upstream/*.key`，文件权限 600，目录 700。
+
+网关容器以 UID 1000 运行，与服务器 ubuntu 用户匹配。上游凭证目录可写，以支持面板录入；应用源码只读，其他秘密文件只读挂载。数据库无宿主机端口，网关的 3000 端口仅绑定宿主机回环地址，80/443 由 Caddy 对外服务。
+
+DNS A 记录 `api.ipzsk.com` 应指向 `43.135.34.238`，腾讯云防火墙放行 TCP 80/443。Caddy 自动申请证书，HTTP 自动跳转 HTTPS。初次证书申请可能需要短暂等待。
+
+## 客户端接入
+
+在面板“用户管理”创建用户，将生成的平台凭证交给对应用户。客户端 Base URL 使用 `https://api.ipzsk.com/v1`，API Key 使用平台的 `ipz_` 凭证。上游 APIMart Key 不发送给客户端。
+
+```http
+POST /v1/chat/completions
+Authorization: Bearer <平台用户凭证>
+Content-Type: application/json
+Idempotency-Key: <本次业务请求的唯一标识>
+
+{"model":"gpt-4o-mini","messages":[{"role":"user","content":"你好"}],"stream":true}
+```
+
+流式请求自动附加 `stream_options.include_usage=true`。默认最大输出 4096 token，允许显式指定不超过 32768 的上限；整个请求最长 180 秒。模型未返回 usage 时显示“用量待核实”，不会用零冒充真实消费。
+
+幂等键按用户隔离。同键重试返回 409 和原 request_id，不重放上游调用，也不缓存用户正文以重放响应；客户端应查询 `/api/me/usage` 确认结果。成功、失败和结果不明确的请求均保留记录。当前实现采取保守策略，不自动重试已提交的上游请求。
+
+账户/Key 并发初始为 3，不代表 APIMart 确认的额度。等待队列最多 30 个，等待不超过约 15 秒。余额每 2 分钟同步，调用完成后合并触发约 5 秒后的刷新；超过 10 分钟无成功余额快照的渠道暂停接收新请求。
+
+余额以 APIMart 原始单位显示。上游账户累计消费可能包含其他客户端和接入前消费，不能归因到本站用户。本网关只用响应 usage 统计 token，不用账户余额差额计算单条请求费用。
+
+## 备份和恢复
+
+```sh
+sudo bash ops/backup.sh
+sudo install -m 644 ops/ipzsk-backup.service /etc/systemd/system/ipzsk-backup.service
+sudo install -m 644 ops/ipzsk-backup.timer /etc/systemd/system/ipzsk-backup.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now ipzsk-backup.timer
+```
+
+每天中国标准时间 03:15 创建只对管理员可读的 PostgreSQL 自定义格式备份，并校验归档目录。默认保留备份，不自动删除。定期检查磁盘容量。
+
+恢复应先创建独立的空数据库，再用 `pg_restore --no-owner --no-privileges --exit-on-error` 导入指定备份，验证用户、Key 元数据与请求记录完整后再考虑切换。不要直接恢复覆盖正在运行的生产数据库。
+
+数据库备份不包含上游秘密文件；`secrets/` 需要单独受控备份。同机备份无法抵御主机丢失，异机备份目标尚待指定。正式收费前需完成异机备份和恢复演练，并增加余额预留、结算和对账逻辑。
+
+## 维护
+
+```sh
+sudo docker compose ps
+sudo docker compose logs --tail=50 gateway
+sudo docker compose exec -T db psql -U postgres -d gateway
+```
+
+不要导出完整环境变量、容器详细配置、请求授权头或秘密文件到聊天/日志。服务重启会将遗留排队/处理中记录标为待核实，不自动补发请求。
+
+### 人民币余额字段
+
+按账户所有者确认的口径，APIMart 的 `remain_credits` / `used_credits` 分别记录人民币剩余余额和累计消费，单位为元。面板保留两位小数；数据库保存接口返回精度。同时保留 `remain_balance` / `used_balance` 原始值，旧快照没有 credits 的保持为空，不推算历史人民币余额。Key 返回 `-1` 且未设独立限额时展示“未设独立上限”，可用资金以所属账户余额为准。
+
+### 逐笔扣费
+
+调用记录及 CSV 包含 `cost_cny`（人民币元）、`cost_reference`（核对依据）和 `cost_recorded_at`。金额为空表示尚未核实，不能按零元计。管理员点击请求 ID，可按 APIMart 逐笔账单录入实际扣费；金额支持最多 8 位小数，修改前后金额及依据写入审计日志。录入操作只记账，不发起付款或上游调用。
+
+当前聊天响应未返回单次扣费，API Key 无法访问已尝试的账单查询接口，尚未实现自动回填。需要 APIMart 提供可授权访问、可按上游请求编号匹配的账单接口后再接入；禁止以账户余额差额作为某次调用实际扣费。历史测试请求保持待核实。
+
+GPT 文字请求会使用 2026-09-06 APIMart 价目表快照自动计算 `estimated_cost_cny`，与实际费用 `cost_cny` 分开。`pricing_details` 保存缓存拆分、单价、档位、版本及假设，CSV 可导出。完整 56 个模型 ID / 62 档价格与复算说明见 [GPT-PRICING.md](docs/GPT-PRICING.md)，部署后的阅读入口为 `/admin/pricing.html`。缺失价格或不支持的用量保持待核实；已有历史 token 可显式运行 `ops/backfill-text-estimates.mjs` 按当前价格补算，旧缓存缺失会保留假设提示。
+
+图片和视频任务会保存上游最终状态中的 `credits_cost`，本账户按人民币元记账；不使用不同单位的 `cost`。客户端查询任务时立即入库，后台也会在启动时及每 2 分钟补查缺少金额的任务（每批最多 20 条）。只接受匹配任务 ID 的最终结果及非负有限金额；重复查询不会重复记账，也不会覆盖已有人工金额。自动记录以 `apimart:task:…:credits_cost` 标识来源，并写入审计。
+
+### 充值码与钱包入账
+
+管理台“充值码管理”支持固定 10 / 50 / 100 元面额，每批 1–1,000 枚，批次名及可选到期时间。生成操作使用批次 UUID 幂等，网络重试不会重复发行同一批。完整码由 Node.js AES-256-GCM 加密，随机数为 128 位；校验使用 SHA-256，列表只显示尾号。
+
+操作顺序：生成 → TXT / CSV 导出 → 导入售卖网站对应面额商品 → 确认已导入并填写渠道 → 客户兑换。确认分配前不能兑换；分配后不能改投其他渠道。重导出只包含当前未兑换且未作废的码，用于原渠道补传；售卖网站应按充值码去重，避免重复发货。TXT 每行一枚码，CSV 为 code、amount_cny、batch_id。外部售卖平台尚未对接，无法推断已售出数量。
+
+用户入口 `/redeem`，用管理员签发的 `ipz_` 平台凭证验证身份，凭证仅驻留页面内存。邮箱注册与登录入口为 `/account`，需先完成发信服务配置。`POST /api/me/vouchers/redeem` 接收 `{code}`，归属用户从认证凭证取值；金额由批次决定。成功兑换与钱包流水在同一事务中提交，重复兑换到本人账户只返回原流水，不重复入账。`GET /api/me/wallet` 只返回自己的余额和最近 30 条入账。管理员可查看全部兑换人与钱包流水，用户管理可查看已入账余额。
+
+当前钱包仅支持充值码入账，尚未接入调用预留额度、定价扣款或退款。钱包入账不会为 APIMart 上游账户充值，现有请求 cost_cny 为上游账单核对金额，不能直接等同于用户消费或自动从钱包扣除。
+
+作废支持单码及整批未兑换码，须填写原因，不能恢复，已兑换记录与金额保持不变。生成、导出、分配、作废和兑换均留审计记录。管理权限沿用当前唯一 admin 账号；尚无多管理员权限分级。
+
+`secrets/voucher-encryption-key` 是独立 32 字节密钥，由 prepare-secrets.py 首次生成且不覆盖。Compose 只读挂载。不要删除或替换，否则已有码无法导出。数据库备份时同时生成对应 `.voucher-key` 文件，权限 600，仅用于恢复加密库存；迁移主机须同时安全保管数据库、密钥及已有上游密钥。当前备份仍在同机。
+
+验证：`npm test`，并在独立 gateway_test 数据库运行 `npm run test:integration`。新增覆盖并发抢兑、同一钱包并发入账、事务失败回滚、失效码、幂等发行、渠道锁定、导出审计、密文身份校验。测试使用隔离数据库及虚构充值码，不向生产钱包注入测试余额。
+
+### 邮箱注册与登录
+
+Better Auth 1.7.2 提供六位邮箱验证码登录，首次验证成功创建用户。钱包、兑换记录和 API 凭证关联稳定用户 ID，邮箱用于身份验证；现有手工创建的用户不会自动合并。普通用户会话与管理员会话隔离。验证码有效期 5 分钟，最多尝试 5 次，数据库保存哈希；同邮箱发送间隔 60 秒、每天最多 20 次，并有 IP 和全局限流。
+
+`/account` 支持登录、退出、查看自己的钱包和调用统计、兑换充值码、生成或重置 API 凭证。完整凭证只显示一次，重置立即撤销旧凭证。`/redeem` 保留已有平台凭证入口。管理台显示邮箱注册总数、今日注册数、启用注册用户及手工创建用户数，并显示邮件配置状态。
+
+邮件通过腾讯云 SES API 的审核模板投递，配置方法见 [ops/email/SETUP.md](ops/email/SETUP.md)。未配置时发送接口返回 503，页面明确提示暂不可用，不会假装发送。配置就绪仅代表字段齐全，实际送达须用可查收的邮箱验证。
+
+`secrets/customer-auth-secret` 由准备脚本生成并只读挂载，禁止覆盖。备份同时保存 `.customer-auth-secret`，已配置邮件时保存 `.mail-settings`，权限均为 600。认证表以 `auth_` 开头，启动时执行 Better Auth 数据库迁移。生产代理仅信任当前 Caddy 容器地址及本机回环地址。
+
+
+### 主站账户入口（2026-09-05）
+
+账户页面源码迁至 `/Users/jaycehuang/Projects/ipzsk/account.html`、`account.js` 和 `account.css`，发布到 `https://www.ipzsk.com/account`。API 域名 `/account` 仅跳转；认证接口和数据库继续运行在腾讯云。仅对 `https://www.ipzsk.com` 的用户接口允许凭证跨域，管理员接口不开放跨域。Cookie 仍仅属于 API 域名，主站通过 credentials: include 发送同站请求。
+
+## 账户架构改造（2026-09-07）
+
+现支持同一账户多把独立平台凭证、有效期和单凭证限速；新增凭证不吊销旧凭证。新增请求保存平台凭证归属。管理台“账户与账单”提供每日统计、凭证、流水、收费核对和独立管理员。完整说明见 [账户与计费架构](docs/ACCOUNT-ARCHITECTURE.md)。
+
+收费默认关闭，超级管理员确认售价后可开启。开启后仅接受已定价、指定最大输出 token 的文字请求，先冻结、后结算；媒体定价未配置时拒绝调用。邮箱验证码仍需要 SES 模板审核完成。
+
+### 网站密码登录（2026-09-07）
+
+网站默认邮箱 + 密码登录，注册和找回密码分开。注册验证通过后才绑定业务账户；密码重置撤销已有会话。邮件服务未开放时，已有已验证账户仍可用密码登录；注册和找回密码暂不可用。旧验证码登录端点关闭。64 项测试通过。
+
+### 桌面登录即用（2026-09-07）
+
+`POST /api/me/desktop/bootstrap` 仅接受已验证账户的登录会话，返回会话绑定的模型调用凭证、可用聊天模型和默认模型。模型目录定义在 `src/desktop.mjs`，与启用号池取交集，默认优先 `gpt-5.6-sol`，其次 `gpt-4o-mini`。桌面端使用内置 API 地址，无需手动复制 Key。
+
+schema 9 为 access_tokens 增加可空唯一 `auth_session_id`；一个登录会话对应一个桌面凭证记录，重复初始化轮换秘密，不影响其他会话或普通 API Key，不占普通 Key 的 20 个配额。网关在入口与排队后的上游提交前验证关联会话；退出、密码重置、用户禁用、凭证撤销和过期都能阻止后续调用。原请求的 token_id 保留，账单归属继续使用同一业务用户。

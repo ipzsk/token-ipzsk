@@ -1,0 +1,9 @@
+[Unit]
+Description=IPZSK gateway database backup
+After=docker.service
+Requires=docker.service
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ubuntu/api-gateway
+ExecStart=/bin/bash /home/ubuntu/api-gateway/ops/backup.sh
+UMask=0077

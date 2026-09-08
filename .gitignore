@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.*
+secrets/
+backups/
+downloads/
+*.log
+*.dump
+*.pem
+*.key
+*.tgz
+.DS_Store

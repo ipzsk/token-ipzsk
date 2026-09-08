@@ -1,0 +1,8 @@
+{
+  "stable": {
+    "version": "2.0.7",
+    "assets": {
+      "darwin-arm64": "IPZSK.Desktop-2.0.7-arm64.dmg"
+    }
+  }
+}
