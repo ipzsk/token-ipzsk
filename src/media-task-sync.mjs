@@ -1,4 +1,5 @@
 import { recordTaskCharge } from './task-charges.mjs';
+import { settleMediaRequest } from './billing.mjs';
 
 const terminal = ['completed', 'failed', 'cancelled'];
 // A database lock deduplicates browser polling and workers, including across processes.
@@ -21,6 +22,8 @@ export async function refreshMediaTask(db, upstream, id) {
         ...(terminal.includes(data.status) && data.status !== 'completed' ? {error:{message:'Media generation failed.'}} : {})};
       await c.query('UPDATE media_tasks SET status=$2,result=$3 WHERE id=$1',[id,data.status,JSON.stringify(result)]);
       await recordTaskCharge({tx:fn=>fn(c)},task,data);
+      // A terminal task must not leave funds frozen, even when the upstream reports no cost.
+      if (terminal.includes(data.status)) await settleMediaRequest(c,id,data.status);
     } catch {
       // A transient network error leaves the remote task pending, with backoff.
     } finally {

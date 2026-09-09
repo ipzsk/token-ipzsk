@@ -22,7 +22,7 @@ export function desktopRoutes(app,{db}) {
     const rows=(await db.query(`SELECT DISTINCT unnest(k.models) AS model FROM upstream_keys k
       JOIN upstream_accounts a ON a.id=k.account_id WHERE k.enabled AND a.enabled`)).rows;
     const available=new Set(rows.map(row=>row.model));
-    const {models,image_models,default_model}=desktopCatalog(available);
+    const {models,image_models,video_models,canonical_params,default_model}=desktopCatalog(available);
     if(!models.length)throw httpError(503,'desktop_models_unavailable');
     return db.tx(async c=>{
       const user=(await c.query('SELECT enabled FROM users WHERE id=$1 FOR UPDATE',[req.apiUser.id])).rows[0];
@@ -53,7 +53,7 @@ export function desktopRoutes(app,{db}) {
         plugin_configs.push({package:plugin.package_name,id:plugin.runtime_id,plugin_id:plugin.id,
           config:plugin.runtime_config,credential_paths:plugin.credential_paths,credential});
       }
-      return {token:value,expires_at:session.expiresAt,default_model,models,image_models,plugin_configs};
+      return {token:value,expires_at:session.expiresAt,default_model,models,image_models,video_models,canonical_params,plugin_configs};
     });
   });
 }

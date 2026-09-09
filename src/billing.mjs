@@ -1,44 +1,73 @@
 import { randomUUID } from 'node:crypto';
 import { httpError } from './security.mjs';
 import { prices, estimateTextCost } from './text-pricing.mjs';
+import { mediaPricing, resolveTier } from './model-catalog.mjs';
 
 export const units=value=>{const [a,b='']=String(value).split('.');return BigInt(a)*100000000n+BigInt(b.padEnd(8,'0').slice(0,8));};
 export const decimal=value=>`${value/100000000n}.${String(value%100000000n).padStart(8,'0')}`;
 const multiply=(amount,multiplier)=>decimal((units(amount)*units(multiplier)+50000000n)/100000000n);
+const mediaPaths=['/v1/images/generations','/v1/images/edits','/v1/videos/generations'];
+// The snapshot alone determines the charge: a later catalog, rate or multiplier change cannot reprice a held request.
+export const mediaAmount=s=>{
+  let usd=multiply(s.base_usd,s.tier_rate);
+  if(s.billing_unit==='per_second')usd=multiply(usd,s.duration_sec);
+  return multiply(multiply(usd,s.usd_cny),s.multiplier);
+};
 export async function wallet(c,userId){
   return (await c.query(`SELECT credit-debit AS balance_cny,held AS frozen_cny,credit-debit-held AS available_cny FROM
     (SELECT coalesce((SELECT sum(amount_cny) FROM wallet_entries WHERE user_id=$1),0) AS credit,
     coalesce((SELECT sum(amount_cny) FROM wallet_debits WHERE user_id=$1),0) AS debit,
     coalesce((SELECT sum(reserved_cny) FROM request_billing WHERE user_id=$1 AND state IN ('reserved','pending')),0) AS held) x`,[userId])).rows[0];
 }
-export async function reserveRequest(db,id,userId,body,path){
+export async function reserveRequest(db,id,userId,body,path,requested=body){
   return db.tx(async c=>{
     await c.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[userId]);
     const policy=(await c.query('SELECT * FROM billing_policy WHERE id=1')).rows[0];
     if(!policy.enabled)return;
-    const model=prices.models[body.model];
-    const output=body.max_completion_tokens??body.max_output_tokens??body.max_tokens;
-    if(!['/v1/chat/completions','/v1/responses','/v1/messages'].includes(path)||!model||!Number.isSafeInteger(output)||output<1||output>1000000||
-      (body.service_tier&&!['default','auto'].includes(body.service_tier))||body.tools?.some(t=>t.type!=='function')||body.model.includes('search'))throw httpError(400,'billing_requires_priced_text_and_output_limit');
-    // A conservative hold, not a tokenizer or a claimed final price. Excess charges require reconciliation.
-    const input=Buffer.byteLength(JSON.stringify(body),'utf8')*2+4096;
-    const maxRate=field=>model.tiers.reduce((max,t)=>{const n=units(t[field]??t.input);return n>max?n:max;},0n);
-    const inputRate=[maxRate('input'),maxRate('cached_input'),maxRate('cache_write')].reduce((a,b)=>a>b?a:b);
-    const base=decimal((BigInt(input)*inputRate+BigInt(output)*maxRate('output')+999999n)/1000000n);
-    const amount=multiply(base,policy.multiplier);
+    let amount,snapshot;
+    if(mediaPaths.includes(path)){
+      // Media is priced in USD upstream; the wallet is CNY. The rate is an administered ledger parameter, never fetched at request time.
+      const pricing=mediaPricing(body.model),{tier,durationSec}=resolveTier(body.model,requested);
+      if(pricing.billing_unit==='per_second'&&!(durationSec>0))throw httpError(400,'billing_requires_priced_media');
+      snapshot={media:true,policy_version:policy.version,multiplier:policy.multiplier,usd_cny:policy.usd_cny,model:body.model,
+        kind:pricing.kind,billing_unit:pricing.billing_unit,base_usd:pricing.base_usd,tier,tier_rate:pricing.tiers[tier],duration_sec:durationSec};
+      amount=mediaAmount(snapshot);
+    }else{
+      const model=prices.models[body.model];
+      const output=body.max_completion_tokens??body.max_output_tokens??body.max_tokens;
+      if(!['/v1/chat/completions','/v1/responses','/v1/messages'].includes(path)||!model||!Number.isSafeInteger(output)||output<1||output>1000000||
+        (body.service_tier&&!['default','auto'].includes(body.service_tier))||body.tools?.some(t=>t.type!=='function')||body.model.includes('search'))throw httpError(400,'billing_requires_priced_text_and_output_limit');
+      // A conservative hold, not a tokenizer or a claimed final price. Excess charges require reconciliation.
+      const input=Buffer.byteLength(JSON.stringify(body),'utf8')*2+4096;
+      const maxRate=field=>model.tiers.reduce((max,t)=>{const n=units(t[field]??t.input);return n>max?n:max;},0n);
+      const inputRate=[maxRate('input'),maxRate('cached_input'),maxRate('cache_write')].reduce((a,b)=>a>b?a:b);
+      const base=decimal((BigInt(input)*inputRate+BigInt(output)*maxRate('output')+999999n)/1000000n);
+      amount=multiply(base,policy.multiplier);
+      snapshot={policy_version:policy.version,multiplier:policy.multiplier,catalog:{...prices,models:{[body.model]:model}},model:body.model};
+    }
     const balance=await wallet(c,userId);
     if(units(balance.available_cny)<units(amount))throw httpError(402,'insufficient_balance');
     await c.query(`INSERT INTO request_billing(request_id,user_id,state,reserved_cny,price_snapshot) VALUES($1,$2,'reserved',$3,$4)`,
-      [id,userId,amount,JSON.stringify({policy_version:policy.version,multiplier:policy.multiplier,catalog:{...prices,models:{[body.model]:model}},model:body.model})]);
+      [id,userId,amount,JSON.stringify(snapshot)]);
   });
 }
-export async function settleRequest(c,id,{status,submitted,usage,serviceTier,billableTools}){
+export async function settleRequest(c,id,{status,submitted,errorCode,usage,serviceTier,billableTools}){
   const found=(await c.query('SELECT user_id FROM request_billing WHERE request_id=$1',[id])).rows[0];if(!found)return;
   await c.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[found.user_id]);
   const bill=(await c.query('SELECT * FROM request_billing WHERE request_id=$1 FOR UPDATE',[id])).rows[0];
   if(['settled','released'].includes(bill.state))return;
   if(!submitted){await c.query("UPDATE request_billing SET state='released',reason='not_executed',resolved_at=now() WHERE request_id=$1",[id]);return;}
   const snapshot=bill.price_snapshot;
+  // Media settles only when the async task reaches a terminal state; an unverified submission stays held for review.
+  if(snapshot.media){
+    if(status==='succeeded')return;
+    // 上游 4xx（含重试打光的 429/401/402/403）是明确拒绝，任务不可能被创建，冻结必须自动退；
+    // 5xx 和结果不确定的提交才留给人工核销 —— 那种情况上游可能已经建了任务。
+    const refused=/^upstream_http_4\d\d$/.test(errorCode??'');
+    if(refused)await c.query("UPDATE request_billing SET state='released',charged_cny=0,resolved_at=now(),reason=$2 WHERE request_id=$1",[id,errorCode]);
+    else await c.query("UPDATE request_billing SET state='pending',reason='media_submit_unverified' WHERE request_id=$1",[id]);
+    return;
+  }
   // The catalog is versioned per request. A changed running process cannot silently reprice a request.
   const price=estimateTextCost(snapshot.model,usage,{status,serviceTier,billableTools,catalog:snapshot.catalog});
   if(status!=='succeeded'||price.amount===null){
@@ -48,6 +77,17 @@ export async function settleRequest(c,id,{status,submitted,usage,serviceTier,bil
   if(units(amount)>units(bill.reserved_cny)){
     await c.query("UPDATE request_billing SET state='pending',reason='charge_exceeds_hold' WHERE request_id=$1",[id]);return;
   }
+  await debit(c,bill,amount,'automatic');
+}
+// Called from the task-charge transaction: the upstream task is the only proof of what the user owes.
+export async function settleMediaRequest(c,id,status){
+  const found=(await c.query('SELECT user_id FROM request_billing WHERE request_id=$1',[id])).rows[0];if(!found)return;
+  await c.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[found.user_id]);
+  const bill=(await c.query('SELECT * FROM request_billing WHERE request_id=$1 FOR UPDATE',[id])).rows[0];
+  if(bill.state!=='reserved'||!bill.price_snapshot.media)return;
+  if(status!=='completed'){await c.query("UPDATE request_billing SET state='released',charged_cny=0,resolved_at=now(),reason=$2 WHERE request_id=$1",[id,'media_task_'+status]);return;}
+  const amount=mediaAmount(bill.price_snapshot);
+  if(units(amount)>units(bill.reserved_cny)){await c.query("UPDATE request_billing SET state='pending',reason='charge_exceeds_hold' WHERE request_id=$1",[id]);return;}
   await debit(c,bill,amount,'automatic');
 }
 async function debit(c,bill,amount,source){
@@ -60,9 +100,10 @@ async function debit(c,bill,amount,source){
 export function billingRoutes(app,{db}){
   app.get('/admin/api/billing',async()=>({policy:(await db.query('SELECT * FROM billing_policy')).rows[0],pending:(await db.query(`SELECT b.*,u.name AS user_name FROM request_billing b JOIN users u ON u.id=b.user_id WHERE state IN ('pending','reserved') ORDER BY review_at LIMIT 200`)).rows}));
   app.post('/admin/api/billing/policy',async req=>{
-    const {enabled,multiplier}=req.body??{};
-    if(typeof enabled!=='boolean'||typeof multiplier!=='string'||!/^\d{1,3}(\.\d{1,4})?$/.test(multiplier)||Number(multiplier)<=0||Number(multiplier)>100)throw httpError(400,'invalid_billing_policy');
-    await db.query('UPDATE billing_policy SET enabled=$1,multiplier=$2,version=version+1,updated_at=now() WHERE id=1',[enabled,multiplier]);return {ok:true};
+    const {enabled,multiplier,usd_cny=null}=req.body??{};
+    if(typeof enabled!=='boolean'||typeof multiplier!=='string'||!/^\d{1,3}(\.\d{1,4})?$/.test(multiplier)||Number(multiplier)<=0||Number(multiplier)>100||
+      (usd_cny!==null&&(typeof usd_cny!=='string'||!/^\d{1,3}(\.\d{1,4})?$/.test(usd_cny)||Number(usd_cny)<=0)))throw httpError(400,'invalid_billing_policy');
+    await db.query('UPDATE billing_policy SET enabled=$1,multiplier=$2,usd_cny=coalesce($3,usd_cny),version=version+1,updated_at=now() WHERE id=1',[enabled,multiplier,usd_cny]);return {ok:true};
   });
   app.post('/admin/api/billing/:id/resolve',async req=>{
     const {amount_cny,reason}=req.body??{};

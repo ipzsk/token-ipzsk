@@ -2,13 +2,13 @@ import { setupPlugins } from '/admin/plugins.js';
 import { setupAccounts } from '/admin/accounts.js';
 import { setupVouchers } from '/admin/vouchers.js';
 const $ = (s) => document.querySelector(s);
-const state = { page:'overview',accounts:[],keys:[],users:[],requestPage:1,filter:{},edit:null };
+const state = { page:'overview',accounts:[],keys:[],users:[],providerTypes:[],requestPage:1,filter:{},edit:null };
 const titles = { plugins:['插件市场与用量','PLUGIN MARKET'], management:['账户与账单','ACCOUNTS & BILLING'], vouchers:['充值码管理','VOUCHERS'], overview:['服务总览','OVERVIEW'],pool:['API 号池','UPSTREAM POOL'],users:['用户管理','USERS'],requests:['调用记录','REQUEST LOG'] };
 const number = (v) => v === null || v === undefined ? '—' : Number(v).toLocaleString('zh-CN');
 const money = (v) => v === null || v === undefined ? '未同步' : Number(v).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2})+' 元';
 const charge = (v) => v === null || v === undefined ? '待核实' : Number(v).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:8})+' 元';
 const time = (v) => v ? new Date(v).toLocaleString('zh-CN',{hour12:false}) : '尚无记录';
-const errors = {invalid_denomination:'仅支持 10、50、100 元面额。',invalid_expiry:'有效期必须晚于当前时间。',batch_conflict:'重复生成请求参数不一致，请重新打开生成窗口。',export_required:'请先导出并导入售卖网站。',batch_already_assigned:'该批次已经分配，不能改为其他渠道。',batch_expired:'该批次已过期。',voucher_not_unused:'该码已兑换或已作废。',no_available_vouchers:'没有可用的未兑换充值码。',voucher_service_unavailable:'充值码服务尚未就绪。',admin_login_required:'请重新登录。',invalid_password:'密码不正确。',invalid_charge:'请填写非负金额，最多 8 位小数。',charge_not_ready:'请求尚未完成或未发送上游，不能录入扣费。',invalid_api_token:'访问凭证无效。',rate_limited:'操作过于频繁，请稍后再试。',origin_denied:'请求来源不匹配，请使用正式管理台地址。',key_already_exists:'这把 Key 已在号池中。',already_exists:'名称或凭证已存在。',invalid_upstream_key:'请检查 APIMart Key 格式。',internal_error:'服务暂时不可用，请稍后再试。',invalid_models:'请填写至少一个有效模型名称。'};
+const errors = {invalid_denomination:'仅支持 10、50、100 元面额。',invalid_expiry:'有效期必须晚于当前时间。',batch_conflict:'重复生成请求参数不一致，请重新打开生成窗口。',export_required:'请先导出并导入售卖网站。',batch_already_assigned:'该批次已经分配，不能改为其他渠道。',batch_expired:'该批次已过期。',voucher_not_unused:'该码已兑换或已作废。',no_available_vouchers:'没有可用的未兑换充值码。',voucher_service_unavailable:'充值码服务尚未就绪。',admin_login_required:'请重新登录。',invalid_password:'密码不正确。',invalid_charge:'请填写非负金额，最多 8 位小数。',charge_not_ready:'请求尚未完成或未发送上游，不能录入扣费。',invalid_api_token:'访问凭证无效。',rate_limited:'操作过于频繁，请稍后再试。',origin_denied:'请求来源不匹配，请使用正式管理台地址。',key_already_exists:'这把 Key 已在号池中。',already_exists:'名称或凭证已存在。',invalid_upstream_key:'请检查 APIMart Key 格式。',internal_error:'服务暂时不可用，请稍后再试。',invalid_models:'请填写至少一个有效模型名称。',invalid_base_url:'上游地址必须是合法的 https 地址，且不带查询参数。',invalid_provider_type:'不支持这个上游类型，请从下拉列表中选择。'};
 function el(tag,text,cls) { const n=document.createElement(tag); if(text!==undefined)n.textContent=text; if(cls)n.className=cls;return n; }
 function notice(message,error=false) { const n=$('#notice');n.textContent=message;n.hidden=false;n.className=error?'error':''; }
 function loginView() { $('#login-view').hidden=false;$('#console-view').hidden=true;document.querySelectorAll('dialog[open]').forEach((d)=>d.close()); }
@@ -72,7 +72,8 @@ async function overview(){
   renderRequests('#recent-requests',d.recent,true);
 }
 async function loadPool(){
-  const [a,k]=await Promise.all([api('/accounts'),api('/keys')]);state.accounts=a.rows;state.keys=k.rows;
+  const [a,k]=await Promise.all([api('/accounts'),api('/keys')]);state.accounts=a.rows;state.keys=k.rows;state.providerTypes=a.provider_types;
+  $('#account-provider').replaceChildren(...state.providerTypes.map((t)=>new Option(t,t)));
   $('#accounts').replaceChildren(...a.rows.map((row)=>{
     const card=el('article',undefined,'account-card');card.append(el('h2',row.name),el('strong',money(row.remain_credits)),el('p',`人民币 · 累计消费 ${money(row.used_credits)}`,'muted'),el('p',`同步：${time(row.balance_at)}`,'footnote'));
     const actions=el('div',undefined,'actions');actions.append(badge(!row.enabled?'已停用':stale(row)?'余额待同步':row.blocked?'余额不足':'正常',!row.enabled?'neutral':stale(row)||row.blocked?'warn':''),button(`设置 · 并发 ${row.active}/${row.concurrency}`,()=>edit('accounts',row)));
@@ -114,7 +115,7 @@ async function enterConsole(){
 }
 function showToken(value){$('#issued-token').value=value;$('#token-dialog').showModal();}
 function inputField(label,name,value,type='text'){const l=el('label',label),i=el(type==='textarea'?'textarea':'input');i.name=name;i.value=value;if(type!=='textarea')i.type=type;if(type==='text')i.maxLength=100;if(type==='number'){i.min=1;i.max=name==='rpm'?600:50;}i.required=true;l.append(i);return l;}
-function edit(kind,row){state.edit={kind,id:row.id};$('#edit-title').textContent=row.name+' · 设置';const fields=[inputField('名称','name',row.name),inputField(kind==='users'?'每分钟请求上限':'并发上限',kind==='users'?'rpm':'concurrency',kind==='users'?row.rpm:row.concurrency,'number')];if(kind==='keys')fields.push(inputField('开放模型（逗号或换行分隔）','models',row.models.join('\n'),'textarea'));if(kind==='accounts'){const l=el('label','账户状态'),s=el('select');s.name='enabled';s.append(new Option('启用','true'),new Option('停用','false'));s.value=String(row.enabled);l.append(s);fields.push(l);}$('#edit-fields').replaceChildren(...fields);$('#edit-dialog').showModal();}
+function edit(kind,row){state.edit={kind,id:row.id};$('#edit-title').textContent=row.name+' · 设置';const fields=[inputField('名称','name',row.name),inputField(kind==='users'?'每分钟请求上限':'并发上限',kind==='users'?'rpm':'concurrency',kind==='users'?row.rpm:row.concurrency,'number')];if(kind==='keys')fields.push(inputField('开放模型（逗号或换行分隔）','models',row.models.join('\n'),'textarea'));if(kind==='accounts'){fields.push(inputField('上游地址','base_url',row.base_url,'url'));const p=el('label','上游类型'),t=el('select');t.name='provider_type';t.append(...state.providerTypes.map((x)=>new Option(x,x)));t.value=row.provider_type;p.append(t);fields.push(p);const l=el('label','账户状态'),s=el('select');s.name='enabled';s.append(new Option('启用','true'),new Option('停用','false'));s.value=String(row.enabled);l.append(s);fields.push(l);}$('#edit-fields').replaceChildren(...fields);$('#edit-dialog').showModal();}
 function formData(form){return Object.fromEntries(new FormData(form));}
 function modelList(value){return value.split(/[,，\n]/).map((x)=>x.trim()).filter(Boolean);}
 async function submit(form,path,body,done){const b=form.querySelector('button.primary');b.disabled=true;try{const result=await api(path,'POST',body);form.closest('dialog')?.close();form.reset();await done(result);}finally{b.disabled=false;}}

@@ -21,7 +21,12 @@ export function database(config) {
     async recover() {
       await pool.query(`UPDATE requests SET status='uncertain',usage_state='unknown',
         error_code='process_restarted',completed_at=now() WHERE status IN ('queued','running')`);
-      await pool.query("UPDATE request_billing SET state='pending',reason='process_restarted' WHERE state='reserved'");
+      // 视频的冻结要持续到上游任务终态（几分钟），不是一次 HTTP 请求（几秒）。
+      // 还在跑的媒体任务保持 reserved，由 syncMediaTasks 到终态时结算；
+      // 无条件转 pending 会让每次部署都把在途视频打成待人工核销，且之后永不自动结算。
+      await pool.query(`UPDATE request_billing b SET state='pending',reason='process_restarted'
+        WHERE b.state='reserved' AND NOT EXISTS (SELECT 1 FROM media_tasks t
+          WHERE t.id=b.request_id AND t.status NOT IN ('completed','failed','cancelled'))`);
       await pool.query('DELETE FROM admin_sessions WHERE expires_at<now()');
     },
     close: () => pool.end(),

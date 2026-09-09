@@ -1,3 +1,5 @@
+import { settleMediaRequest } from './billing.mjs';
+
 // This account's APIMart credits are CNY, as confirmed by the account owner.
 // `cost` is a different unit; never substitute it for `credits_cost`.
 export async function recordTaskCharge(db, task, data) {
@@ -12,6 +14,8 @@ export async function recordTaskCharge(db, task, data) {
     if (!saved.rowCount) return false;
     await c.query('INSERT INTO audit_events(action,target_id,details) VALUES($1,$2,$3)',
       ['request.cost.sync',task.id,JSON.stringify({cost_cny:amount,source:reference})]);
+    // The user-side charge settles in the same transaction as the upstream cost; the two amounts stay separate.
+    await settleMediaRequest(c,task.id,data.status);
     return true;
   });
 }

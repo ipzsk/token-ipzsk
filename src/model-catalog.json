@@ -1,0 +1,203 @@
+{
+  "version": "apimart-2026-09-09",
+  "source": "done-hub providers/apimart/pricing/pricing.go (USDPrices / BillingUnits / TierRatios)",
+  "currency": "USD",
+  "notes": [
+    "三层结构：前端统一字段(canonical) → 网关内部名 → 各模型上游参数名(upstream)。",
+    "aliases 是前端统一字段名；from_openai 是 OpenAI SDK 客户端的方言。两条入站方言都归一到同一个内部名。",
+    "upstream.key 是发给上游时的参数名，upstream.values 是取值映射（缺省表示原值直传）。前端永远不需要知道上游参数叫什么。",
+    "base_usd 是「基准档 1 次调用」的上游价；视频的基准档是 1 秒。",
+    "tiers 的值是相对 base_usd 的倍率。per_second 的最终倍率 = 时长秒数 × 档位倍率。",
+    "tier_from 列出参与拼档位键的内部参数名，按顺序取第一个非空值。",
+    "档位键查不到时必须报 400，绝不回落成 1 —— 静默回落等于按错的价扣钱。",
+    "require_tier=true 的模型没有可信的基准档名，前端必须让用户显式选一档。",
+    "unsupported 列出该模型不支持的 canonical 字段：报 400 并说明原因，不静默丢弃（丢了用户以为生效了）。",
+    "chat 型号不参与 tiers 计价，billing_unit/base_usd/tiers 为 null；force_params 是提交前必须覆盖的固定入参。"
+  ],
+  "models": {
+    "gpt-5.6-sol": {
+      "kind": "chat",
+      "name": "GPT 5.6",
+      "provider_type": "apimart",
+      "api_path": "/v1/chat/completions",
+      "context_window": 128000,
+      "max_tokens": 8192,
+      "force_params": {
+        "reasoning_effort": "none"
+      },
+      "force_params_note": "APIMart 的 chat function tools 要求关闭 reasoning，字段缺省时也要显式传 none。",
+      "billing_unit": null,
+      "base_usd": null,
+      "tiers": null,
+      "params": {}
+    },
+    "gpt-image-2": {
+      "kind": "image",
+      "name": "GPT Image 2",
+      "provider_type": "apimart",
+      "api_path": "/v1/images/generations",
+      "billing_unit": "per_call",
+      "base_usd": 0.0085,
+      "require_tier": false,
+      "default_tier": "1k",
+      "tiers": {
+        "1k": 1,
+        "2k": 1.647059,
+        "4k": 2.470588
+      },
+      "tier_from": [
+        "resolution"
+      ],
+      "params": {
+        "resolution": {
+          "type": "enum",
+          "values": [
+            "1k",
+            "2k",
+            "4k"
+          ],
+          "default": "1k",
+          "from_openai": {
+            "quality": {
+              "low": "1k",
+              "medium": "2k",
+              "high": "4k"
+            }
+          },
+          "aliases": [
+            "resolution"
+          ],
+          "upstream": {
+            "key": "resolution"
+          }
+        },
+        "size": {
+          "type": "enum",
+          "values": [
+            "1:1",
+            "16:9",
+            "9:16",
+            "3:2",
+            "2:3"
+          ],
+          "default": "1:1",
+          "from_openai": {
+            "size": {
+              "1024x1024": "1:1",
+              "1792x1024": "16:9",
+              "1024x1792": "9:16",
+              "1536x1024": "3:2",
+              "1024x1536": "2:3",
+              "auto": "1:1"
+            }
+          },
+          "aliases": [
+            "aspect_ratio"
+          ],
+          "upstream": {
+            "key": "size"
+          }
+        }
+      },
+      "unsupported": {
+        "duration": "这是图片型号，不接受时长",
+        "enhance_prompt": "上游未提供提示词扩写"
+      }
+    },
+    "z-image-turbo": {
+      "kind": "image",
+      "provider_type": "apimart",
+      "api_path": "/v1/images/generations",
+      "billing_unit": "per_call",
+      "base_usd": 0.01,
+      "require_tier": false,
+      "default_tier": "default",
+      "tiers": {
+        "default": 1,
+        "prompt_extend": 2
+      },
+      "tier_from": [
+        "prompt_extend"
+      ],
+      "params": {
+        "prompt_extend": {
+          "type": "boolean",
+          "default": false,
+          "tier_when_true": "prompt_extend",
+          "aliases": [
+            "enhance_prompt"
+          ],
+          "upstream": {
+            "key": "prompt_extend"
+          }
+        }
+      },
+      "name": "Z-Image Turbo",
+      "unsupported": {
+        "aspect_ratio": "上游未登记尺寸参数，传了会按未知参数改变计价",
+        "resolution": "上游未登记清晰度档位",
+        "duration": "这是图片型号，不接受时长"
+      }
+    },
+    "seedance-2.0-mini": {
+      "kind": "video",
+      "provider_type": "apimart",
+      "api_path": "/v1/videos/generations",
+      "billing_unit": "per_second",
+      "base_usd": 0.0064,
+      "require_tier": true,
+      "default_tier": null,
+      "tiers": {
+        "480p": 1.65,
+        "720p": 3.575
+      },
+      "tier_from": [
+        "resolution"
+      ],
+      "params": {
+        "resolution": {
+          "type": "enum",
+          "values": [
+            "480p",
+            "720p"
+          ],
+          "default": null,
+          "required": true,
+          "aliases": [
+            "resolution"
+          ],
+          "upstream": {
+            "key": "resolution"
+          }
+        },
+        "duration": {
+          "type": "integer",
+          "min": 1,
+          "max": 10,
+          "default": 5,
+          "unit": "second",
+          "multiplies_price": true,
+          "aliases": [
+            "duration"
+          ],
+          "upstream": {
+            "key": "duration"
+          }
+        }
+      },
+      "name": "Seedance 2.0 Mini",
+      "unsupported_note": "暂不开放图生视频（i2v）。上游 720p-input 档位($0.0064*2.1625)未开放，因为 APIMart 的输入图字段名未经核实，猜错会按错的价扣钱。请求里带参考图字段时应报 400。",
+      "unsupported": {
+        "aspect_ratio": "上游按 resolution 决定画幅，不单独接受比例",
+        "enhance_prompt": "上游未提供提示词扩写"
+      }
+    }
+  },
+  "canonical_params": {
+    "prompt": "提示词，所有生成型号通用",
+    "aspect_ratio": "画面比例，如 1:1 / 16:9",
+    "resolution": "清晰度档位，取值按型号而定（图片 1k/2k/4k，视频 480p/720p）",
+    "duration": "视频时长（秒）",
+    "enhance_prompt": "是否让上游自动扩写提示词"
+  }
+}
