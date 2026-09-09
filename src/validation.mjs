@@ -51,3 +51,34 @@ export function requestFilter(query, forcedUser) {
   }
   return { sql: where.length ? 'WHERE ' + where.join(' AND ') : '', args };
 }
+export function oneOf(value, values, code) {
+  if (!values.includes(value)) throw httpError(400, code);
+  return value;
+}
+// Maps an OpenAI-shaped body onto the upstream params a catalog model declares.
+export function modelParams(params, body) {
+  const out = {};
+  for (const [name, spec] of Object.entries(params)) {
+    // aliases (the frontend's shared vocabulary) and from_openai (the SDK dialect) both normalize onto one internal name.
+    const tables = spec.from_openai ?? {}, given = new Set();
+    for (const key of new Set([name, ...(spec.aliases ?? []), ...Object.keys(tables)])) {
+      if (body[key] != null) given.add(tables[key] ? tables[key][body[key]] ?? body[key] : body[key]);
+    }
+    if (given.size > 1) throw httpError(400, 'conflicting_parameter');
+    let value = given.values().next().value ?? spec.default;
+    if (value == null) {
+      if (spec.required) throw httpError(400, `missing_${name}`);
+      continue;
+    }
+    if (spec.type === 'enum') oneOf(value, spec.values, `unsupported_${name === 'size' ? 'image_size' : name}`);
+    if (spec.type === 'boolean') bool(value);
+    if (spec.type === 'integer') integer(value, spec.min, spec.max);
+    out[name] = value;
+  }
+  return out;
+}
+export function onlyKnownKeys(body, allowed) {
+  const extra = Object.keys(body).find((key) => !allowed.has(key));
+  // The API error body echoes only the code; the offending key rides along for the server log.
+  if (extra !== undefined) throw Object.assign(httpError(400, 'unsupported_parameter'), { message: `unsupported_parameter: ${extra.slice(0, 64)}` });
+}

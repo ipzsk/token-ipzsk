@@ -23,7 +23,10 @@ export function setupAccounts({api,action,el,table,cell,button,rowActions,charge
       const d=await api('/billing');content.append(el('p',d.policy.enabled?'收费已开启':'收费关闭：记录用量和上游成本，不扣用户钱包。'));
       content.append(el('p','开启后仅接受有定价的文字接口，必须指定最大输出 token；图片、音频、搜索和未能计价的调用会被拒绝。金额按 APIMart Credits × 售价倍数记录为元。'));
       const mult=input('对用户售价倍数','number',d.policy.multiplier);mult.n.step='0.0001';mult.n.min='0.0001';
-      content.append(mult.l,button(d.policy.enabled?'关闭收费':'保存倍数并开启收费',async()=>{if(!confirm(`确认${d.policy.enabled?'关闭收费':'按 '+mult.n.value+' 倍开启实际钱包扣费'}？`))return;await api('/billing/policy','POST',{enabled:!d.policy.enabled,multiplier:mult.n.value});await refresh();}));
+      const rate=input('美元兑人民币汇率（媒体按美元定价）','number',d.policy.usd_cny);rate.n.step='0.0001';rate.n.min='0.0001';
+      content.append(mult.l,rate.l,el('p','改汇率只影响之后新建的冻结单；已冻结的按下单时的快照结算，不会重算。','footnote'));
+      content.append(button(d.policy.enabled?'关闭收费':'保存倍数并开启收费',async()=>{if(!confirm(`确认${d.policy.enabled?'关闭收费':'按 '+mult.n.value+' 倍开启实际钱包扣费'}？`))return;await api('/billing/policy','POST',{enabled:!d.policy.enabled,multiplier:mult.n.value,usd_cny:rate.n.value});await refresh();}));
+      content.append(button('只保存倍数与汇率',async()=>{await api('/billing/policy','POST',{enabled:d.policy.enabled,multiplier:mult.n.value,usd_cny:rate.n.value});await refresh();}));
       content.append(el('p','待核对款项继续冻结；超过 24 小时显示逾期。核对后录入扣款金额，填 0 释放冻结款。'));
       const box=el('div',undefined,'table-wrap');content.append(box);table(box,['用户 / 请求','状态','冻结金额','核对期限','原因','操作'],d.pending.map(r=>[cell(r.user_name,r.request_id),r.state,charge(r.reserved_cny),cell(time(r.review_at),new Date(r.review_at)<new Date()?'已逾期':''),r.reason??'等待请求结束',r.state==='pending'?button('核对结算',async()=>{const amount=prompt('本次用户扣款金额（元），0 表示释放，不能超过冻结金额');if(amount===null)return;const reason=prompt('账单依据或释放原因（至少 5 个字）');if(!reason)return;await api('/billing/'+r.request_id+'/resolve','POST',{amount_cny:amount,reason});await refresh();}):'处理中']));
     },

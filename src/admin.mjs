@@ -3,6 +3,19 @@ import { passwordHash } from './security.mjs';
 import { randomUUID } from 'node:crypto';
 import { hash, token, httpError, verifyPassword, sessionCookie, readSession, RateLimiter } from './security.mjs';
 import * as v from './validation.mjs';
+import { providerTypes } from './upstream.mjs';
+
+// 渠道地址必须是 https 且不带查询串；扣费口径按 provider_type 走注册表，未登记的类型直接拒绝。
+function baseUrl(value) {
+  let url;
+  try { url = new URL(v.text(value, 200)); } catch { throw httpError(400, 'invalid_base_url'); }
+  if (url.protocol !== 'https:' || url.search || url.hash || url.username || url.password) throw httpError(400, 'invalid_base_url');
+  return (url.origin + url.pathname).replace(/\/+$/, '');
+}
+function providerType(value) {
+  if (!providerTypes.includes(value)) throw httpError(400, 'invalid_provider_type');
+  return value;
+}
 
 const fields = `r.id,r.user_id,u.name AS user_name,k.name AS key_name,r.model,r.status,r.usage_state,
   r.input_tokens,r.output_tokens,r.total_tokens,r.duration_ms,r.created_at,r.error_code,r.upstream_id,r.stream,r.cost_cny,r.cost_reference,r.cost_recorded_at,r.estimated_cost_cny,r.pricing_details,r.access_token_id,r.plugin_id,r.plugin_publisher_ref,
@@ -95,13 +108,15 @@ export function adminRoutes(app, { db, upstream, scheduler, origin, secureCookie
       chart: chart.rows, recent: recent.rows.slice(0, 5), queue: scheduler.waiting,
       active: [...scheduler.accounts.values()].reduce((a,b) => a+b,0), updated_at: new Date().toISOString() };
   });
-  app.get('/admin/api/accounts', async () => ({ rows: (await db.query(`SELECT a.*,
+  // 下拉选项由注册表直接吐出，前端不再维护第二份名单。
+  app.get('/admin/api/accounts', async () => ({ provider_types: providerTypes, rows: (await db.query(`SELECT a.*,
     (SELECT count(*) FROM upstream_keys k WHERE k.account_id=a.id) AS key_count FROM upstream_accounts a ORDER BY created_at`)).rows
     .map((a) => ({ ...a, active: scheduler.accounts.get(a.id) ?? 0 })) }));
   app.post('/admin/api/accounts', async (req) => {
     const id = randomUUID(), name = v.text(req.body?.name), concurrency = v.integer(req.body?.concurrency ?? 3, 1, 50);
+    const base = baseUrl(req.body?.base_url ?? 'https://api.apimart.ai'), provider = providerType(req.body?.provider_type ?? 'apimart');
     await db.tx(async (c) => {
-      await c.query('INSERT INTO upstream_accounts (id,name,concurrency) VALUES ($1,$2,$3)', [id, name, concurrency]);
+      await c.query('INSERT INTO upstream_accounts (id,name,concurrency,base_url,provider_type) VALUES ($1,$2,$3,$4,$5)', [id, name, concurrency, base, provider]);
       await audit(c, 'account.create', id);
     });
     return { id };
@@ -111,9 +126,10 @@ export function adminRoutes(app, { db, upstream, scheduler, origin, secureCookie
     const row = requiredRow(await db.query('SELECT * FROM upstream_accounts WHERE id=$1', [id]));
     const b = req.body ?? {};
     await db.tx(async (c) => {
-      await c.query('UPDATE upstream_accounts SET name=$2,enabled=$3,concurrency=$4 WHERE id=$1',
+      await c.query('UPDATE upstream_accounts SET name=$2,enabled=$3,concurrency=$4,base_url=$5,provider_type=$6 WHERE id=$1',
         [id, b.name === undefined ? row.name : v.text(b.name), b.enabled === undefined ? row.enabled : v.bool(b.enabled),
-          b.concurrency === undefined ? row.concurrency : v.integer(b.concurrency,1,50)]);
+          b.concurrency === undefined ? row.concurrency : v.integer(b.concurrency,1,50),
+          b.base_url === undefined ? row.base_url : baseUrl(b.base_url), b.provider_type === undefined ? row.provider_type : providerType(b.provider_type)]);
       await audit(c, 'account.update', id);
     });
     upstream.refreshSoon(); return { ok: true };

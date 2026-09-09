@@ -1,5 +1,14 @@
 import {httpError} from './security.mjs';
 
+// imageUpload 能产出的、且**不由模型目录登记**的 body 键的唯一真源。
+// model-catalog 的图片白名单 import 它，不要在别处再抄一份 —— 两份名单必然漂移。
+// 注意这里刻意不含 size/quality/resolution：那几个是按模型登记的计价参数，
+// 由目录逐模型放行；无差别放进来会让没登记尺寸的模型（如 z-image-turbo）
+// 把 size 透传给上游，那是「未登记参数改变上游价格」。
+export const imageUploadExtraKeys=new Set(['image_urls','mask_url','background','output_format','output_compression','input_fidelity','user']);
+const imageUploadFormFields=new Set(['model','prompt','size','quality','detail','n','response_format','resolution',...imageUploadExtraKeys]);
+imageUploadFormFields.delete('image_urls');imageUploadFormFields.delete('mask_url');
+
 // OpenAI multipart edits become APIMart JSON reference images; nothing is written to disk.
 export async function imageUpload(payload,contentType){
   if(!Buffer.isBuffer(payload)||!/^multipart\/form-data;/i.test(contentType??''))throw httpError(400,'invalid_image_upload');
@@ -8,7 +17,7 @@ export async function imageUpload(payload,contentType){
   try{form=await new Request('https://multipart.invalid',{method:'POST',headers:{'Content-Type':contentType},body:payload}).formData();}
   catch{throw httpError(400,'invalid_image_upload');}
   const body={},images=[];let bytes=0;
-  const fields=new Set(['model','prompt','size','quality','detail','n','response_format','resolution','background','output_format','output_compression','input_fidelity','user']);
+  const fields=imageUploadFormFields;
   for(const [name,value] of form){
     if(['image','image[]','mask'].includes(name)){
       if(!(value instanceof File)||!value.size)throw httpError(400,'image_file_required');

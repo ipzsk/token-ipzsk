@@ -29,7 +29,12 @@ function stable(value) {
   if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map((k) => [k, stable(value[k])]));
   return value;
 }
-export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, origin, requestTimeoutMs = 180_000 }) {
+// 只有上游明确拒绝执行才换渠道：429 限流、401/403 鉴权、402 余额。
+// 5xx 说明请求已经到过上游，可能已经建了媒体任务只是回包失败，重发就是第二笔计费。
+const retryableStatus = (status) => [401,402,403,429].includes(status);
+// 连接阶段就失败，说明请求没有到达上游。ECONNRESET 等中途错误不在其列。
+const connectFailed = (error) => ['ECONNREFUSED','ENOTFOUND','EAI_AGAIN'].includes(error?.cause?.code);
+export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, origin, requestTimeoutMs = 180_000, maxAttempts = 3 }) {
   const limiter = new RateLimiter();
   app.decorateRequest('apiUser', null);
   app.addHook('onRequest', async (req) => {
@@ -95,7 +100,11 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     const image=path==='/v1/images/generations'&&Buffer.isBuffer(req.body)?await imageUpload(req.body,req.headers['content-type']):null;
     if(routePath==='/v1/images/edits'&&!image)throw httpError(400,'invalid_image_upload');
     const audio=path==='/v1/audio/transcriptions'?await audioRequest(req.body,req.headers['content-type']):null;
-    const body = audio?.metadata??adaptModelRequest(path,agentRequest(path,image??req.body));
+    // requested 是归一后、尚未按上游参数名改写的 body。计价档位只能从它解析：
+    // adaptModelRequest 之后键名已经是上游的，resolveTier 认的是内部名，
+    // 拿上游 body 去解析档位会在第一个真正改名的型号上静默回落到最便宜档。
+    const requested = audio?.metadata??agentRequest(path,image??req.body);
+    const body = audio?.metadata??adaptModelRequest(path,requested);
     let plugin;
     if(req.apiUser.plugin_id){
       plugin=(await db.query('SELECT id,publisher_ref,allowed_models,owner_user_id,revenue_share_bps FROM plugins WHERE id=$1 AND enabled',[req.apiUser.plugin_id])).rows[0];
@@ -139,44 +148,62 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
         [id,status,usage ? 'reported' : (submitted ? 'unknown' : 'not_executed'),usage?.input ?? null,
           usage?.output ?? null,usage?.total ?? null,upstreamId ?? null,httpStatus ?? null,errorCode,Date.now()-started,
           estimate.amount,JSON.stringify(estimate.details)]);
-        await settleRequest(c,id,{status,submitted,usage:billingUsage,serviceTier:responseTier??body.service_tier,billableTools:body.tools?.some(t=>t.type!=='function')});
+        await settleRequest(c,id,{status,submitted,errorCode,usage:billingUsage,serviceTier:responseTier??body.service_tier,billableTools:body.tools?.some(t=>t.type!=='function')});
         if (attemptId) await c.query(`UPDATE request_attempts SET upstream_id=$2,http_status=$3,error_code=$4,
           usage=$5,completed_at=now() WHERE id=$1`, [attemptId,upstreamId ?? null,httpStatus ?? null,errorCode,usage ? JSON.stringify(usage) : null]);
       });
       finalized = true;
     };
     try {
-      await reserveRequest(db,id,req.apiUser.id,body,path);
-      lease = await scheduler.acquire(() => upstream.candidates(body.model), controller.signal);
-      controller.signal.throwIfAborted();
-      const stillValid = await db.query(`SELECT t.id,t.user_id,t.auth_session_id,t.plugin_id FROM access_tokens t JOIN users u ON u.id=t.user_id
-        WHERE t.id=$1 AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at>now()) AND u.enabled`, [req.apiUser.token_id]);
-      if (!stillValid.rowCount) throw httpError(401,'invalid_api_token');
-      await checkDesktopSession(db,stillValid.rows[0]);
-      attemptId = randomUUID();
-      await db.tx(async (c) => {
-        await c.query('UPDATE access_tokens SET last_used_at=now() WHERE id=$1',[req.apiUser.token_id]);
-        await c.query("UPDATE requests SET status='running',key_id=$2 WHERE id=$1", [id,lease.row.id]);
-        await c.query('INSERT INTO request_attempts (id,request_id,key_id) VALUES ($1,$2,$3)', [attemptId,id,lease.row.id]);
-      });
+      await reserveRequest(db,id,req.apiUser.id,body,path,requested);
       const payload = { ...body };
       const media=path==='/v1/images/generations'||path==='/v1/videos/generations';
       if(media)delete payload.stream;
       // Require usage for SSE. Models that omit it remain explicitly unverified.
       if (payload.stream && path==='/v1/chat/completions') payload.stream_options = { ...payload.stream_options, include_usage:true };
-      submitted = true;
-      const response = await upstream.request(lease.row.secret_ref, path, {
-        method:'POST', body:audio?.payload??JSON.stringify(payload), headers:protocolHeaders, signal:controller.signal,
-      });
-      httpStatus = response.status;
-      upstreamId = response.headers.get('x-oneapi-request-id')?.slice(0,200);
-      if (!response.ok) {
-        await response.body?.cancel();
-        await upstream.markFailure(lease.row,response.status,response.headers.get('retry-after'));
-        await finalize('failed',null,`upstream_http_${response.status}`);
+      const skip = []; let response = null, failure = null;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        // 只有第一次没渠道才是 503；换渠道时拿不到别的 key 就沿用上一次的失败结果。
+        const next = await scheduler.acquire(() => upstream.candidates(body.model,skip), controller.signal)
+          .catch((error) => { if (attempt === 0 || controller.signal.aborted) throw error; return null; });
+        if (!next) break;
+        lease?.release(); lease = next;
+        controller.signal.throwIfAborted();
+        const stillValid = await db.query(`SELECT t.id,t.user_id,t.auth_session_id,t.plugin_id FROM access_tokens t JOIN users u ON u.id=t.user_id
+          WHERE t.id=$1 AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at>now()) AND u.enabled`, [req.apiUser.token_id]);
+        if (!stillValid.rowCount) throw httpError(401,'invalid_api_token');
+        await checkDesktopSession(db,stillValid.rows[0]);
+        attemptId = randomUUID();
+        await db.tx(async (c) => {
+          await c.query('UPDATE access_tokens SET last_used_at=now() WHERE id=$1',[req.apiUser.token_id]);
+          await c.query("UPDATE requests SET status='running',key_id=$2 WHERE id=$1", [id,lease.row.id]);
+          await c.query('INSERT INTO request_attempts (id,request_id,key_id) VALUES ($1,$2,$3)', [attemptId,id,lease.row.id]);
+        });
+        submitted = true;
+        response = await upstream.request(lease.row, path, {
+          method:'POST', body:audio?.payload??JSON.stringify(payload), headers:protocolHeaders, signal:controller.signal,
+        }).catch((error) => {
+          // 连接根本没建立时上游不可能执行过；其他错误一律当作已提交，绝不重放。
+          if (controller.signal.aborted || !connectFailed(error)) throw error;
+          submitted = false; return null;
+        });
+        httpStatus = response?.status ?? null;
+        upstreamId = response?.headers.get('x-oneapi-request-id')?.slice(0,200) ?? null;
+        if (response?.ok) { failure = null; break; }
+        if (response) {
+          await response.body?.cancel();
+          await upstream.markFailure(lease.row,response.status,response.headers.get('retry-after'));
+        }
+        failure = response ? `upstream_http_${response.status}` : 'upstream_connect_failed';
+        if (response && !retryableStatus(response.status)) break;
+        skip.push(lease.row.id);
+        await db.query('UPDATE request_attempts SET upstream_id=$2,http_status=$3,error_code=$4,completed_at=now() WHERE id=$1',
+          [attemptId,upstreamId,httpStatus,failure]);
+      }
+      if (failure) {
+        await finalize('failed',null,failure);
         cleanup();
-        const status = response.status === 429 ? 429 : 502;
-        return reply.code(status).send({ error: { code:`upstream_http_${response.status}`,message:'Upstream request failed.',request_id:id } });
+        return reply.code(httpStatus === 429 ? 429 : 502).send({ error: { code:failure,message:'Upstream request failed.',request_id:id } });
       }
       if (body.stream) {
         if (!response.headers.get('content-type')?.includes('text/event-stream')) {

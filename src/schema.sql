@@ -253,3 +253,17 @@ CREATE TABLE IF NOT EXISTS image_captchas (
 );
 CREATE INDEX IF NOT EXISTS image_captchas_expiry ON image_captchas(expires_at);
 INSERT INTO schema_version(version) VALUES(13) ON CONFLICT DO NOTHING;
+
+-- 多上游：渠道自带 base_url 与 provider_type。默认值保持现网单上游行为不变。
+-- provider_type 不加 CHECK：未知类型由代码在注册表里 fail fast，不靠数据库枚举挡，
+-- 也不静默回落到 apimart（那是扣费口径错且无声的事故）。
+ALTER TABLE upstream_accounts ADD COLUMN IF NOT EXISTS base_url text NOT NULL DEFAULT 'https://api.apimart.ai';
+ALTER TABLE upstream_accounts ADD COLUMN IF NOT EXISTS provider_type text NOT NULL DEFAULT 'apimart';
+ALTER TABLE upstream_accounts DROP CONSTRAINT IF EXISTS upstream_accounts_base_url_https;
+ALTER TABLE upstream_accounts ADD CONSTRAINT upstream_accounts_base_url_https CHECK (base_url LIKE 'https://%');
+INSERT INTO schema_version(version) VALUES(14) ON CONFLICT DO NOTHING;
+
+-- 媒体按 USD 报价，钱包记 CNY。汇率是管理员维护的账本参数，不在请求时联网取值，
+-- 保证迁移与历史计费可复现；每笔冻结把当时的汇率写进 price_snapshot。
+ALTER TABLE billing_policy ADD COLUMN IF NOT EXISTS usd_cny numeric(12,4) NOT NULL DEFAULT 7.3 CHECK(usd_cny>0);
+INSERT INTO schema_version(version) VALUES(15) ON CONFLICT DO NOTHING;
