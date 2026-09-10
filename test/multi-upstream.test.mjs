@@ -5,20 +5,40 @@ import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Upstream, providerPaths, providerTypes } from '../src/upstream.mjs';
+import { Upstream, providerPaths, providerTypes, providerOptions } from '../src/upstream.mjs';
 import { Scheduler } from '../src/scheduler.mjs';
 import { gatewayRoutes } from '../src/gateway.mjs';
+import { recordTaskCharge } from '../src/task-charges.mjs';
 
 const TOKEN = 'ipz_' + 'a'.repeat(43);
 
 test('provider registry serves apimart paths and refuses unknown types', () => {
-  assert.deepEqual(providerTypes, ['apimart']);
+  assert.deepEqual(providerTypes, ['apimart', 'openai_relay']);
   assert.equal(providerPaths('apimart').keyBalance, '/v1/balance');
   assert.equal(providerPaths('apimart').accountBalance, '/v1/user/balance');
   assert.equal(providerPaths('apimart').task('a b'), '/v1/tasks/a%20b');
   for (const type of ['openrouter', '', undefined, null, 'APIMART']) {
     assert.throws(() => providerPaths(type), /unknown_provider_type/);
   }
+});
+
+test('没有的能力用显式 null 登记，不是省略；后台下拉带中文名', () => {
+  const relay = providerPaths('openai_relay');
+  for (const capability of ['keyBalance', 'accountBalance', 'task', 'validBalance']) {
+    assert.ok(capability in relay, capability);
+    assert.equal(relay[capability], null);
+  }
+  assert.deepEqual(providerOptions, [{ type:'apimart', label:'APIMart' }, { type:'openai_relay', label:'通用 OpenAI 中转' }]);
+});
+
+test('没有余额接口的渠道不查余额，也不因此被停用', async () => {
+  const account = randomUUID();
+  const rows = [{ id: randomUUID(), account_id: account, secret_ref: 'fixture.key', base_url: 'https://relay.example', provider_type: 'openai_relay' }];
+  const { upstream, urls, calls } = await upstreamFixture(rows);
+  upstream.db.tx = async (fn) => fn(upstream.db);
+  assert.deepEqual(await upstream.sync(), { refreshed_keys: 1, refreshed_accounts: 1 });
+  assert.deepEqual(urls, []);
+  assert.equal(calls.filter((c) => /balance_error|balance_at|balance_snapshots/.test(c.sql)).length, 0);
 });
 
 async function upstreamFixture(rows = []) {
@@ -52,7 +72,41 @@ test('candidates 带出渠道行并支持跳过已失败的 key', async () => {
   await upstream.candidates('gpt-4o-mini', skip);
   assert.match(calls[0].sql, /a\.base_url,a\.provider_type/);
   assert.match(calls[0].sql, /NOT \(k\.id=ANY\(\$2::uuid\[\]\)\)/);
-  assert.deepEqual(calls[0].args, ['gpt-4o-mini', skip]);
+  assert.deepEqual(calls[0].args, ['gpt-4o-mini', skip, ['apimart'], false, ['apimart']]);
+});
+
+test('可用性按能力分支：余额规则只压在有余额接口的渠道上，enabled/blocked/cooldown 对所有渠道都在', async () => {
+  const { upstream, calls } = await upstreamFixture();
+  await upstream.candidates('gpt-4o-mini');
+  const sql = calls[0].sql.replace(/\s+/g, ' ');
+  // 余额新鲜度 + 余额>0 整体挂在「这家有余额接口」的条件下，openai_relay 直接跳过这一段。
+  assert.match(sql, /AND \(NOT a\.provider_type=ANY\(\$3::text\[\]\) OR \(a\.remain_credits>0 AND a\.balance_at>now\(\)-interval '10 minutes' AND k\.balance_at>now\(\)-interval '10 minutes' AND \(k\.unlimited OR k\.remain_credits>0\)\)\)/);
+  assert.match(sql, /k\.enabled AND a\.enabled AND NOT a\.blocked AND \(k\.cooldown_until IS NULL OR k\.cooldown_until<=now\(\)\)/);
+  assert.equal(/a\.remain_credits>0/.test(sql.split('AND (NOT a.provider_type=ANY($3::text[])')[0]), false);
+});
+
+test('媒体模型只走有异步任务接口的渠道，文本模型不受这条限制', async () => {
+  const { upstream, calls } = await upstreamFixture();
+  await upstream.candidates('gpt-image-2');
+  assert.match(calls[0].sql.replace(/\s+/g, ' '), /AND \(NOT \$4::boolean OR a\.provider_type=ANY\(\$5::text\[\]\)\)/);
+  // $4=true 时只留下注册了 task 的 provider；openai_relay 没有 /v1/tasks/{id}，永远不在这份名单里。
+  assert.deepEqual(calls[0].args.slice(3), [true, ['apimart']]);
+  assert.equal(calls[0].args[4].includes('openai_relay'), false);
+  assert.equal(providerPaths('openai_relay').task, null);
+  const chat = await upstreamFixture();
+  await chat.upstream.candidates('gpt-5.6-sol');
+  assert.equal(chat.calls[0].args[3], false);
+});
+
+test('credits_cost 只在 apimart 渠道记成本，别的 provider 宁可不记', async () => {
+  const sqls = [];
+  const db = { tx: (fn) => fn({ query: async (sql) => { sqls.push(sql); return { rowCount: 0, rows: [] }; } }) };
+  const task = { id: randomUUID(), upstream_task_id: 'up-1' };
+  const data = { id: 'up-1', status: 'completed', credits_cost: 0.5 };
+  assert.equal(await recordTaskCharge(db, task, data), false);
+  // 金额写入自带 provider 判定；渠道不是 apimart 时这条 UPDATE 命中 0 行，后面的审计与结算都不会发生。
+  assert.match(sqls[0].replace(/\s+/g, ' '), /UPDATE requests SET cost_cny.+EXISTS \(SELECT 1 FROM upstream_keys k JOIN upstream_accounts a ON a\.id=k\.account_id WHERE k\.id=requests\.key_id AND a\.provider_type='apimart'\)/s);
+  assert.equal(sqls.length, 1);
 });
 
 // —— 换渠道重试 ——

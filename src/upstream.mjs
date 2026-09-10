@@ -3,13 +3,22 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { hash, httpError } from './security.mjs';
 import { recordTaskCharge } from './task-charges.mjs';
+import { mediaPricing } from './model-catalog.mjs';
 
-// 每个 provider_type 登记自己的余额与任务查询路径。未知类型直接 throw：
+// 每个 provider_type 登记自己的余额与任务查询路径，以及余额响应的形状校验。未知类型直接 throw：
 // 静默回落到 apimart 会用错扣费口径，且不会有任何报错。
+// 没有的能力写显式 null（不是省略）：漏登记一项会当场 TypeError，不会被当成「这家没有」。
 const providers = {
-  apimart: { keyBalance:'/v1/balance', accountBalance:'/v1/user/balance', task:(id) => '/v1/tasks/'+encodeURIComponent(id) },
+  apimart: { label:'APIMart', keyBalance:'/v1/balance', accountBalance:'/v1/user/balance', task:(id) => '/v1/tasks/'+encodeURIComponent(id),
+    validBalance:(d) => d.success === true && ['remain_balance','used_balance','remain_credits','used_credits'].every((f) => Number.isFinite(d[f])) },
+  // 通用 OpenAI 兼容中转（one-api / new-api 系，如书虫 / BBshare）：只转发对话与媒体同步接口。
+  openai_relay: { label:'通用 OpenAI 中转', keyBalance:null, accountBalance:null, task:null, validBalance:null },
 };
 export const providerTypes = Object.keys(providers);
+export const providerOptions = Object.entries(providers).map(([type, p]) => ({ type, label:p.label }));
+// candidates 的可用性按能力分支，名单从注册表算出来，数据库里不另存一份会漂移的枚举。
+const balanceProviders = providerTypes.filter((t) => providers[t].accountBalance);
+const taskProviders = providerTypes.filter((t) => providers[t].task);
 export function providerPaths(type) {
   const paths = providers[type];
   if (!paths) throw new Error('unknown_provider_type');
@@ -65,10 +74,7 @@ export class Upstream {
     const response = await this.request(channel, path, { signal: AbortSignal.timeout(15_000) });
     if (!response.ok) { await response.body?.cancel(); throw new Error(`upstream_http_${response.status}`); }
     const data = await response.json();
-    if (data.success !== true || !Number.isFinite(data.remain_balance) || !Number.isFinite(data.used_balance) ||
-      !Number.isFinite(data.remain_credits) || !Number.isFinite(data.used_credits)) {
-      throw new Error('invalid_balance_response');
-    }
+    if (!providerPaths(channel.provider_type).validBalance(data)) throw new Error('invalid_balance_response');
     return data;
   }
   refreshSoon() {
@@ -92,7 +98,10 @@ export class Upstream {
       if (!accounts.has(key.account_id)) accounts.set(key.account_id, []);
       accounts.get(key.account_id).push(key);
       try {
-        const b = await this.balance(key, providerPaths(key.provider_type).keyBalance);
+        const paths = providerPaths(key.provider_type);
+        // 没有余额接口的渠道不查余额；candidates 对这类渠道也不看余额新鲜度，跳过不等于停用。
+        if (!paths.keyBalance) continue;
+        const b = await this.balance(key, paths.keyBalance);
         await this.db.tx(async (c) => {
           await c.query(`UPDATE upstream_keys SET balance=$2,used_balance=$3,unlimited=$4,
             remain_credits=$5,used_credits=$6,balance_at=now(),balance_error=NULL,last_error=NULL WHERE id=$1`,
@@ -110,7 +119,9 @@ export class Upstream {
       let lastError;
       for (const key of keys) {
         try {
-          const b = await this.balance(key, providerPaths(key.provider_type).accountBalance);
+          const paths = providerPaths(key.provider_type);
+          if (!paths.accountBalance) break;
+          const b = await this.balance(key, paths.accountBalance);
           await this.db.tx(async (c) => {
             await c.query(`UPDATE upstream_accounts SET balance=$2,used_balance=$3,balance_at=now(),
               remain_credits=$4,used_credits=$5,balance_error=NULL,blocked=($4::numeric<=0) WHERE id=$1`, [id, String(b.remain_balance), String(b.used_balance), String(b.remain_credits), String(b.used_credits)]);
@@ -126,12 +137,17 @@ export class Upstream {
     return { refreshed_keys: rows.length, refreshed_accounts: accounts.size };
   }
   async candidates(model, skip = []) {
+    // 媒体模型必须落在有异步任务接口的渠道上：提交成功但取不回结果，钱已经冻结了。
+    let media = false; try { mediaPricing(model); media = true; } catch { /* chat 或未知模型按非媒体处理 */ }
     return (await this.db.query(`SELECT k.id,k.account_id,k.secret_ref,k.concurrency,a.concurrency AS account_concurrency,a.base_url,a.provider_type
       FROM upstream_keys k JOIN upstream_accounts a ON a.id=k.account_id
-      WHERE k.enabled AND a.enabled AND NOT a.blocked AND a.remain_credits>0
-      AND a.balance_at>now()-interval '10 minutes' AND k.balance_at>now()-interval '10 minutes'
-      AND (k.unlimited OR k.remain_credits>0) AND (k.cooldown_until IS NULL OR k.cooldown_until<=now())
-      AND $1=ANY(k.models) AND NOT (k.id=ANY($2::uuid[])) ORDER BY k.created_at`, [model, skip])).rows;
+      WHERE k.enabled AND a.enabled AND NOT a.blocked AND (k.cooldown_until IS NULL OR k.cooldown_until<=now())
+      AND (NOT a.provider_type=ANY($3::text[]) OR (a.remain_credits>0
+        AND a.balance_at>now()-interval '10 minutes' AND k.balance_at>now()-interval '10 minutes'
+        AND (k.unlimited OR k.remain_credits>0)))
+      AND (NOT $4::boolean OR a.provider_type=ANY($5::text[]))
+      AND $1=ANY(k.models) AND NOT (k.id=ANY($2::uuid[])) ORDER BY k.created_at`,
+    [model, skip, balanceProviders, media, taskProviders])).rows;
   }
   syncTaskCharges() {
     if (this.taskChargesPending) return this.taskChargesPending;

@@ -3,7 +3,7 @@ import { passwordHash } from './security.mjs';
 import { randomUUID } from 'node:crypto';
 import { hash, token, httpError, verifyPassword, sessionCookie, readSession, RateLimiter } from './security.mjs';
 import * as v from './validation.mjs';
-import { providerTypes } from './upstream.mjs';
+import { providerTypes, providerOptions } from './upstream.mjs';
 
 // 渠道地址必须是 https 且不带查询串；扣费口径按 provider_type 走注册表，未登记的类型直接拒绝。
 function baseUrl(value) {
@@ -109,7 +109,7 @@ export function adminRoutes(app, { db, upstream, scheduler, origin, secureCookie
       active: [...scheduler.accounts.values()].reduce((a,b) => a+b,0), updated_at: new Date().toISOString() };
   });
   // 下拉选项由注册表直接吐出，前端不再维护第二份名单。
-  app.get('/admin/api/accounts', async () => ({ provider_types: providerTypes, rows: (await db.query(`SELECT a.*,
+  app.get('/admin/api/accounts', async () => ({ provider_types: providerOptions, rows: (await db.query(`SELECT a.*,
     (SELECT count(*) FROM upstream_keys k WHERE k.account_id=a.id) AS key_count FROM upstream_accounts a ORDER BY created_at`)).rows
     .map((a) => ({ ...a, active: scheduler.accounts.get(a.id) ?? 0 })) }));
   app.post('/admin/api/accounts', async (req) => {
