@@ -9,8 +9,11 @@ export async function recordTaskCharge(db, task, data) {
   const amount = String(data.credits_cost);
   const reference = `apimart:task:${task.upstream_task_id}:credits_cost`;
   return db.tx(async (c) => {
+    // credits_cost 是 APIMart 的口径；别的 provider 的数字单位未知，宁可不记成本也不记错金额。
     const saved = await c.query(`UPDATE requests SET cost_cny=$2,cost_reference=$3,cost_recorded_at=now()
-      WHERE id=$1 AND cost_cny IS NULL RETURNING id`, [task.id,amount,reference]);
+      WHERE id=$1 AND cost_cny IS NULL AND EXISTS (SELECT 1 FROM upstream_keys k
+        JOIN upstream_accounts a ON a.id=k.account_id WHERE k.id=requests.key_id AND a.provider_type='apimart')
+      RETURNING id`, [task.id,amount,reference]);
     if (!saved.rowCount) return false;
     await c.query('INSERT INTO audit_events(action,target_id,details) VALUES($1,$2,$3)',
       ['request.cost.sync',task.id,JSON.stringify({cost_cny:amount,source:reference})]);
