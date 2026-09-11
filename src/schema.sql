@@ -267,3 +267,29 @@ INSERT INTO schema_version(version) VALUES(14) ON CONFLICT DO NOTHING;
 -- 保证迁移与历史计费可复现；每笔冻结把当时的汇率写进 price_snapshot。
 ALTER TABLE billing_policy ADD COLUMN IF NOT EXISTS usd_cny numeric(12,4) NOT NULL DEFAULT 7.3 CHECK(usd_cny>0);
 INSERT INTO schema_version(version) VALUES(15) ON CONFLICT DO NOTHING;
+
+-- ── lanehub 接入：额度真源搬到 lanehub 之后，这一侧只留映射与入账幂等 ──────────
+-- 设计说明见 src/lanehub.mjs 的文件头。
+CREATE TABLE IF NOT EXISTS app_settings (
+  key text PRIMARY KEY, value text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now()
+);
+-- 一个客户 = lanehub 的一个用户 + 一个令牌。令牌落成 upstream_keys 行，
+-- 转发 / 并发闸 / requests.key_id 外键 / 尝试记录都能原样复用。
+CREATE TABLE IF NOT EXISTS lanehub_accounts (
+  user_id uuid PRIMARY KEY REFERENCES users(id),
+  lanehub_user_id integer NOT NULL,
+  key_id uuid NOT NULL REFERENCES upstream_keys(id),
+  lane text NOT NULL DEFAULT 'official',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS lanehub_accounts_lanehub_user ON lanehub_accounts(lanehub_user_id);
+-- 充值入账的幂等表。reference = 支付单号 / 兑换码 id / 迁移批次+客户，
+-- 支付回调重放和迁移脚本重跑都落在同一行上——否则每重放一次就是白送一次钱。
+CREATE TABLE IF NOT EXISTS lanehub_credits (
+  reference text PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES users(id),
+  amount_cny numeric NOT NULL CHECK (amount_cny > 0),
+  quota bigint NOT NULL CHECK (quota > 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  applied_at timestamptz
+);

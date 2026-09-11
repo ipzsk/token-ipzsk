@@ -13,6 +13,12 @@ const providers = {
     validBalance:(d) => d.success === true && ['remain_balance','used_balance','remain_credits','used_credits'].every((f) => Number.isFinite(d[f])) },
   // 通用 OpenAI 兼容中转（one-api / new-api 系，如书虫 / BBshare）：只转发对话与媒体同步接口。
   openai_relay: { label:'通用 OpenAI 中转', keyBalance:null, accountBalance:null, task:null, validBalance:null },
+  // lanehub：线路矩阵网关。它有异步任务接口，且**任务响应已经是规范化形状**
+  // （data.id / data.status 小写词表 / data.result / data.charge_cny），
+  // 所以 media-task-sync 那套解析可以原样用在它身上。
+  // 余额不在这一侧看：额度真源在 lanehub，它自己的用户页就是账本。
+  lanehub: { label:'lanehub 线路矩阵', keyBalance:null, accountBalance:null,
+    task:(id) => '/v1/tasks/'+encodeURIComponent(id), validBalance:null },
 };
 export const providerTypes = Object.keys(providers);
 export const providerOptions = Object.entries(providers).map(([type, p]) => ({ type, label:p.label }));

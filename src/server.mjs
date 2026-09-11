@@ -8,6 +8,7 @@ import { createCustomerAuth } from './customer-auth.mjs';
 import { loadMailer } from './email.mjs';
 import { createImageCaptcha } from './captcha.mjs';
 import { createApp } from './app.mjs';
+import { Lanehub } from './lanehub.mjs';
 
 const db = database({ host:process.env.PGHOST ?? 'db', port:Number(process.env.PGPORT ?? 5432),
   user:'gateway', database:'gateway', password:(await readFile(process.env.PGPASSWORD_FILE ?? '/run/secrets/db-password','utf8')).trim() });
@@ -31,7 +32,14 @@ async function refreshProxyAddresses(){
 }
 await refreshProxyAddresses();
 const proxyTimer=setInterval(refreshProxyAddresses,60000);proxyTimer.unref();
+// lanehub 客户端只在配好时才建：没配就是没开这条路，createApp 里那个 `Boolean(lanehub)`
+// 会把整条分支关掉——不会出现「开关是 on 但没有客户端」的半开状态。
+const lanehub = process.env.LANEHUB_BASE_URL && process.env.LANEHUB_ADMIN_TOKEN
+  ? new Lanehub({ baseUrl:process.env.LANEHUB_BASE_URL, adminToken:process.env.LANEHUB_ADMIN_TOKEN })
+  : null;
+
 const app = await createApp({ db,upstream,voucherKey,customerAuth,
+  lanehub,lanehubAccountId:process.env.LANEHUB_ACCOUNT_ID ?? null,
   trustProxy:(address)=>trustedProxyAddresses.has(address.replace(/^::ffff:/,'')),scheduler:new Scheduler(),
   origin:process.env.PUBLIC_ORIGIN ?? 'https://api.ipzsk.com',secureCookies:true,
   logger:{ level:'warn', redact:['req.headers.authorization','req.headers.cookie','res.headers.set-cookie','password','key','token'] } });

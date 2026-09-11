@@ -13,7 +13,7 @@ import { recordTaskCharge } from '../src/task-charges.mjs';
 const TOKEN = 'ipz_' + 'a'.repeat(43);
 
 test('provider registry serves apimart paths and refuses unknown types', () => {
-  assert.deepEqual(providerTypes, ['apimart', 'openai_relay']);
+  assert.deepEqual(providerTypes, ['apimart', 'openai_relay', 'lanehub']);
   assert.equal(providerPaths('apimart').keyBalance, '/v1/balance');
   assert.equal(providerPaths('apimart').accountBalance, '/v1/user/balance');
   assert.equal(providerPaths('apimart').task('a b'), '/v1/tasks/a%20b');
@@ -28,7 +28,13 @@ test('没有的能力用显式 null 登记，不是省略；后台下拉带中�
     assert.ok(capability in relay, capability);
     assert.equal(relay[capability], null);
   }
-  assert.deepEqual(providerOptions, [{ type:'apimart', label:'APIMart' }, { type:'openai_relay', label:'通用 OpenAI 中转' }]);
+  assert.deepEqual(providerOptions, [{ type:'apimart', label:'APIMart' },
+    { type:'openai_relay', label:'通用 OpenAI 中转' }, { type:'lanehub', label:'lanehub 线路矩阵' }]);
+  // lanehub 有任务接口、没有余额接口：轮询走得通，余额不在这一侧看（额度真源在对面）
+  const lane = providerPaths('lanehub');
+  assert.equal(typeof lane.task, 'function');
+  assert.equal(lane.keyBalance, null);
+  assert.equal(lane.accountBalance, null);
 });
 
 test('没有余额接口的渠道不查余额，也不因此被停用', async () => {
@@ -72,7 +78,7 @@ test('candidates 带出渠道行并支持跳过已失败的 key', async () => {
   await upstream.candidates('gpt-4o-mini', skip);
   assert.match(calls[0].sql, /a\.base_url,a\.provider_type/);
   assert.match(calls[0].sql, /NOT \(k\.id=ANY\(\$2::uuid\[\]\)\)/);
-  assert.deepEqual(calls[0].args, ['gpt-4o-mini', skip, ['apimart'], false, ['apimart']]);
+  assert.deepEqual(calls[0].args, ['gpt-4o-mini', skip, ['apimart'], false, ['apimart', 'lanehub']]);
 });
 
 test('可用性按能力分支：余额规则只压在有余额接口的渠道上，enabled/blocked/cooldown 对所有渠道都在', async () => {
@@ -90,7 +96,8 @@ test('媒体模型只走有异步任务接口的渠道，文本模型不受这�
   await upstream.candidates('gpt-image-2');
   assert.match(calls[0].sql.replace(/\s+/g, ' '), /AND \(NOT \$4::boolean OR a\.provider_type=ANY\(\$5::text\[\]\)\)/);
   // $4=true 时只留下注册了 task 的 provider；openai_relay 没有 /v1/tasks/{id}，永远不在这份名单里。
-  assert.deepEqual(calls[0].args.slice(3), [true, ['apimart']]);
+  // lanehub 有（而且它的任务响应已经是规范化形状），所以它在名单里。
+  assert.deepEqual(calls[0].args.slice(3), [true, ['apimart', 'lanehub']]);
   assert.equal(calls[0].args[4].includes('openai_relay'), false);
   assert.equal(providerPaths('openai_relay').task, null);
   const chat = await upstreamFixture();

@@ -167,3 +167,42 @@ Better Auth 1.7.2 提供六位邮箱验证码登录，首次验证成功创建�
 `POST /api/me/desktop/bootstrap` 仅接受已验证账户的登录会话，返回会话绑定的模型调用凭证、可用聊天模型和默认模型。模型目录定义在 `src/desktop.mjs`，与启用号池取交集，默认优先 `gpt-5.6-sol`，其次 `gpt-4o-mini`。桌面端使用内置 API 地址，无需手动复制 Key。
 
 schema 9 为 access_tokens 增加可空唯一 `auth_session_id`；一个登录会话对应一个桌面凭证记录，重复初始化轮换秘密，不影响其他会话或普通 API Key，不占普通 Key 的 20 个配额。网关在入口与排队后的上游提交前验证关联会话；退出、密码重置、用户禁用、凭证撤销和过期都能阻止后续调用。原请求的 token_id 保留，账单归属继续使用同一业务用户。
+
+## lanehub 模式（额度真源在 lanehub）
+
+开启后，这一侧不再预扣、不再改写字段、不再换线，请求带着**该客户自己的 lanehub 令牌**
+转发过去；额度、价目、扣费、账本全在 lanehub。这一侧保留账号、登录、插件授权、
+桌面端 bootstrap、并发闸与幂等边缘。
+
+环境变量：
+
+```
+LANEHUB_BASE_URL=https://lane.example      # lanehub 地址
+LANEHUB_ADMIN_TOKEN=...                    # lanehub 的管理令牌（建号、加额度用）
+LANEHUB_ACCOUNT_ID=<uuid>                  # 后台里那个 provider_type=lanehub 的上游账户
+```
+
+三条不配就不生效：没有客户端时整条分支关闭，不会出现「开关是 on 但没有客户端」的半开状态。
+
+### 切换与回滚（幂等）
+
+```
+node scripts/lanehub-switch.mjs status     # 看当前状态 + 前置检查
+node scripts/lanehub-switch.mjs on         # 四项前置检查全过才开
+node scripts/lanehub-switch.mjs off        # 立刻回滚，不做检查
+```
+
+前置检查挡的都是「跑起来才会发现、而发现时钱已经错了」的那类：lanehub 账户不存在或
+类型写错、还有客户的余额没迁走、`billing_policy` 仍开着（两边都预扣 = 同一笔钱冻两次）、
+还有未结算的预扣（切过去会永远停在 reserved）。
+
+### 余额迁移（幂等）
+
+```
+node scripts/lanehub-migrate.mjs --batch 2026-09-11            # dry-run，什么都不写
+node scripts/lanehub-migrate.mjs --batch 2026-09-11 --apply
+```
+
+幂等键是 `migrate:<批次>:<客户 id>`。**同一个批次重跑不会重复加钱；换一个批次号就是
+真的再加一次**——批次号要写进运行记录，不要随手改。折算汇率由 `LANEHUB_USD_CNY`
+显式指定，不从对面实时取：用请求时抓到的汇率迁历史余额，会让同一批客户按不同汇率折算。

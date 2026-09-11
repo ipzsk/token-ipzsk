@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node --test test/captcha.test.mjs test/core.test.mjs test/agent-protocols.test.mjs test/audio.test.mjs test/image-upload.test.mjs test/text-pricing.test.mjs test/model-catalog.test.mjs test/multi-upstream.test.mjs test/media-billing.test.mjs",
+    "test": "node --test test/captcha.test.mjs test/core.test.mjs test/agent-protocols.test.mjs test/audio.test.mjs test/image-upload.test.mjs test/text-pricing.test.mjs test/model-catalog.test.mjs test/multi-upstream.test.mjs test/media-billing.test.mjs test/lanehub.test.mjs",
     "test:integration": "node --test test/integration.test.mjs test/vouchers.test.mjs test/customer-auth.test.mjs test/accounts-billing.test.mjs test/plugins.test.mjs test/developers.test.mjs test/image-captcha.test.mjs"
   },
   "dependencies": {

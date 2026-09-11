@@ -1,6 +1,7 @@
 import { refreshMediaTask } from './media-task-sync.mjs';
 import { publicImageTask, imageUrls, fetchResultImage } from './image-results.mjs';
 import { adaptModelRequest } from './model-catalog.mjs';
+import { lanehubMode, ensureAccount } from './lanehub.mjs';
 import { reserveRequest, settleRequest } from './billing.mjs';
 import { customerOrigin } from './customer-auth.mjs';
 import { randomUUID } from 'node:crypto';
@@ -34,7 +35,7 @@ function stable(value) {
 const retryableStatus = (status) => [401,402,403,429].includes(status);
 // 连接阶段就失败，说明请求没有到达上游。ECONNRESET 等中途错误不在其列。
 const connectFailed = (error) => ['ECONNREFUSED','ENOTFOUND','EAI_AGAIN'].includes(error?.cause?.code);
-export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, origin, requestTimeoutMs = 180_000, maxAttempts = 3 }) {
+export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, origin, lanehub = null, lanehubAccountId = null, requestTimeoutMs = 180_000, maxAttempts = 3 }) {
   const limiter = new RateLimiter();
   app.decorateRequest('apiUser', null);
   app.addHook('onRequest', async (req) => {
@@ -104,7 +105,10 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     // adaptModelRequest 之后键名已经是上游的，resolveTier 认的是内部名，
     // 拿上游 body 去解析档位会在第一个真正改名的型号上静默回落到最便宜档。
     const requested = audio?.metadata??agentRequest(path,image??req.body);
-    const body = audio?.metadata??adaptModelRequest(path,requested);
+    // lanehub 模式下**不做字段适配**：canonical 契约本来就是干这件事的，
+    // 两层都改名等于改两次，而第二次改的是它不认识的键。
+    const viaLanehub = Boolean(lanehub) && await lanehubMode(db);
+    const body = audio?.metadata??(viaLanehub?requested:adaptModelRequest(path,requested));
     let plugin;
     if(req.apiUser.plugin_id){
       plugin=(await db.query('SELECT id,publisher_ref,allowed_models,owner_user_id,revenue_share_bps FROM plugins WHERE id=$1 AND enabled',[req.apiUser.plugin_id])).rows[0];
@@ -155,17 +159,28 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       finalized = true;
     };
     try {
-      await reserveRequest(db,id,req.apiUser.id,body,path,requested);
+      // lanehub 模式下**不预扣**：额度真源在对面，它自己会扣。两边都冻的结果是
+      // 同一笔钱冻两次，而用户看到的是这边那份余额——他会觉得钱少了却不知道为什么。
+      if(!viaLanehub)await reserveRequest(db,id,req.apiUser.id,body,path,requested);
       const payload = { ...body };
       const media=path==='/v1/images/generations'||path==='/v1/videos/generations';
       if(media)delete payload.stream;
       // Require usage for SSE. Models that omit it remain explicitly unverified.
       if (payload.stream && path==='/v1/chat/completions') payload.stream_options = { ...payload.stream_options, include_usage:true };
+      // lanehub 模式：这个客户自己的令牌就是唯一的候选，且**只打一次**。
+      // 不换线是对面的硬约束（换线会改变这一单的价钱），这边再换一层等于把它破掉。
+      const lanehubRow = viaLanehub
+        ? (await ensureAccount(db, lanehub, upstream, { userId: req.apiUser.id, name: req.apiUser.name, accountId: lanehubAccountId }))
+        : null;
+      const attempts = viaLanehub ? 1 : maxAttempts;
       const skip = []; let response = null, failure = null;
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      for (let attempt = 0; attempt < attempts; attempt++) {
         // 只有第一次没渠道才是 503；换渠道时拿不到别的 key 就沿用上一次的失败结果。
-        const next = await scheduler.acquire(() => upstream.candidates(body.model,skip), controller.signal)
-          .catch((error) => { if (attempt === 0 || controller.signal.aborted) throw error; return null; });
+        const next = lanehubRow
+          ? await scheduler.acquire(async () => [{ id: lanehubRow.key_id, account_id: lanehubAccountId, secret_ref: lanehubRow.secret_ref,
+              concurrency: 3, account_concurrency: 50, base_url: lanehub.baseUrl, provider_type: 'lanehub' }], controller.signal)
+          : await scheduler.acquire(() => upstream.candidates(body.model,skip), controller.signal)
+            .catch((error) => { if (attempt === 0 || controller.signal.aborted) throw error; return null; });
         if (!next) break;
         lease?.release(); lease = next;
         controller.signal.throwIfAborted();
@@ -195,7 +210,8 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
           await upstream.markFailure(lease.row,response.status,response.headers.get('retry-after'));
         }
         failure = response ? `upstream_http_${response.status}` : 'upstream_connect_failed';
-        if (response && !retryableStatus(response.status)) break;
+        // lanehub 那条线一律不换（上面 attempts=1 已经保证，这里是第二道闸）
+        if (viaLanehub || (response && !retryableStatus(response.status))) break;
         skip.push(lease.row.id);
         await db.query('UPDATE request_attempts SET upstream_id=$2,http_status=$3,error_code=$4,completed_at=now() WHERE id=$1',
           [attemptId,upstreamId,httpStatus,failure]);
