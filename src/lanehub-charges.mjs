@@ -28,6 +28,16 @@ export function quotaToCny(quota, usdCnyRate, quotaPerUnit) {
  * 和日志还没落库（什么都不做，下一轮再来）。不分开的话，前者会被永远重查。
  */
 export async function recordLanehubCharge(db, lanehub, row, { usdCnyRate, quotaPerUnit, staleAfterMs = 600_000 }) {
+  // 任务失败/取消时 lanehub 已经把钱退给用户了，但它退款写的是一条**系统日志**，
+  // 原来那条消费日志还在、quota 还是全额。照着日志记账会把一笔已退款的失败任务
+  // 算成正常收入，还据此给插件作者计提分成——用户的钱退了，账面却还在。
+  // 所以失败的任务根本不去查日志，直接落 released。
+  if (['failed', 'cancelled'].includes(row.task_status)) {
+    await db.query(`INSERT INTO request_billing (request_id,user_id,state,reserved_cny,charged_cny,price_snapshot,reason,resolved_at)
+      VALUES ($1,$2,'released',0,0,$3,'lanehub_task_refunded',now()) ON CONFLICT (request_id) DO NOTHING`,
+    [row.id, row.user_id, JSON.stringify({ source: 'lanehub', request_id: row.upstream_id, task_status: row.task_status })]);
+    return 'released';
+  }
   const page = await lanehub.call('/api/log/?request_id=' + encodeURIComponent(row.upstream_id) + '&size=20');
   const logs = (Array.isArray(page) ? page : page?.data ?? []).filter((log) => log.type === LOG_TYPE_CONSUME);
   if (!logs.length) {
@@ -58,7 +68,7 @@ export async function recordLanehubCharge(db, lanehub, row, { usdCnyRate, quotaP
  * 媒体任务要等它走到终态才查：lanehub 那边任务失败会退费，中途查到的数字会被退掉。
  */
 export async function reconcileLanehubCharges(db, lanehub, options) {
-  const { rows } = await db.query(`SELECT r.id,r.user_id,r.model,r.upstream_id,r.completed_at FROM requests r
+  const { rows } = await db.query(`SELECT r.id,r.user_id,r.model,r.upstream_id,r.completed_at,t.status AS task_status FROM requests r
     JOIN upstream_keys k ON k.id=r.key_id JOIN upstream_accounts a ON a.id=k.account_id
     LEFT JOIN media_tasks t ON t.id=r.id LEFT JOIN request_billing b ON b.request_id=r.id
     WHERE a.provider_type='lanehub' AND b.request_id IS NULL AND r.upstream_id IS NOT NULL

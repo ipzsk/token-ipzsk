@@ -10,8 +10,10 @@ function fakeDb(rows = []) {
     async query(sql, args = []) {
       if (/INSERT INTO request_billing/.test(sql)) {
         if (billing.some((b) => b.request_id === args[0])) return { rowCount: 0, rows: [] };
-        billing.push({ request_id: args[0], user_id: args[1], amount: args[2], snapshot: args[3] ?? null,
-          state: /'settled'/.test(sql) ? 'settled' : 'released' });
+        // released 那条 SQL 把金额写死成 0，参数里只有快照——两种形状别混着读。
+        const settled = /'settled'/.test(sql);
+        billing.push({ request_id: args[0], user_id: args[1], state: settled ? 'settled' : 'released',
+          amount: settled ? args[2] : 0, snapshot: settled ? args[3] : args[2] });
         return { rowCount: 1, rows: [] };
       }
       // 真 SQL 用 LEFT JOIN lanehub_credits 把已补过的排除掉；这里照做，
@@ -111,4 +113,23 @@ test('补记用 lanehub 现行汇率，配置里的只兜底', async () => {
   broken.usdRate = async () => { throw new Error('lanehub down') };
   await recordLanehubCharge(down, broken, request, { ...RATES, usdCnyRate: 7 });
   assert.equal(down.billing[0].amount, quotaToCny(4250, 7, 500000), '读不到汇率时用配置值，不能停摆');
+});
+
+// lanehub 任务失败会退款，但它退款写的是**系统日志**，原来那条消费日志还在、quota 还是全额。
+// 照着日志记账就会把已退款的失败任务算成收入，还给作者分了钱——用户的钱退了，账面却还在。
+test('失败/取消的任务落 released，且一次日志都不查', async () => {
+  for (const status of ['failed', 'cancelled']) {
+    const db = fakeDb(), lanehub = fakeLanehub([{ type: 2, quota: 4250 }]);
+    const outcome = await recordLanehubCharge(db, lanehub, { ...request, task_status: status }, RATES);
+    assert.equal(outcome, 'released');
+    assert.equal(db.billing[0].state, 'released');
+    assert.equal(db.billing[0].amount, 0, '失败的任务不能有金额，否则作者按它分成');
+    assert.equal(lanehub.seen.length, 0, '不该去查消费日志——那条日志还在，查了就会记错');
+  }
+});
+
+test('完成的任务照常记账（上面那条不能把正常的也挡掉）', async () => {
+  const db = fakeDb(), lanehub = fakeLanehub([{ type: 2, quota: 4250 }]);
+  assert.equal(await recordLanehubCharge(db, lanehub, { ...request, task_status: 'completed' }, RATES), 'settled');
+  assert.equal(db.billing[0].amount, quotaToCny(4250, 7, 500000));
 });
