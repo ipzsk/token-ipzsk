@@ -206,6 +206,10 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
         });
         httpStatus = response?.status ?? null;
         upstreamId = response?.headers.get('x-oneapi-request-id')?.slice(0,200) ?? null;
+        // lanehub 模式下这个头就是**对面的** request id，而扣费正是按它反查回来的
+        // （lanehub-charges.mjs）。下面几处会用响应体里的 id 覆盖它——那是上游的上游的
+        // id，查不到任何账。所以 lanehub 模式下一律不覆盖。
+        const keepUpstreamId = viaLanehub;
         if (response?.ok) { failure = null; break; }
         if (response) {
           await response.body?.cancel();
@@ -243,11 +247,11 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
             parser.finish();
             billingUsage=parser.billingUsage;responseTier=parser.serviceTier;
             observedUsage = parser.usage;
-            upstreamId = parser.upstreamId ?? upstreamId;
+            if(!viaLanehub)upstreamId = parser.upstreamId ?? upstreamId;
             const complete = parser.done && !parser.failed;
             await finalize(complete ? 'succeeded' : 'uncertain',parser.usage,complete ? null : 'stream_incomplete');
           } catch {
-            upstreamId = parser.upstreamId ?? upstreamId;
+            if(!viaLanehub)upstreamId = parser.upstreamId ?? upstreamId;
             await finalize('uncertain',parser.usage,'stream_interrupted');
           } finally {
             if (!finalized) await finalize('uncertain',parser.usage,'stream_interrupted').catch(() => app.log.error({request_id:id},'accounting_failed'));
@@ -273,7 +277,8 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       const value = agentResponse(path,raw);
       if(media) {
         const taskId=value.data[0].task_id;
-        upstreamId=taskId;
+        // 任务 id 另有 media_tasks.upstream_task_id 存着，这里不会丢。
+        if(!viaLanehub)upstreamId=taskId;
         await db.query('INSERT INTO media_tasks(id,upstream_task_id,kind) VALUES($1,$2,$3)',[id,taskId,path.includes('/images/')?'image':'video']);
         await finalize('succeeded',null);
         cleanup();
@@ -281,7 +286,7 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       }
       observedUsage = extractUsage(value);
       billingUsage = extractBillingUsage(value);responseTier=value.service_tier;
-      upstreamId = typeof value.id === 'string' ? value.id.slice(0,200) : upstreamId;
+      if(!viaLanehub&&typeof value.id === 'string')upstreamId = value.id.slice(0,200);
       await finalize('succeeded',observedUsage);
       cleanup();
       return reply.send(value);
