@@ -166,7 +166,10 @@ export class Upstream {
   async reconcileTaskCharges() {
     const tasks = (await this.db.query(`SELECT t.id,t.upstream_task_id,k.secret_ref,a.base_url,a.provider_type FROM media_tasks t
       JOIN requests r ON r.id=t.id JOIN upstream_keys k ON k.id=r.key_id JOIN upstream_accounts a ON a.id=k.account_id
-      WHERE r.cost_cny IS NULL ORDER BY t.updated_at LIMIT 20`)).rows;
+      -- lanehub 的任务永远不会有 cost_cny（recordTaskCharge 只认 apimart 的 credits_cost 口径），
+      -- 不排掉的话这 20 个名额会被它们永久占满，真正等着记成本的 apimart 任务再也轮不上。
+      -- lanehub 那条线的金额走 lanehub-charges.mjs，从对面的消费日志取。
+      WHERE r.cost_cny IS NULL AND a.provider_type<>'lanehub' ORDER BY t.updated_at LIMIT 20`)).rows;
     let recorded = 0, failed = 0;
     for (const task of tasks) {
       try {

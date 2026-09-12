@@ -22,7 +22,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { database } from '../src/database.mjs';
 import { Upstream } from '../src/upstream.mjs';
-import { Lanehub, provisionCustomer } from '../src/lanehub.mjs';
+import { Lanehub, provisionCustomer, creditAccount } from '../src/lanehub.mjs';
+import { reconcileLanehubCharges, reconcileLanehubTopups } from '../src/lanehub-charges.mjs';
 
 const spend = process.argv.includes('--spend');
 const env = (name, fallback) => process.env[name] ?? fallback;
@@ -116,10 +117,13 @@ try {
   if (!spend) {
     console.log('\n（没加 --spend，跳过真实生成与扣费验证）');
   } else {
-    const submit = await (await callAsCustomer('/v1/images/generations', {
+    const submitted = await callAsCustomer('/v1/images/generations', {
       method: 'POST', headers: { 'X-Quote-Id': quote.quote_id },
       body: JSON.stringify({ model: MODEL, prompt: 'e2e lemon', aspect_ratio: '1:1' }),
-    })).json();
+    });
+    // lanehub 把它的 request id 放在响应头里；网关就是靠它把扣费查回来的。
+    const lanehubRequestId = submitted.headers.get('x-oneapi-request-id');
+    const submit = await submitted.json();
     const taskId = submit?.data?.[0]?.task_id;
     check('提交：报价一致的请求被放行', Boolean(taskId), taskId ?? JSON.stringify(submit).slice(0, 120));
 
@@ -139,7 +143,50 @@ try {
 
     const after = Number((await lanehub.balance(first.lanehub_user_id))?.quota ?? 0);
     check('余额下降', after < quotaBefore, `${quotaBefore} → ${after}`);
+
+    // ── 4. 扣费回到这一侧：插件作者的分成读的就是 request_billing.charged_cny ──
+    // 这一步是变现模型的落点。没有它，作者后台的收益永远是 0。
+    // 这个脚本直接打 lanehub，不经过网关，所以库里没有 requests 行——补一条形状一样的，
+    // 字段取自真实响应（key_id 指向这个客户的 lanehub 密钥，upstream_id 就是上面那个头）。
+    // 补记扫描刻意跳过刚完成 30 秒内的请求（那时对面的消费日志可能还没落库），
+    // 这里把 completed_at 往前挪，免得脚本干等。
+    check('提交响应带 lanehub 的 request id', Boolean(lanehubRequestId), lanehubRequestId ?? '缺');
+    const requestId = randomUUID();
+    await db.query(`INSERT INTO requests (id,user_id,key_id,model,fingerprint,status,stream,upstream_id,completed_at)
+      VALUES ($1,$2,$3,$4,'e2e','succeeded',false,$5,now()-interval '2 minutes')`,
+    [requestId, TEST_USER_ID, first.key_id, MODEL, lanehubRequestId]);
+    const rates = { usdCnyRate: USD_CNY, quotaPerUnit: QUOTA_PER_UNIT };
+    const firstPass = await reconcileLanehubCharges(db, lanehub, rates);
+    const bill = (await db.query(
+      `SELECT b.state,b.charged_cny,b.price_snapshot FROM request_billing b JOIN requests r ON r.id=b.request_id
+       WHERE r.user_id=$1 ORDER BY b.created_at DESC LIMIT 1`, [TEST_USER_ID])).rows[0];
+    check('扣费回写：这一侧补出了一条已结算账单', bill?.state === 'settled',
+      `${bill?.state ?? '无账单'} ¥${bill?.charged_cny ?? '-'}（补记 ${firstPass.settled} 条）`);
+    check('扣费回写：金额取自 lanehub 的消费日志', Number(bill?.price_snapshot?.quota) > 0,
+      `quota=${bill?.price_snapshot?.quota ?? '-'}`);
+    // 这条是分成的地基：作者分的是「客户实际付了多少」，差一分都是分错。
+    check('扣费回写：补记金额 = 客户实扣', bill?.charged_cny === data.charge_cny,
+      `补记 ${bill?.charged_cny ?? '-'} / 实扣 ${data.charge_cny}`);
+
+    // 幂等：再扫一遍不能多出第二条账单（多一条就是把作者的分成算两遍）。
+    const billsBefore = (await db.query('SELECT count(*)::int AS n FROM request_billing b JOIN requests r ON r.id=b.request_id WHERE r.user_id=$1', [TEST_USER_ID])).rows[0].n;
+    await reconcileLanehubCharges(db, lanehub, rates);
+    const billsAfter = (await db.query('SELECT count(*)::int AS n FROM request_billing b JOIN requests r ON r.id=b.request_id WHERE r.user_id=$1', [TEST_USER_ID])).rows[0].n;
+    check('幂等：重复补记不会多出账单行', billsBefore === billsAfter, `${billsBefore} → ${billsAfter}`);
   }
+
+  // ── 5. 充值补账（不花钱：走的是我们自己的入账，不打上游） ────────────────
+  // 兑换码的钱写在这一侧的 wallet_entries 上，必须搬到 lanehub，否则客户花不掉。
+  const voucherId = env('LANEHUB_E2E_VOUCHER_ID', '00000000-0000-4000-8000-00000000e2e2');
+  const applied = await creditAccount(db, lanehub, {
+    userId: TEST_USER_ID, lanehubUserId: first.lanehub_user_id, amountCny: '1',
+    usdCnyRate: USD_CNY, quotaPerUnit: QUOTA_PER_UNIT, reference: 'voucher:' + voucherId, remark: 'e2e 充值',
+  }).catch(() => ({ applied: false }));
+  const credited = (await db.query('SELECT count(*)::int AS n FROM lanehub_credits WHERE reference=$1', ['voucher:' + voucherId])).rows[0].n;
+  check('充值：兑换码的钱能搬到 lanehub', credited === 1, applied.applied ? '本次入账' : '之前已入账');
+  const sweep = await reconcileLanehubTopups(db, lanehub, { usdCnyRate: USD_CNY, quotaPerUnit: QUOTA_PER_UNIT },
+    async () => ({ lanehub_user_id: first.lanehub_user_id }));
+  check('幂等：补账扫描不会重复入账', sweep.applied === 0, `扫到 ${sweep.scanned} 条待补`);
 } finally {
   await db.close();
 }

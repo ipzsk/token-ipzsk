@@ -9,6 +9,8 @@ import { loadMailer } from './email.mjs';
 import { createImageCaptcha } from './captcha.mjs';
 import { createApp } from './app.mjs';
 import { Lanehub } from './lanehub.mjs';
+import { reconcileLanehubCharges, reconcileLanehubTopups } from './lanehub-charges.mjs';
+import { provisionIfEnabled } from './lanehub.mjs';
 
 const db = database({ host:process.env.PGHOST ?? 'db', port:Number(process.env.PGPORT ?? 5432),
   user:'gateway', database:'gateway', password:(await readFile(process.env.PGPASSWORD_FILE ?? '/run/secrets/db-password','utf8')).trim() });
@@ -38,21 +40,33 @@ const lanehub = process.env.LANEHUB_BASE_URL && process.env.LANEHUB_ADMIN_TOKEN
   ? new Lanehub({ baseUrl:process.env.LANEHUB_BASE_URL, adminToken:process.env.LANEHUB_ADMIN_TOKEN })
   : null;
 
-const app = await createApp({ db,upstream,voucherKey,customerAuth,
+const lanehubUsdCny=Number(process.env.LANEHUB_USD_CNY ?? 0);
+const lanehubQuotaPerUnit=Number(process.env.LANEHUB_QUOTA_PER_UNIT ?? 500000);
+const appOptions = { db,upstream,voucherKey,customerAuth,
   lanehub,lanehubAccountId:process.env.LANEHUB_ACCOUNT_ID ?? null,
   // 新人额度：默认 ¥5。折算汇率显式给，不从对面实时取——同一批新用户按不同汇率
   // 折算会让「都送了 5 块」变成各自不同的积分。
   lanehubSignupCny:Number(process.env.LANEHUB_SIGNUP_CNY ?? 5),
-  lanehubUsdCny:Number(process.env.LANEHUB_USD_CNY ?? 0),
-  lanehubQuotaPerUnit:Number(process.env.LANEHUB_QUOTA_PER_UNIT ?? 500000),
+  lanehubUsdCny,lanehubQuotaPerUnit,
   trustProxy:(address)=>trustedProxyAddresses.has(address.replace(/^::ffff:/,'')),scheduler:new Scheduler(),
   origin:process.env.PUBLIC_ORIGIN ?? 'https://api.ipzsk.com',secureCookies:true,
-  logger:{ level:'warn', redact:['req.headers.authorization','req.headers.cookie','res.headers.set-cookie','password','key','token'] } });
+  logger:{ level:'warn', redact:['req.headers.authorization','req.headers.cookie','res.headers.set-cookie','password','key','token'] } };
+const app = await createApp(appOptions);
 const syncTimer = setInterval(() => upstream.refresh().catch(() => app.log.error('balance_refresh_failed')),120_000);
 syncTimer.unref();
 const syncCharges = () => upstream.syncTaskCharges().then(result => {
   if (result.failed) app.log.warn({failed:result.failed},'task_charge_sync_failed');
-}).catch(() => app.log.error('task_charge_sync_failed'));
+}).catch(() => app.log.error('task_charge_sync_failed'))
+  // lanehub 模式下这一侧不扣钱，但「这单收了多少」必须回来——插件作者的分成读的就是它。
+  .then(async () => {
+    if (!lanehub || !(lanehubUsdCny>0)) return;
+    const charges = await reconcileLanehubCharges(db,lanehub,{usdCnyRate:lanehubUsdCny,quotaPerUnit:lanehubQuotaPerUnit});
+    if (charges.failed) app.log.warn({failed:charges.failed},'lanehub_charge_sync_failed');
+    // 充值补账：兑换当场那次调用失败时，这里是唯一的补救。
+    const topups = await reconcileLanehubTopups(db,lanehub,{usdCnyRate:lanehubUsdCny,quotaPerUnit:lanehubQuotaPerUnit},
+      (user) => provisionIfEnabled(db,appOptions,user));
+    if (topups.failed) app.log.warn({failed:topups.failed},'lanehub_topup_sync_failed');
+  }).catch(() => app.log.error('lanehub_charge_sync_failed'));
 const chargeTimer = setInterval(syncCharges,120_000);
 chargeTimer.unref();
 let mediaPending;

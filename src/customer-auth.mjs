@@ -1,4 +1,5 @@
 import { issueKey } from './account-keys.mjs';
+import { provisionIfEnabled } from './lanehub.mjs';
 import { betterAuth } from 'better-auth';
 import { emailOTP } from 'better-auth/plugins/email-otp';
 import { fromNodeHeaders } from 'better-auth/node';
@@ -65,7 +66,8 @@ export function createCustomerAuth({db,secret,origin,mailer,captcha=unavailableC
   };
 }
 
-export function customerAuthRoutes(app,{db,customerAuth,origin}) {
+export function customerAuthRoutes(app,options) {
+  const {db,customerAuth,origin}=options;
   const limiter=new RateLimiter();
   app.get('/api/account/status',async()=>({password_login_ready:!!customerAuth,registration_ready:!!customerAuth?.mailer.ready&&!!customerAuth?.captcha.ready,email_login_ready:false,
     captcha_ready:!!customerAuth?.captcha.ready,captcha_provider:'captcha-canvas'}));
@@ -112,7 +114,14 @@ export function customerAuthRoutes(app,{db,customerAuth,origin}) {
     const result=await customerAuth.auth.handler(new Request(origin+req.url,{method:req.method,headers,
       ...(req.body?{body:JSON.stringify(req.body)}:{})}));
     const body=await result.text();
-    if(['/sign-in/email','/email-otp/verify-email'].includes(path)&&result.ok){const data=JSON.parse(body);await customerAuth.ensureCustomer(data.user);}
+    if(['/sign-in/email','/email-otp/verify-email'].includes(path)&&result.ok){
+      const data=JSON.parse(body);
+      const customer=await customerAuth.ensureCustomer(data.user);
+      // 注册/登录当场就把 lanehub 的账号、密钥和新人额度备好。放在这里而不是等第一次
+      // 发请求：不然新用户在后台查不到、余额显示 0，而「送了 5 块」是注册页答应过的。
+      // 失败不挡登录——网关和桌面端 bootstrap 还会各补一次。
+      await provisionIfEnabled(db,options,{userId:customer.id,name:customer.name}).catch(()=>{});
+    }
     reply.code(result.status);
     for(const [key,value] of result.headers)if(key!=='set-cookie')reply.header(key,value);
     const cookies=result.headers.getSetCookie();if(cookies.length)reply.header('Set-Cookie',cookies);

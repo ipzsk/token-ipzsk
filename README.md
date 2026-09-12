@@ -187,8 +187,10 @@ LANEHUB_QUOTA_PER_UNIT=500000              # lanehub 的 1 美元 = 多少 quota
 
 ### 一个客户一个密钥
 
-客户**登录时**（桌面端 bootstrap）就会在 lanehub 建好账号并签一个令牌，映射表的主键
-就是客户 id——一个客户永远只有一个密钥。第一次发请求那条路也会再备一次，两处都幂等。
+客户**注册/登录当场**就会在 lanehub 建好账号并签一个令牌，映射表的主键
+就是客户 id——一个客户永远只有一个密钥。桌面端 bootstrap 和第一次发请求各会再备一次，
+三处都幂等（同一个 `provisionIfEnabled`）。不等到首单才建号，是因为在那之前
+新用户在后台查不到、余额显示 0，而「注册送 5 块」是注册页答应过的。
 
 令牌按客户的档位（官方线 / 便宜线）签发，`unlimited_quota=true`：**额度管在用户身上，
 不是令牌上**，这样后台看到的「这个客户还剩多少」就是唯一那个数。
@@ -198,6 +200,37 @@ LANEHUB_QUOTA_PER_UNIT=500000              # lanehub 的 1 美元 = 多少 quota
 发放失败不影响登录——额度事后能补，登录不能卡。
 
 三条不配就不生效：没有客户端时整条分支关闭，不会出现「开关是 on 但没有客户端」的半开状态。
+
+### 扣费回到这一侧（插件分成的地基）
+
+lanehub 模式下这一侧**不预扣也不扣钱**，但「这一单收了多少」必须回来：插件作者的
+分成口径（`/api/me/developer/usage`、插件后台）读的是 `request_billing.charged_cny`，
+没有这张表的行，作者收益永远是 0——而那正是要卖的东西。
+
+数据来源是 **lanehub 的消费日志**，按 `request_id` 反查（这一侧早就把 lanehub 回的
+`X-Oneapi-Request-Id` 存进了 `requests.upstream_id`），所以 lanehub 侧不用改任何东西。
+折算汇率取**对面现行的** `PaymentUSDRate`，不是这边配的那个——实测两边差过 4%
+（配 7 / 对面 6.7078），差的就是作者分成的基数。配置值只在读不到时兜底。
+
+补记跑在和余额刷新同一个定时器上（120 秒），幂等键是 `request_id`：
+
+- 查到消费日志 → 写一条 `settled` 行，`charged_cny` 就是客户实扣（E2E 验到分毫不差）
+- 查不到，且完成不到 10 分钟 → 什么都不做，下一轮再来（日志可能还没落库）
+- 查不到，且已超过 10 分钟 → 写一条 `released` 行终止重试（失败的请求本来就没扣钱）
+
+媒体请求要等任务走到终态才补记：lanehub 那边任务失败会退费，中途查到的数字会被退掉。
+
+`reconcileTaskCharges`（APIMart 的 `credits_cost` 口径）已排除 lanehub 渠道——
+不排的话那 20 个名额会被永远查不出结果的 lanehub 任务占满。
+
+### 充值也要搬过去
+
+兑换码的钱写在这一侧的 `wallet_entries` 上，lanehub 模式下客户花的却是 lanehub 的额度，
+不搬过去那笔钱就躺在一个花不掉的钱包里。兑换成功后（事务外）立刻搬一次，失败了由同一个
+定时器扫描补上，幂等键 `voucher:<兑换码 id>`。
+
+`GET /api/me/wallet` 在 lanehub 模式下读的也是对面的余额（`source: "lanehub"`），
+不再是本地那张只剩充值流水的表。
 
 ### 切换与回滚（幂等）
 
@@ -219,7 +252,7 @@ export LANEHUB_BASE_URL=http://localhost:3000
 export LANEHUB_ADMIN_TOKEN=<lanehub root 的 access_token>
 
 node scripts/lanehub-e2e.mjs            # 不花钱：建号、新人额度、报价、报价校验
-node scripts/lanehub-e2e.mjs --spend    # 连真实生成一起验（会扣真钱）
+node scripts/lanehub-e2e.mjs --spend    # 连真实生成、扣费回写、分成基数一起验（会扣真钱）
 ```
 
 打的是真 lanehub 和真库，不是 mock——单元测试能证明幂等逻辑对，证明不了「对面的接口

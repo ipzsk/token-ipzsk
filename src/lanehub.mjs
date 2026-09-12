@@ -82,6 +82,21 @@ export class Lanehub {
   balance(userId) {
     return this.call('/api/user/' + userId);
   }
+
+  /**
+   * lanehub 现行的美元汇率（PaymentUSDRate）。折算扣费必须用**对面的**汇率：
+   * 消费日志里的 quota 是它按这个汇率算出来的，这边拿另一个数去折，账面就差几个点
+   * （实测配的 7 和对面的 6.7078 差 4%），而插件作者的分成正是按这个数分的。
+   * 缓存 10 分钟：它是管理项，不会一分钟一变，但也不该每笔账单都去问一次。
+   */
+  async usdRate() {
+    if (this.rateCachedAt > Date.now() - 600_000) return this.rateCache;
+    const options = await this.call('/api/option/');
+    const rate = Number((Array.isArray(options) ? options : []).find((o) => o.key === 'PaymentUSDRate')?.value);
+    if (!(rate > 0)) throw httpError(502, 'lanehub_usd_rate_unavailable');
+    this.rateCache = rate; this.rateCachedAt = Date.now();
+    return rate;
+  }
 }
 
 // lanehub 的密码上限是 20 个字符（实测报错才发现）。这个密码没人会用——
@@ -207,4 +222,20 @@ export async function creditAccount(db, lanehub, { userId, lanehubUserId, amount
 export async function lanehubMode(db) {
   const row = (await db.query("SELECT value FROM app_settings WHERE key='lanehub_mode'")).rows[0];
   return row?.value === 'on';
+}
+
+/**
+ * 三处（注册/登录后、桌面端 bootstrap、第一次发请求）都要备号，参数一模一样。
+ * 写三遍的结果是某处漏一个字段——比如漏掉 signupCny，那条路进来的新用户就不发钱。
+ */
+export async function provisionIfEnabled(db, options, { userId, name }) {
+  const { lanehub, upstream, lanehubAccountId, lanehubSignupCny = 0, lanehubUsdCny, lanehubQuotaPerUnit } = options;
+  if (!lanehub || !(await lanehubMode(db))) return null;
+  return provisionCustomer(db, lanehub, upstream, {
+    userId, name, accountId: lanehubAccountId, signupCny: lanehubSignupCny,
+    // 折算汇率以对面为准，配的那个只兜底：进的钱和出的账用同一个汇率，
+    // 「送了 5 块」在用户那边看回来才还是 5 块。历史余额迁移不走这条路——
+    // 那个脚本要求显式给汇率，一批客户必须按同一个数折算。
+    usdCnyRate: await lanehub.usdRate().catch(() => lanehubUsdCny), quotaPerUnit: lanehubQuotaPerUnit,
+  });
 }

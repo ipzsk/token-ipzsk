@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { hash, token, httpError, RateLimiter } from './security.mjs';
 
 import { desktopCatalog } from './model-catalog.mjs';
-import { lanehubMode, provisionCustomer } from './lanehub.mjs';
+import { provisionIfEnabled } from './lanehub.mjs';
 
 export async function checkDesktopSession(db,credential) {
   if(credential?.plugin_id){
@@ -15,7 +15,8 @@ export async function checkDesktopSession(db,credential) {
   if(!session.rowCount)throw httpError(401,'invalid_api_token');
 }
 
-export function desktopRoutes(app,{db,upstream,lanehub=null,lanehubAccountId=null,lanehubSignupCny=0,lanehubUsdCny=0,lanehubQuotaPerUnit=500000}) {
+export function desktopRoutes(app,options) {
+  const {db}=options;
   const limiter=new RateLimiter();
   app.post('/api/me/desktop/bootstrap',async req=>{
     if(!req.apiUser.session_id)throw httpError(403,'customer_login_required');
@@ -24,12 +25,7 @@ export function desktopRoutes(app,{db,upstream,lanehub=null,lanehubAccountId=nul
     // 首次建号时发新人额度。放在这里而不是注册事务里——那是个 db.tx，把一次跨网络调用
     // 塞进去会把事务拖长，失败还会把注册一起回滚掉。
     // 这里失败也不该挡住 bootstrap：密钥在第一次发请求时还会再备一次（网关那条路）。
-    if(lanehub&&await lanehubMode(db)){
-      await provisionCustomer(db,lanehub,upstream,{
-        userId:req.apiUser.id,name:req.apiUser.name,accountId:lanehubAccountId,
-        signupCny:lanehubSignupCny,usdCnyRate:lanehubUsdCny,quotaPerUnit:lanehubQuotaPerUnit,
-      }).catch(()=>{});
-    }
+    await provisionIfEnabled(db,options,{userId:req.apiUser.id,name:req.apiUser.name}).catch(()=>{});
     const rows=(await db.query(`SELECT DISTINCT unnest(k.models) AS model FROM upstream_keys k
       JOIN upstream_accounts a ON a.id=k.account_id WHERE k.enabled AND a.enabled`)).rows;
     const available=new Set(rows.map(row=>row.model));
