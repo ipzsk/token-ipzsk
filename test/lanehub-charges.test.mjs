@@ -5,8 +5,9 @@ import { quotaToCny, recordLanehubCharge, reconcileLanehubTopups } from '../src/
 // 补记账单用的内存库：只认这两条语句。
 function fakeDb(rows = []) {
   const billing = [], credits = new Map();
-  return {
+  const db = {
     billing, credits, topups: rows,
+    tx: (work) => work(db),
     async query(sql, args = []) {
       if (/INSERT INTO request_billing/.test(sql)) {
         if (billing.some((b) => b.request_id === args[0])) return { rowCount: 0, rows: [] };
@@ -22,6 +23,7 @@ function fakeDb(rows = []) {
         const pending = rows.filter((r) => !credits.has('voucher:' + r.voucher_id));
         return { rowCount: pending.length, rows: pending };
       }
+      if (/INSERT INTO plugin_earnings/.test(sql)) return { rowCount: 0, rows: [] };
       if (/INSERT INTO lanehub_credits/.test(sql)) {
         if (credits.has(args[0])) return { rowCount: 0, rows: [] };
         credits.set(args[0], { quota: args[3] }); return { rowCount: 1, rows: [{ reference: args[0] }] };
@@ -29,6 +31,7 @@ function fakeDb(rows = []) {
       return { rowCount: 0, rows: [] };
     },
   };
+  return db;
 }
 const fakeLanehub = (logs) => ({ seen: [], call(path) { this.seen.push(path); return { data: logs } },
   usdRate: async () => 7,

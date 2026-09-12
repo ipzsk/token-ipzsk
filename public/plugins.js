@@ -46,7 +46,7 @@ export function setupPlugins({api,action,el,table,cell,button,rowActions,charge,
         ['使用人数',number(r.active_users)],['调用次数',number(r.requests)],['失败次数',number(r.failed_requests)],['输入 / 输出 token',`${number(r.input_tokens)} / ${number(r.output_tokens)}`],['未知用量',r.unknown_token_requests+' 次'],['媒体任务 / 完成 / 失败',`${r.media_tasks} / ${r.completed_media_tasks} / ${r.failed_media_tasks}`],['收入和成本均已确认',r.margin_known_requests+' 笔'],['开发者归属标签',r.plugin_publisher_ref??'未归属']
       ]))]));}
     filters.append(from.l,to.l,select,button('查询',load),button('导出明细',()=>{
-      if(!reportData)return;const keys=['plugin_id','plugin_name','model','requests','failed_requests','input_tokens','output_tokens','total_tokens','unknown_token_requests','charged_cny','confirmed_cost_cny','unknown_cost_requests','confirmed_margin_cny','developer_earnings_cny'];
+      if(!reportData)return;const keys=['plugin_id','plugin_name','model','requests','failed_requests','input_tokens','output_tokens','total_tokens','unknown_token_requests','charged_cny','confirmed_cost_cny','unknown_cost_requests','confirmed_margin_cny','developer_earnings_cny','refunded_cny'];
       const quote=v=>'"'+String(v??'').replace(/^[\s]*[=+@-]/,"'$&").replaceAll('"','""')+'"';const data='\ufeff'+[keys,...reportData.rows.map(r=>keys.map(k=>r[k]))].map(row=>row.map(quote).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob([data],{type:'text/csv;charset=utf-8'})),a=el('a');a.href=url;a.download=`plugin-usage-${reportData.from}-${reportData.to}.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
     }));section.append(filters,report,el('p','毛利只计收入和成本均已确认的调用，未扣开发者分成。应计分成尚未打款。','footnote'));await load();
   }

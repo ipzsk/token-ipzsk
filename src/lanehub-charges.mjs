@@ -1,5 +1,6 @@
 import { units, decimal } from './billing.mjs';
 import { creditAccount, provisionIfEnabled } from './lanehub.mjs';
+import { accrueEarning } from './earnings.mjs';
 
 // lanehub 模式下这一侧**不预扣也不扣钱**——钱是 lanehub 从客户自己的额度里扣的。
 // 但「这单收了多少」仍然必须回到这一侧：插件作者的分成口径
@@ -55,10 +56,15 @@ export async function recordLanehubCharge(db, lanehub, row, { usdCnyRate, quotaP
   // 实测两边差过 4%（配 7 / 对面 6.7078），而作者的分成正是按这个金额分的。
   const rate = await lanehub.usdRate().catch(() => usdCnyRate);
   const amount = quotaToCny(quota, rate, quotaPerUnit);
-  await db.query(`INSERT INTO request_billing (request_id,user_id,state,reserved_cny,charged_cny,price_snapshot,reason,resolved_at)
-    VALUES ($1,$2,'settled',$3,$3,$4,'lanehub',now()) ON CONFLICT (request_id) DO NOTHING`,
-  [row.id, row.user_id, amount, JSON.stringify({ source: 'lanehub', request_id: row.upstream_id,
-    quota, usd_cny: String(rate), quota_per_unit: quotaPerUnit, model: row.model })]);
+  // 账单和作者计提写在同一个事务里：分开写就会出现「扣了钱但没计提」的窗口，
+  // 而那个窗口里出的结算单会漏掉这笔。
+  await db.tx(async (c) => {
+    await c.query(`INSERT INTO request_billing (request_id,user_id,state,reserved_cny,charged_cny,price_snapshot,reason,resolved_at)
+      VALUES ($1,$2,'settled',$3,$3,$4,'lanehub',now()) ON CONFLICT (request_id) DO NOTHING`,
+    [row.id, row.user_id, amount, JSON.stringify({ source: 'lanehub', request_id: row.upstream_id,
+      quota, usd_cny: String(rate), quota_per_unit: quotaPerUnit, model: row.model })]);
+    await accrueEarning(c, row.id);
+  });
   return 'settled';
 }
 

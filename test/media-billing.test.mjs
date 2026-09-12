@@ -26,6 +26,9 @@ function fake(credit){
       state.debits.push({request_id:params[1],user_id:params[2],amount_cny:params[3]});return {rowCount:1};}
     if(sql.startsWith('UPDATE requests SET cost_cny')){if(state.costs.has(params[0]))return {rowCount:0};state.costs.set(params[0],params[1]);return {rowCount:1};}
     if(sql.startsWith('INSERT INTO audit_events'))return {rowCount:1};
+    // 计提跟着结算走（同一个事务）。这些用例里的请求没有插件归属，
+    // 真 SQL 的 WHERE 也会把它们滤掉，所以这里等价地当成空写。
+    if(sql.startsWith('INSERT INTO plugin_earnings'))return {rowCount:0};
     throw new Error('unexpected query: '+sql);
   }};
   return {state,db:{tx:fn=>fn(c),query:c.query},c};

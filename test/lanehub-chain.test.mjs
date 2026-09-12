@@ -134,6 +134,77 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
       assert.equal(Number(row.developer_earnings_cny).toFixed(8),(charged*0.3).toFixed(8),'作者分成 = 实扣 × 30%');
     });
 
+    await t.test('人工退款：钱回到用户额度，作者的计提同额冲掉', async () => {
+      const login=await app.inject({url:'/admin/api/login',method:'POST',payload:{password:'test-administrator-password'},
+        headers:{origin:'https://api.ipzsk.com'}});
+      const cookie=login.headers['set-cookie'].split(';')[0];
+      const bill=(await db.query(`SELECT request_id,charged_cny FROM request_billing WHERE state='settled'`)).rows[0];
+      const accrued=Number((await db.query(`SELECT sum(amount_cny) AS n FROM plugin_earnings WHERE owner_user_id=$1`,[ownerId])).rows[0].n);
+      assert.ok(accrued>0,'先得有计提，才谈得上冲销');
+
+      const before=quotaAdded.length;
+      const refund=await app.inject({url:'/admin/api/billing/'+bill.request_id+'/refund',method:'POST',
+        headers:{cookie,origin:'https://api.ipzsk.com'},payload:{amount_cny:'0.02000000',reason:'用户反馈图片不可用'}});
+      assert.equal(refund.statusCode,200,refund.body);
+      assert.equal(quotaAdded.length,before+1,'钱必须真的回到用户的 lanehub 额度');
+
+      const after=Number((await db.query(`SELECT sum(amount_cny) AS n FROM plugin_earnings WHERE owner_user_id=$1`,[ownerId])).rows[0].n);
+      assert.equal(Number((after-accrued).toFixed(8)),-0.006,'作者按同样比例被冲回 30%');
+      assert.equal(Number((await db.query('SELECT refunded_cny FROM request_billing WHERE request_id=$1',[bill.request_id])).rows[0].refunded_cny),0.02);
+      // charged_cny 是「当时收了多少」的事实，不能被退款改掉。
+      assert.equal((await db.query('SELECT charged_cny FROM request_billing WHERE request_id=$1',[bill.request_id])).rows[0].charged_cny,bill.charged_cny);
+
+      // 退不出比收的还多。
+      const over=await app.inject({url:'/admin/api/billing/'+bill.request_id+'/refund',method:'POST',
+        headers:{cookie,origin:'https://api.ipzsk.com'},payload:{amount_cny:'99',reason:'超额退款应当被拒'}});
+      assert.equal(over.statusCode,409,over.body);
+    });
+
+    await t.test('结算单：起草 → 冻结 → 打款；冻结之后的退款落到下一张单', async () => {
+      const login=await app.inject({url:'/admin/api/login',method:'POST',payload:{password:'test-administrator-password'},
+        headers:{origin:'https://api.ipzsk.com'}});
+      const cookie=login.headers['set-cookie'].split(';')[0];
+      const admin=(url,method='GET',payload)=>app.inject({url:'/admin/api'+url,method,payload,headers:{cookie,origin:'https://api.ipzsk.com'}});
+
+      const open=(await admin('/settlements')).json().pending.find(p=>p.owner_user_id===ownerId);
+      assert.ok(Number(open.amount_cny)>0,'先看得到还没出单的计提');
+
+      const draft=(await admin('/settlements','POST',{owner_user_id:ownerId,from:'2000-01-01',to:'2099-12-31'})).json();
+      assert.equal(Number(draft.amount_cny),Number(open.amount_cny),'出单金额 = 未归属的计提合计');
+      assert.equal((await admin('/settlements')).json().pending.length,0,'圈进去之后就不再是待出单');
+
+      // 同一条明细不能进两张单：紧接着再出一张，只能是空的。
+      const second=(await admin('/settlements','POST',{owner_user_id:ownerId,from:'2000-01-01',to:'2099-12-31'})).json();
+      assert.equal(Number(second.amount_cny),0);
+      assert.equal((await admin('/settlements/'+second.id+'/void','POST',{reason:'重复出单，作废'})).statusCode,200);
+
+      assert.equal((await admin('/settlements/'+draft.id+'/pay','POST',{paid_note:'未冻结不能打款'})).statusCode,409);
+      const frozen=(await admin('/settlements/'+draft.id+'/freeze','POST',{})).json();
+      assert.equal(Number(frozen.amount_cny),Number(draft.amount_cny));
+
+      // 冻结之后再退款：不回溯改这张单，作为一条负数计提等下一张单。
+      const bill=(await db.query(`SELECT request_id FROM request_billing WHERE state='settled'`)).rows[0];
+      assert.equal((await admin('/billing/'+bill.request_id+'/refund','POST',{amount_cny:'0.01000000',reason:'第二次部分退款'})).statusCode,200);
+      const after=(await admin('/settlements/'+draft.id)).json().settlement;
+      assert.equal(Number(after.amount_cny),Number(frozen.amount_cny),'已冻结的金额不能被事后改掉');
+      const nextPending=(await admin('/settlements')).json().pending.find(p=>p.owner_user_id===ownerId);
+      assert.equal(Number(nextPending.amount_cny),-0.003,'冲销落到下一张单里');
+
+      assert.equal((await admin('/settlements/'+draft.id+'/pay','POST',{paid_note:'微信转账 2026-09-12 单号 X1'})).statusCode,200);
+      assert.equal((await admin('/settlements/'+draft.id+'/void','POST',{reason:'已打款的单不能作废'})).statusCode,409);
+
+      // 作者视角那条路要浏览器登录态，API 令牌打不开（开发者后台的既有约束）。
+      const plain=token('ipz_');
+      await db.query(`INSERT INTO access_tokens (id,user_id,token_hash,prefix,name) VALUES ($1,$2,$3,$4,'作者凭证')`,
+        [randomUUID(),ownerId,hash(plain),plain.slice(0,12)]);
+      const mine=await app.inject({url:'/api/me/developer/settlements',headers:{authorization:'Bearer '+plain}});
+      assert.equal(mine.statusCode,403,'开发者后台只认登录会话');
+
+      const paid=(await admin('/settlements?owner_user_id='+ownerId)).json();
+      assert.equal(paid.rows.find(r=>r.id===draft.id).state,'paid');
+      assert.ok(paid.rows.find(r=>r.id===draft.id).paid_note.includes('X1'),'打款凭据要留痕');
+    });
+
     await t.test('余额读的是 lanehub，不是本地那张只剩充值流水的表', async () => {
       const wallet=await app.inject({url:'/api/me/wallet',headers:{authorization:'Bearer '+pluginToken}});
       // 插件令牌不许碰 /api/me（这条本身也是要守住的边界）

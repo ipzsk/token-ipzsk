@@ -61,6 +61,10 @@ test('three roles isolate administration, plugin ownership, usage and customer r
   await t.test('only the owning developer sees aggregate usage and revenue, never customer details or upstream cost',async()=>{
    const requestId=randomUUID();await db.query(`INSERT INTO requests(id,user_id,model,fingerprint,stream,status,usage_state,input_tokens,output_tokens,total_tokens,cost_cny,plugin_id,plugin_owner_user_id,plugin_share_bps) VALUES($1,$2,'fixture-model','fixture',false,'succeeded','reported',12,8,20,3,$3,$4,2500)`,[requestId,customer,aPlugin,alice]);
    await db.query(`INSERT INTO request_billing(request_id,user_id,state,reserved_cny,charged_cny,price_snapshot) VALUES($1,$2,'settled',10,10,'{}')`,[requestId,customer]);
+   // 分成的真源是 plugin_earnings（结算时由 accrueEarning 写），这里等价地补上一行。
+   await db.query(`INSERT INTO plugin_earnings(id,request_id,owner_user_id,plugin_id,kind,amount_cny)
+     SELECT gen_random_uuid(),r.id,r.plugin_owner_user_id,r.plugin_id,'accrual',round(b.charged_cny*r.plugin_share_bps/10000,8)
+     FROM requests r JOIN request_billing b ON b.request_id=r.id WHERE r.id=$1`,[requestId]);
    const a=(await call(alice,path+'/usage')).json();assert.equal(a.rows[0].active_users,'1');assert.equal(a.rows[0].total_tokens,'20');assert.equal(Number(a.rows[0].billed_revenue_cny),10);assert.equal(Number(a.rows[0].accrued_earnings_cny),2.5);assert.equal(a.settlement_enabled,false);
    for(const key of ['user_id','email','cost_cny','confirmed_cost_cny','access_token_id'])assert.equal(a.rows[0][key],undefined);
    assert.equal((await call(bob,path+'/usage?plugin_id='+aPlugin)).json().rows.length,0);

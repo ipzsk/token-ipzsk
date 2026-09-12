@@ -92,15 +92,59 @@
 lanehub 退款写的是一条系统日志，原来那条消费日志还在、quota 还是全额——照着它记账
 会把已退款的失败任务算成收入，还给作者分了钱。
 
-## 五、分成
+## 五、分成与结算
+
+### 计提
+
+`plugin_earnings` 是**作者应得的唯一真源**：结算时计提一行，退款时再记一行负数。
+报表和结算单都从它汇总，不各自按 `charged_cny` 再算一遍——两份口径只要差一点，
+打给作者的钱就是错的。
 
 ```
-request_billing.charged_cny × requests.plugin_share_bps / 10000 → 作者应得
+计提 = (charged_cny - refunded_cny) × plugin_share_bps / 10000
 ```
 
-出口两个：`/admin/api/plugin-usage`（运营视角，含毛利）、`/api/me/developer/usage`（作者视角）。
-两者都按 `plugin_owner_user_id` 的**历史快照**统计，改当前归属不会改写历史收益。
-`settlement_enabled: false` —— 目前只计提，不打款。
+比例和归属取 `requests` 上的**发生时快照**，改当前归属不会改写历史收益。
+写入点两个，都在结算的同一个事务里：`billing.debit()`（本地）和
+`recordLanehubCharge()`（lanehub 模式）——分开写会出现「扣了钱但没计提」的窗口。
+
+### 退款
+
+`POST /admin/api/billing/:id/refund`（superadmin），一个事务里做三件事：
+
+1. `refunded_cny` 累加 —— `charged_cny` 不动，它是「当时收了多少」的事实
+2. `plugin_earnings` 记一条负数，按同样的比例冲回
+3. 钱真回到用户手里：lanehub 模式加回对面额度（幂等键 `refund:<请求 id>:<序号>`），
+   本地模式写 `wallet_entries`
+
+退不出比收的多（`refund_exceeds_charge`）。
+
+### 结算单（人工打款的凭据）
+
+`settlements` + `plugin_earnings.settlement_id`。状态机：
+
+```
+draft ──freeze──▶ frozen ──pay──▶ paid
+  └──void──▶ void（释放明细，可重新出单；已打款的不能作废）
+```
+
+| 接口 | 作用 |
+| --- | --- |
+| `GET /admin/api/settlements` | 单列表 + **还没出单的计提合计**（按作者分组） |
+| `POST /admin/api/settlements` | 起草：把区间内还没归属任何单的计提圈进来 |
+| `GET /admin/api/settlements/:id` | 单详情 + 明细 |
+| `POST /admin/api/settlements/:id/freeze` | 冻结（重算一次再锁金额） |
+| `POST /admin/api/settlements/:id/pay` | 登记人工打款，`paid_note` 必填（转账单号） |
+| `POST /admin/api/settlements/:id/void` | 作废，释放明细 |
+| `GET /api/me/developer/settlements` | 作者自己看（要浏览器登录态） |
+
+两条关键语义：
+
+- **同一条明细只能进一张单**（`settlement_id IS NULL` 才圈），重复出单只会是空单
+- **冻结之后不回溯**：之后发生的退款作为一条负数计提落到下一张单里 ——
+  已经打出去的钱不能被事后改账
+
+打款本身是人工的：没有提现流程、没有付款流水，`paid_note` 就是凭据。
 
 ## 六、充值与余额
 
@@ -135,8 +179,8 @@ node scripts/lanehub-switch.mjs off      # 立刻回滚，不做检查
 
 ## 还缺的
 
-1. **打款**：分成只计提（`settlement_enabled: false`），没有结算单、没有提现。
-   **成功后的人工退款**也还不会反向冲掉已计提的作者收益 —— 打款上线前必须处理。
+1. **打款流程**：结算单只到「登记已打款」为止——没有提现申请、没有付款流水对接。
+   运营后台也还没有结算单页面，目前只有接口。
 2. **skill 粒度**：记账最细到插件（`plugin_id`），一个插件里多个 skill 分不开。
    要分得开，插件调用时得带 skill 标识，网关再落一列。
 3. **七个上游没验过**：只有 APIMart 用真 Key 跑通过；优云 / 优云H3 / AutoDL

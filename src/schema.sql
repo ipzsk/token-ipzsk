@@ -297,3 +297,53 @@ CREATE TABLE IF NOT EXISTS lanehub_credits (
   created_at timestamptz NOT NULL DEFAULT now(),
   applied_at timestamptz
 );
+
+-- 退款：已结算的账单可以被人工退掉一部分或全部。不改 charged_cny（它是「当时收了多少」
+-- 的事实），另记 refunded_cny，净额 = charged - refunded。所有分成口径都按净额算。
+ALTER TABLE request_billing ADD COLUMN IF NOT EXISTS refunded_cny numeric(20,8) NOT NULL DEFAULT 0 CHECK(refunded_cny>=0);
+
+-- 结算单：给插件作者人工打款用的凭据。冻结之后金额锁死，之后发生的退款不回溯改它，
+-- 而是作为一条负数计提落到下一张单里——已经打出去的钱不能被事后改账。
+CREATE TABLE IF NOT EXISTS settlements (
+  id uuid PRIMARY KEY,
+  owner_user_id uuid NOT NULL REFERENCES developer_profiles(user_id),
+  period_from date NOT NULL, period_to date NOT NULL,
+  state text NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','frozen','paid','void')),
+  amount_cny numeric(20,8) NOT NULL DEFAULT 0, item_count integer NOT NULL DEFAULT 0,
+  note text NOT NULL DEFAULT '', paid_note text NOT NULL DEFAULT '',
+  created_by integer REFERENCES administrators(id),
+  created_at timestamptz NOT NULL DEFAULT now(), frozen_at timestamptz, paid_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS settlements_owner ON settlements(owner_user_id,created_at DESC);
+
+-- 分成明细：**作者应得的唯一真源**。计提一行，退款再记一行负数——
+-- 报表和结算单都从这里汇总，不各自再按 charged_cny 算一遍。
+-- 两份口径只要差一点，打出去的钱就是错的。
+CREATE TABLE IF NOT EXISTS plugin_earnings (
+  id uuid PRIMARY KEY,
+  request_id uuid NOT NULL REFERENCES requests(id),
+  owner_user_id uuid NOT NULL REFERENCES developer_profiles(user_id),
+  plugin_id uuid REFERENCES plugins(id),
+  kind text NOT NULL CHECK(kind IN ('accrual','refund')),
+  amount_cny numeric(20,8) NOT NULL,
+  settlement_id uuid REFERENCES settlements(id),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+-- 一笔请求只能计提一次；退款可以多次（部分退）。
+CREATE UNIQUE INDEX IF NOT EXISTS plugin_earnings_accrual ON plugin_earnings(request_id) WHERE kind='accrual';
+CREATE INDEX IF NOT EXISTS plugin_earnings_open ON plugin_earnings(owner_user_id,created_at) WHERE settlement_id IS NULL;
+CREATE INDEX IF NOT EXISTS plugin_earnings_settlement ON plugin_earnings(settlement_id);
+-- 一次性回填：上线之前已经结算过的请求也要有计提，否则作者的第一张结算单会漏掉
+-- 全部历史收益。挂在 schema_version 上，只跑一次（ON CONFLICT 也保证重跑无害）。
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_version WHERE version=11) THEN
+    INSERT INTO plugin_earnings (id,request_id,owner_user_id,plugin_id,kind,amount_cny)
+    SELECT gen_random_uuid(),r.id,r.plugin_owner_user_id,r.plugin_id,'accrual',
+      round((b.charged_cny-b.refunded_cny)*r.plugin_share_bps/10000,8)
+    FROM requests r JOIN request_billing b ON b.request_id=r.id
+    WHERE r.plugin_owner_user_id IS NOT NULL AND coalesce(r.plugin_share_bps,0)>0
+      AND b.state='settled' AND (b.charged_cny-b.refunded_cny)>0
+    ON CONFLICT DO NOTHING;
+    INSERT INTO schema_version(version) VALUES(11);
+  END IF;
+END $$;

@@ -5,6 +5,7 @@ import { adminAccountRoutes } from './admin-accounts.mjs';
 import { accountKeyRoutes } from './account-keys.mjs';
 import { desktopRoutes } from './desktop.mjs';
 import { billingRoutes } from './billing.mjs';
+import { earningsRoutes } from './earnings.mjs';
 import Fastify, { LogController } from 'fastify';
 import { readFile } from 'node:fs/promises';
 import { customerAuthRoutes, customerOrigin } from './customer-auth.mjs';
@@ -59,6 +60,7 @@ export async function createApp(options) {
   accountKeyRoutes(app,options);
   desktopRoutes(app,options);
   billingRoutes(app,options);
+  earningsRoutes(app,options);
   adminAccountRoutes(app,options);
   pluginRoutes(app,options);
   developerRoutes(app,options);

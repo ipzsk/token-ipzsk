@@ -125,8 +125,11 @@ export function pluginRoutes(app,{db,githubFetch}){
       count(*) FILTER(WHERE r.total_tokens IS NULL) AS unknown_token_requests,
       sum(r.input_tokens) AS input_tokens,sum(r.output_tokens) AS output_tokens,sum(r.total_tokens) AS total_tokens,
       sum(r.cost_cny) AS confirmed_cost_cny,count(*) FILTER(WHERE r.cost_cny IS NULL) AS unknown_cost_requests,
-      sum(round(b.charged_cny*r.plugin_share_bps/10000,8)) FILTER(WHERE b.state='settled' AND r.plugin_owner_user_id IS NOT NULL) AS developer_earnings_cny,
-      sum(b.charged_cny-r.cost_cny) FILTER(WHERE b.state='settled' AND r.cost_cny IS NOT NULL) AS confirmed_margin_cny,
+      -- 分成读 plugin_earnings（唯一真源：计提一行、退款一行负数），不在这里按
+      -- charged_cny 再算一遍——两份口径只要差一点，打给作者的钱就是错的。
+      sum((SELECT coalesce(sum(pe.amount_cny),0) FROM plugin_earnings pe WHERE pe.request_id=r.id)) AS developer_earnings_cny,
+      sum(b.refunded_cny) FILTER(WHERE b.state='settled') AS refunded_cny,
+      sum(b.charged_cny-b.refunded_cny-r.cost_cny) FILTER(WHERE b.state='settled' AND r.cost_cny IS NOT NULL) AS confirmed_margin_cny,
       count(*) FILTER(WHERE b.state='settled' AND r.cost_cny IS NOT NULL) AS margin_known_requests,
       sum(b.charged_cny) FILTER(WHERE b.state='settled') AS charged_cny,
       count(*) FILTER(WHERE b.state='settled') AS settled_requests,

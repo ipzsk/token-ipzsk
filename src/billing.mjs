@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { httpError } from './security.mjs';
 import { prices, estimateTextCost } from './text-pricing.mjs';
 import { mediaPricing, resolveTier } from './model-catalog.mjs';
+import { accrueEarning } from './earnings.mjs';
 
 export const units=value=>{const [a,b='']=String(value).split('.');return BigInt(a)*100000000n+BigInt(b.padEnd(8,'0').slice(0,8));};
 export const decimal=value=>`${value/100000000n}.${String(value%100000000n).padStart(8,'0')}`;
@@ -96,6 +97,8 @@ async function debit(c,bill,amount,source){
   const after=decimal(units(balance.balance_cny)-units(amount));
   await c.query('INSERT INTO wallet_debits(id,request_id,user_id,amount_cny,balance_after_cny) VALUES($1,$2,$3,$4,$5)',[randomUUID(),bill.request_id,bill.user_id,amount,after]);
   await c.query("UPDATE request_billing SET state='settled',charged_cny=$2,resolved_at=now(),reason=$3 WHERE request_id=$1",[bill.request_id,amount,source]);
+  // 结算的同一个事务里计提作者分成：分开写就会出现「扣了钱但没计提」的窗口。
+  await accrueEarning(c,bill.request_id);
 }
 export function billingRoutes(app,{db}){
   app.get('/admin/api/billing',async()=>({policy:(await db.query('SELECT * FROM billing_policy')).rows[0],pending:(await db.query(`SELECT b.*,u.name AS user_name FROM request_billing b JOIN users u ON u.id=b.user_id WHERE state IN ('pending','reserved') ORDER BY review_at LIMIT 200`)).rows}));
