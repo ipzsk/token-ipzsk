@@ -180,7 +180,22 @@ schema 9 为 access_tokens 增加可空唯一 `auth_session_id`；一个登录�
 LANEHUB_BASE_URL=https://lane.example      # lanehub 地址
 LANEHUB_ADMIN_TOKEN=...                    # lanehub 的管理令牌（建号、加额度用）
 LANEHUB_ACCOUNT_ID=<uuid>                  # 后台里那个 provider_type=lanehub 的上游账户
+LANEHUB_SIGNUP_CNY=5                       # 新用户注册赠送额度（人民币，默认 5）
+LANEHUB_USD_CNY=7                          # 折算汇率，显式给，不从对面实时取
+LANEHUB_QUOTA_PER_UNIT=500000              # lanehub 的 1 美元 = 多少 quota
 ```
+
+### 一个客户一个密钥
+
+客户**登录时**（桌面端 bootstrap）就会在 lanehub 建好账号并签一个令牌，映射表的主键
+就是客户 id——一个客户永远只有一个密钥。第一次发请求那条路也会再备一次，两处都幂等。
+
+令牌按客户的档位（官方线 / 便宜线）签发，`unlimited_quota=true`：**额度管在用户身上，
+不是令牌上**，这样后台看到的「这个客户还剩多少」就是唯一那个数。
+
+首次建号时发放 `LANEHUB_SIGNUP_CNY` 的新人额度，幂等键 `signup:<客户 id>`：
+重复登录不会重复发；**余额迁移脚本先建过映射的老客户不会被当成新人**（created 为 false）；
+发放失败不影响登录——额度事后能补，登录不能卡。
 
 三条不配就不生效：没有客户端时整条分支关闭，不会出现「开关是 on 但没有客户端」的半开状态。
 

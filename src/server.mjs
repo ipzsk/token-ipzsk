@@ -40,6 +40,11 @@ const lanehub = process.env.LANEHUB_BASE_URL && process.env.LANEHUB_ADMIN_TOKEN
 
 const app = await createApp({ db,upstream,voucherKey,customerAuth,
   lanehub,lanehubAccountId:process.env.LANEHUB_ACCOUNT_ID ?? null,
+  // 新人额度：默认 ¥5。折算汇率显式给，不从对面实时取——同一批新用户按不同汇率
+  // 折算会让「都送了 5 块」变成各自不同的积分。
+  lanehubSignupCny:Number(process.env.LANEHUB_SIGNUP_CNY ?? 5),
+  lanehubUsdCny:Number(process.env.LANEHUB_USD_CNY ?? 0),
+  lanehubQuotaPerUnit:Number(process.env.LANEHUB_QUOTA_PER_UNIT ?? 500000),
   trustProxy:(address)=>trustedProxyAddresses.has(address.replace(/^::ffff:/,'')),scheduler:new Scheduler(),
   origin:process.env.PUBLIC_ORIGIN ?? 'https://api.ipzsk.com',secureCookies:true,
   logger:{ level:'warn', redact:['req.headers.authorization','req.headers.cookie','res.headers.set-cookie','password','key','token'] } });

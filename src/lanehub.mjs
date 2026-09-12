@@ -93,7 +93,9 @@ export async function ensureAccount(db, lanehub, upstream, { userId, name, lane 
   const existing = (await db.query(
     `SELECT a.*, k.secret_ref, k.id AS key_id FROM lanehub_accounts a JOIN upstream_keys k ON k.id=a.key_id WHERE a.user_id=$1`,
     [userId])).rows[0];
-  if (existing) return existing;
+  // created 标记给发放新人额度用：只有**这一次真的建了映射**才发，
+  // 已有映射（包括余额迁移脚本先建的那批）一律不发。
+  if (existing) return { ...existing, created: false };
 
   const username = 'ipz_' + String(userId).replace(/-/g, '').slice(0, 24);
   const found = await lanehub.findUser(username);
@@ -108,9 +110,38 @@ export async function ensureAccount(db, lanehub, upstream, { userId, name, lane 
     `INSERT INTO lanehub_accounts (user_id,lanehub_user_id,key_id,lane) VALUES ($1,$2,$3,$4)
      ON CONFLICT (user_id) DO NOTHING`, [userId, lanehubUserId, keyId, lane]);
 
-  return (await db.query(
+  const row = (await db.query(
     `SELECT a.*, k.secret_ref, k.id AS key_id FROM lanehub_accounts a JOIN upstream_keys k ON k.id=a.key_id WHERE a.user_id=$1`,
     [userId])).rows[0];
+  return { ...row, created: true };
+}
+
+/**
+ * 登录后给这个客户备好 lanehub 的账号与密钥，并在**首次**建号时发放新人额度。
+ *
+ * 一个客户一个密钥（映射表主键就是 user_id），所以这个函数在哪调都安全——
+ * 登录、桌面端 bootstrap、第一次发请求，三处都调，重复调不会多建也不会多发钱。
+ *
+ * 新人额度的幂等键是 `signup:<客户 id>`：
+ *   · 重复登录不会重复发
+ *   · 余额迁移脚本先建过映射的老客户**不会**被当成新人（created 为 false）
+ *   · 发放失败不影响登录——额度可以补，登录不能卡
+ */
+export async function provisionCustomer(db, lanehub, upstream, {
+  userId, name, lane = LANE_DEFAULT, accountId, signupCny = 0, usdCnyRate, quotaPerUnit,
+}) {
+  const account = await ensureAccount(db, lanehub, upstream, { userId, name, lane, accountId });
+  if (!account.created || !(Number(signupCny) > 0)) return account;
+
+  try {
+    await creditAccount(db, lanehub, {
+      userId, lanehubUserId: account.lanehub_user_id, amountCny: signupCny,
+      usdCnyRate, quotaPerUnit, reference: `signup:${userId}`, remark: '新用户注册赠送',
+    });
+  } catch {
+    // 发不出去就算了：额度事后能补，登录不能卡在这一步。
+  }
+  return account;
 }
 
 /**

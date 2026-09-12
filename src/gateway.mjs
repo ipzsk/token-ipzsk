@@ -1,7 +1,7 @@
 import { refreshMediaTask } from './media-task-sync.mjs';
 import { publicImageTask, imageUrls, fetchResultImage } from './image-results.mjs';
 import { adaptModelRequest } from './model-catalog.mjs';
-import { lanehubMode, ensureAccount } from './lanehub.mjs';
+import { lanehubMode, provisionCustomer } from './lanehub.mjs';
 import { reserveRequest, settleRequest } from './billing.mjs';
 import { customerOrigin } from './customer-auth.mjs';
 import { randomUUID } from 'node:crypto';
@@ -35,7 +35,8 @@ function stable(value) {
 const retryableStatus = (status) => [401,402,403,429].includes(status);
 // 连接阶段就失败，说明请求没有到达上游。ECONNRESET 等中途错误不在其列。
 const connectFailed = (error) => ['ECONNREFUSED','ENOTFOUND','EAI_AGAIN'].includes(error?.cause?.code);
-export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, origin, lanehub = null, lanehubAccountId = null, requestTimeoutMs = 180_000, maxAttempts = 3 }) {
+export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, origin, lanehub = null, lanehubAccountId = null,
+  lanehubSignupCny = 0, lanehubUsdCny = 0, lanehubQuotaPerUnit = 500_000, requestTimeoutMs = 180_000, maxAttempts = 3 }) {
   const limiter = new RateLimiter();
   app.decorateRequest('apiUser', null);
   app.addHook('onRequest', async (req) => {
@@ -170,7 +171,8 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       // lanehub 模式：这个客户自己的令牌就是唯一的候选，且**只打一次**。
       // 不换线是对面的硬约束（换线会改变这一单的价钱），这边再换一层等于把它破掉。
       const lanehubRow = viaLanehub
-        ? (await ensureAccount(db, lanehub, upstream, { userId: req.apiUser.id, name: req.apiUser.name, accountId: lanehubAccountId }))
+        ? (await provisionCustomer(db, lanehub, upstream, { userId: req.apiUser.id, name: req.apiUser.name,
+            accountId: lanehubAccountId, signupCny: lanehubSignupCny, usdCnyRate: lanehubUsdCny, quotaPerUnit: lanehubQuotaPerUnit }))
         : null;
       const attempts = viaLanehub ? 1 : maxAttempts;
       const skip = []; let response = null, failure = null;

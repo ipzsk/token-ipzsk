@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { Lanehub, ensureAccount, creditAccount } from '../src/lanehub.mjs';
+import { Lanehub, ensureAccount, creditAccount, provisionCustomer } from '../src/lanehub.mjs';
 
 // 一个够用的内存库：只认这三张表上会发生的那几条语句。
 function fakeDb() {
@@ -116,4 +116,53 @@ test('建号中途失败重来：捡回已建的用户，不建第二个同名�
   });
   const account = await ensureAccount(db, lanehub, fakeUpstream(), { userId: 'u2', name: 'B', accountId: 'acc' });
   assert.equal(account.lanehub_user_id, 99);
+});
+
+// 登录后自动备好密钥 + 首次发新人额度。一个客户一个密钥，重复登录不会重复发钱。
+test('首次建号发新人额度，重复登录不再发', async () => {
+  const db = fakeDb();
+  const lanehub = fakeLanehub({
+    '/api/user/search?keyword=ipz_u3': [],
+    '/api/user/': { id: 3 },
+    '/api/token/': { key: 'sk-' + 'c'.repeat(40) },
+  });
+  const args = { userId: 'u3', name: 'C', accountId: 'acc', signupCny: 5, usdCnyRate: 7, quotaPerUnit: 500000 };
+
+  const first = await provisionCustomer(db, lanehub, fakeUpstream(), args);
+  const second = await provisionCustomer(db, lanehub, fakeUpstream(), args);
+
+  assert.equal(first.created, true);
+  assert.equal(second.created, false);
+  assert.equal(second.key_id, first.key_id, '一个客户只有一个密钥');
+  const grants = lanehub.seen.filter((c) => c.path === '/api/user/quota');
+  assert.equal(grants.length, 1, '新人额度只发一次');
+  assert.equal(db.credits.get('signup:u3').quota, Math.round((5 / 7) * 500000));
+});
+
+// 余额迁移脚本先建过映射的老客户，不能被当成新人再送一笔。
+test('迁移过的老客户不发新人额度', async () => {
+  const db = fakeDb();
+  db.accounts.set('u4', { user_id: 'u4', lanehub_user_id: 4, key_id: 'k4', lane: 'official', secret_ref: 'k4.key' });
+  const lanehub = fakeLanehub({ '/api/user/': new Error('不该建号') });
+
+  const account = await provisionCustomer(db, lanehub, fakeUpstream(),
+    { userId: 'u4', accountId: 'acc', signupCny: 5, usdCnyRate: 7, quotaPerUnit: 500000 });
+
+  assert.equal(account.created, false);
+  assert.equal(lanehub.seen.length, 0, '既不建号也不发钱');
+});
+
+// 发钱失败不能挡住登录：额度事后能补，登录不能卡。
+test('新人额度发放失败不影响建号', async () => {
+  const db = fakeDb();
+  const lanehub = fakeLanehub({
+    '/api/user/search?keyword=ipz_u5': [],
+    '/api/user/': { id: 5 },
+    '/api/token/': { key: 'sk-' + 'd'.repeat(40) },
+    '/api/user/quota': new Error('lanehub down'),
+  });
+  const account = await provisionCustomer(db, lanehub, fakeUpstream(),
+    { userId: 'u5', accountId: 'acc', signupCny: 5, usdCnyRate: 7, quotaPerUnit: 500000 });
+  assert.equal(account.created, true, '密钥仍要建出来');
+  assert.equal(db.credits.size, 0, '失败后不留占位，之后能补发');
 });
