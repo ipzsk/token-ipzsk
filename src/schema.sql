@@ -260,7 +260,11 @@ INSERT INTO schema_version(version) VALUES(13) ON CONFLICT DO NOTHING;
 ALTER TABLE upstream_accounts ADD COLUMN IF NOT EXISTS base_url text NOT NULL DEFAULT 'https://api.apimart.ai';
 ALTER TABLE upstream_accounts ADD COLUMN IF NOT EXISTS provider_type text NOT NULL DEFAULT 'apimart';
 ALTER TABLE upstream_accounts DROP CONSTRAINT IF EXISTS upstream_accounts_base_url_https;
-ALTER TABLE upstream_accounts ADD CONSTRAINT upstream_accounts_base_url_https CHECK (base_url LIKE 'https://%');
+-- https 是硬要求，回环地址例外：本机自检要能把 lanehub 起在 http://localhost 上打一遍。
+-- 回环流量不出网卡，密钥不会裸奔；理由同 src/admin.mjs 的 baseUrl()。
+ALTER TABLE upstream_accounts ADD CONSTRAINT upstream_accounts_base_url_https
+  CHECK (base_url LIKE 'https://%' OR base_url LIKE 'http://localhost%'
+      OR base_url LIKE 'http://127.0.0.1%' OR base_url LIKE 'http://[::1]%');
 INSERT INTO schema_version(version) VALUES(14) ON CONFLICT DO NOTHING;
 
 -- 媒体按 USD 报价，钱包记 CNY。汇率是管理员维护的账本参数，不在请求时联网取值，

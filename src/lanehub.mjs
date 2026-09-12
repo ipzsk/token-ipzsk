@@ -1,4 +1,4 @@
-import { httpError } from './security.mjs';
+import { hash, httpError } from './security.mjs';
 
 // lanehub 接入：**额度真源在 lanehub**，这一侧只负责账号映射、充值入账和转发。
 //
@@ -44,28 +44,39 @@ export class Lanehub {
   }
 
   /** 建一个 lanehub 用户。用户名就是客户 id，重名时由调用方按映射表判重。 */
-  createUser(username, displayName) {
-    return this.call('/api/user/', { method: 'POST', body: { username, display_name: displayName, password: randomPassword() } });
+  async createUser(username, displayName) {
+    await this.call('/api/user/', { method: 'POST', body: { username, display_name: displayName, password: randomPassword() } });
+    // 建号接口只回 success，不回用户对象——再查一次拿 id。
+    return this.findUser(username);
   }
 
   /** 按用户名找已有用户：建号中途失败重来时，避免第二次建出重名用户。 */
   async findUser(username) {
-    const rows = await this.call('/api/user/search?keyword=' + encodeURIComponent(username));
-    const list = Array.isArray(rows) ? rows : rows?.data ?? [];
+    const page = await this.call('/api/user/?keyword=' + encodeURIComponent(username) + '&size=20');
+    // 分页接口回的是 {data:[…], page, size, total_count}，而 call() 已经剥过一层 data。
+    const list = Array.isArray(page) ? page : page?.data ?? [];
     return list.find((u) => u.username === username) ?? null;
   }
 
-  /** 给这个用户签一个令牌，分组 = 他的档位。额度不限——额度管在用户身上，不是令牌上。 */
+  /**
+   * 给这个用户签一个令牌，分组 = 他的档位。
+   *
+   * 走 /api/token/for_user 而不是 /api/token/：后者只会给**当前登录的人**签，
+   * 用管理员令牌调它，签出来的是管理员自己的密钥——客户拿着它花的是我们的钱。
+   *
+   * unlimited_quota=true 是刻意的：额度管在**用户**身上，不是令牌上，
+   * 这样「这个客户还剩多少」只有一个数。
+   */
   createToken(userId, name, lane = LANE_DEFAULT) {
-    return this.call('/api/token/', {
+    return this.call('/api/token/for_user', {
       method: 'POST',
-      body: { name, expired_time: -1, unlimited_quota: true, group: lane, user_id: userId },
+      body: { user_id: userId, token: { name, expired_time: -1, unlimited_quota: true, group: lane } },
     });
   }
 
   /** 加额度。quota 是 lanehub 的内部单位（1 美元 = QuotaPerUnit）。 */
   addQuota(userId, quota, remark) {
-    return this.call('/api/user/quota', { method: 'PUT', body: { user_id: userId, quota, remark } });
+    return this.call('/api/user/quota/' + userId, { method: 'POST', body: { quota, remark } });
   }
 
   balance(userId) {
@@ -73,8 +84,19 @@ export class Lanehub {
   }
 }
 
+// lanehub 的密码上限是 20 个字符（实测报错才发现）。这个密码没人会用——
+// 客户走的是 IPZSK 自己的登录，这里只是建号必填项——但仍然要随机，
+// 固定值等于给每个客户开了同一把后门。
+// 用户名 = ipz + 客户 id 哈希的前 9 位（36 进制），恰好 12 个字符，且对同一个客户恒定：
+// 建号中途失败重来时要能按同一个名字把人找回来。
+function lanehubUsername(userId) {
+  const digest = hash(String(userId));
+  const short = BigInt('0x' + digest.slice(0, 16)).toString(36).slice(0, 9).padStart(9, '0');
+  return 'ipz' + short;
+}
+
 function randomPassword() {
-  return 'ipz-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  return 'ipz' + Math.random().toString(36).slice(2, 12) + Math.random().toString(36).slice(2, 6);
 }
 
 /**
@@ -97,10 +119,16 @@ export async function ensureAccount(db, lanehub, upstream, { userId, name, lane 
   // 已有映射（包括余额迁移脚本先建的那批）一律不发。
   if (existing) return { ...existing, created: false };
 
-  const username = 'ipz_' + String(userId).replace(/-/g, '').slice(0, 24);
+  // lanehub 的用户名上限 12 个字符（实测报错才发现），装不下 uuid，只能压成哈希。
+  const username = lanehubUsername(userId);
   const found = await lanehub.findUser(username);
   const lanehubUserId = found?.id ?? (await lanehub.createUser(username, name ?? username))?.id;
   if (!Number.isInteger(lanehubUserId)) throw httpError(502, 'lanehub_user_create_failed');
+
+  // 压成 9 位哈希就有撞名的可能，而撞名的后果是**两个客户共用一个钱包**——
+  // 一个人充的钱另一个人花得掉。这里宁可当场失败也不能悄悄合并。
+  const taken = (await db.query('SELECT user_id FROM lanehub_accounts WHERE lanehub_user_id=$1', [lanehubUserId])).rows[0];
+  if (taken && String(taken.user_id) !== String(userId)) throw httpError(500, 'lanehub_username_collision');
 
   const token = await lanehub.createToken(lanehubUserId, username, lane);
   if (typeof token?.key !== 'string') throw httpError(502, 'lanehub_token_create_failed');

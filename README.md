@@ -211,6 +211,28 @@ node scripts/lanehub-switch.mjs off        # 立刻回滚，不做检查
 类型写错、还有客户的余额没迁走、`billing_policy` 仍开着（两边都预扣 = 同一笔钱冻两次）、
 还有未结算的预扣（切过去会永远停在 reserved）。
 
+### 端到端自检（可反复跑）
+
+```
+export DATABASE_URL=postgres://user:pass@127.0.0.1:5433/ipzsk_e2e
+export LANEHUB_BASE_URL=http://localhost:3000
+export LANEHUB_ADMIN_TOKEN=<lanehub root 的 access_token>
+
+node scripts/lanehub-e2e.mjs            # 不花钱：建号、新人额度、报价、报价校验
+node scripts/lanehub-e2e.mjs --spend    # 连真实生成一起验（会扣真钱）
+```
+
+打的是真 lanehub 和真库，不是 mock——单元测试能证明幂等逻辑对，证明不了「对面的接口
+真是这个形状」。这一轮就是靠它打出了四个只有真打才看得见的错：用户名 12 字上限、
+密码 20 字上限、签令牌要走 `/api/token/for_user`（`/api/token/` 只给当前登录者签，
+用管理员令牌调它会把管理员自己的密钥发给客户）、done-hub 的令牌**没有 `sk-` 前缀**。
+
+写操作的幂等键都是固定的（测试客户 id、reference），所以第二次跑会跳过建号与发钱；
+唯一不幂等的是真实生成——上游不认我们的幂等键，所以它默认关着。
+
+`UPSTREAM_SECRET_DIR` 要跨次稳定（默认 `$TMPDIR/ipzsk-e2e-secrets`）：库里存的是
+文件名，目录变了就读不到上次那把密钥。
+
 ### 余额迁移（幂等）
 
 ```

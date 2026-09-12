@@ -45,7 +45,10 @@ export class Upstream {
     return (await readFile(join(this.secretDir, ref), 'utf8')).trim();
   }
   async addKey({ account_id, name, key, concurrency = 3, models = [] }, existingRef) {
-    if (!/^sk-[A-Za-z0-9_-]{16,240}$/.test(key)) throw httpError(400, 'invalid_upstream_key');
+    // `sk-` 前缀是 APIMart 那家的写法，不是通用的：lanehub 的令牌就没有前缀
+    // （实测 addKey 把它判成 invalid_upstream_key 才发现）。前缀改成可选，
+    // 字符集与长度仍然要卡——那两条挡的是「把整段 JSON 粘进输入框」这类错。
+    if (!/^(sk-)?[A-Za-z0-9_-]{16,240}$/.test(key)) throw httpError(400, 'invalid_upstream_key');
     const fingerprint = hash(key);
     const existing = await this.db.query('SELECT id FROM upstream_keys WHERE fingerprint=$1', [fingerprint]);
     if (existing.rowCount) throw httpError(409, 'key_already_exists');

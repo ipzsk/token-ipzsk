@@ -51,6 +51,12 @@ function fakeLanehub(script = {}) {
 
 const fakeUpstream = () => ({ addKey: async () => randomUUID() });
 
+// createUser 建完会再查一次拿 id：第一次查（建号前）返回空，之后返回那个用户。
+function listAfterCreate(id, username) {
+  let created = false;
+  return () => (created ? [{ id, username }] : (created = true, []));
+}
+
 // 充值入账的幂等键是 reference：支付回调重放、迁移脚本重跑，都必须落在同一行上。
 // 这条不成立的话，每重放一次就是白送一次钱。
 test('同一个 reference 只入账一次', async () => {
@@ -63,13 +69,13 @@ test('同一个 reference 只入账一次', async () => {
   assert.equal(first.applied, true);
   assert.equal(first.quota, Math.round((10 / 7) * 500000));
   assert.equal(second.applied, false, '第二次必须什么都不做');
-  assert.equal(lanehub.seen.filter((c) => c.path === '/api/user/quota').length, 1, '对面只能被加一次');
+  assert.equal(lanehub.seen.filter((c) => c.path.startsWith('/api/user/quota')).length, 1, '对面只能被加一次');
 });
 
 // 对面加额度失败时，占位必须撤掉——否则这笔钱永远加不上去了（reference 已被占用）。
 test('对面失败时撤掉占位，重试还能入账', async () => {
   const db = fakeDb();
-  const boom = fakeLanehub({ '/api/user/quota': new Error('lanehub down') });
+  const boom = fakeLanehub({ '/api/user/quota/7': new Error('lanehub down') });
   const args = { userId: 'u1', lanehubUserId: 7, amountCny: '10', usdCnyRate: 7, quotaPerUnit: 500000, reference: 'pay:order-2' };
 
   await assert.rejects(() => creditAccount(db, boom, args));
@@ -93,9 +99,9 @@ test('金额非正或缺 reference 一律拒绝', async () => {
 test('建号幂等：已有映射直接返回，不再建号', async () => {
   const db = fakeDb();
   const lanehub = fakeLanehub({
-    '/api/user/search?keyword=ipz_u1': [],
-    '/api/user/': { id: 42 },
-    '/api/token/': { key: 'sk-' + 'a'.repeat(40) },
+    '/api/user/?keyword=ipz2unib86zn&size=20': listAfterCreate(42, 'ipz2unib86zn'),
+    '/api/user/': { },
+    '/api/token/for_user': { key: 'sk-' + 'a'.repeat(40) },
   });
   const first = await ensureAccount(db, lanehub, fakeUpstream(), { userId: 'u1', name: 'A', accountId: 'acc' });
   const second = await ensureAccount(db, lanehub, fakeUpstream(), { userId: 'u1', name: 'A', accountId: 'acc' });
@@ -103,15 +109,15 @@ test('建号幂等：已有映射直接返回，不再建号', async () => {
   assert.equal(first.lanehub_user_id, 42);
   assert.equal(second.key_id, first.key_id);
   assert.equal(lanehub.seen.filter((c) => c.path === '/api/user/').length, 1, '只能建一次用户');
-  assert.equal(lanehub.seen.filter((c) => c.path === '/api/token/').length, 1, '只能签一次令牌');
+  assert.equal(lanehub.seen.filter((c) => c.path === '/api/token/for_user').length, 1, '只能签一次令牌');
 });
 
 // 上一次建到一半（用户建了、令牌没签）时，重来要把已建的用户捡回来。
 test('建号中途失败重来：捡回已建的用户，不建第二个同名用户', async () => {
   const db = fakeDb();
   const lanehub = fakeLanehub({
-    '/api/user/search?keyword=ipz_u2': [{ id: 99, username: 'ipz_u2' }],
-    '/api/token/': { key: 'sk-' + 'b'.repeat(40) },
+    '/api/user/?keyword=ipz1ngzvddhp&size=20': [{ id: 99, username: 'ipz1ngzvddhp' }],
+    '/api/token/for_user': { key: 'sk-' + 'b'.repeat(40) },
     '/api/user/': new Error('不该再建用户'),
   });
   const account = await ensureAccount(db, lanehub, fakeUpstream(), { userId: 'u2', name: 'B', accountId: 'acc' });
@@ -122,9 +128,9 @@ test('建号中途失败重来：捡回已建的用户，不建第二个同名�
 test('首次建号发新人额度，重复登录不再发', async () => {
   const db = fakeDb();
   const lanehub = fakeLanehub({
-    '/api/user/search?keyword=ipz_u3': [],
-    '/api/user/': { id: 3 },
-    '/api/token/': { key: 'sk-' + 'c'.repeat(40) },
+    '/api/user/?keyword=ipzm1a3osgli&size=20': listAfterCreate(3, 'ipzm1a3osgli'),
+    '/api/user/': { },
+    '/api/token/for_user': { key: 'sk-' + 'c'.repeat(40) },
   });
   const args = { userId: 'u3', name: 'C', accountId: 'acc', signupCny: 5, usdCnyRate: 7, quotaPerUnit: 500000 };
 
@@ -134,7 +140,7 @@ test('首次建号发新人额度，重复登录不再发', async () => {
   assert.equal(first.created, true);
   assert.equal(second.created, false);
   assert.equal(second.key_id, first.key_id, '一个客户只有一个密钥');
-  const grants = lanehub.seen.filter((c) => c.path === '/api/user/quota');
+  const grants = lanehub.seen.filter((c) => c.path.startsWith('/api/user/quota'));
   assert.equal(grants.length, 1, '新人额度只发一次');
   assert.equal(db.credits.get('signup:u3').quota, Math.round((5 / 7) * 500000));
 });
@@ -156,10 +162,10 @@ test('迁移过的老客户不发新人额度', async () => {
 test('新人额度发放失败不影响建号', async () => {
   const db = fakeDb();
   const lanehub = fakeLanehub({
-    '/api/user/search?keyword=ipz_u5': [],
-    '/api/user/': { id: 5 },
-    '/api/token/': { key: 'sk-' + 'd'.repeat(40) },
-    '/api/user/quota': new Error('lanehub down'),
+    '/api/user/?keyword=ipz1cck5isv0&size=20': listAfterCreate(5, 'ipz1cck5isv0'),
+    '/api/user/': { },
+    '/api/token/for_user': { key: 'sk-' + 'd'.repeat(40) },
+    '/api/user/quota/5': new Error('lanehub down'),
   });
   const account = await provisionCustomer(db, lanehub, fakeUpstream(),
     { userId: 'u5', accountId: 'acc', signupCny: 5, usdCnyRate: 7, quotaPerUnit: 500000 });
