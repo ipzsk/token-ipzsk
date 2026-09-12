@@ -107,6 +107,27 @@ test('password login, verified registration and recovery',async t=>{
       assert.equal((await send('/api/me/tokens/'+a.json().id+'/revoke',{},bobCookie)).statusCode,404);
       assert.equal((await send('/api/me/wallet?user_id='+aliceId,undefined,bobCookie)).json().user.id,bobId);
     });
+    await t.test('网页会话密钥：一个登录会话一把，退出即失效',async()=>{
+      // 官网要打 /v1/*（生图、对话），那条路只认 Bearer 令牌不认 cookie。
+      assert.equal((await send('/api/me/web/session-key',{})).statusCode,401,'没登录不给');
+      assert.equal((await send('/api/me/web/session-key',{},aliceCookie,'https://evil.example')).statusCode,403,'跨站不给');
+      const call=t=>app.inject({url:'/v1/models',headers:{authorization:'Bearer '+t}});
+      const first=(await send('/api/me/web/session-key',{},aliceCookie)).json();
+      assert.match(first.token,/^ipz_/);
+      assert.equal((await call(first.token)).statusCode,200);
+      // 刷新页面只是轮换同一行，不能攒出第二把永久 Key。
+      const second=(await send('/api/me/web/session-key',{},aliceCookie)).json();
+      assert.equal((await call(first.token)).statusCode,401,'旧密钥必须作废');
+      assert.equal((await call(second.token)).statusCode,200);
+      assert.equal((await db.query('SELECT count(*) FROM access_tokens WHERE user_id=$1 AND auth_session_id IS NOT NULL AND plugin_id IS NULL',[aliceId])).rows[0].count,'1');
+      // 退出登录，这把密钥跟着失效——浏览器里存着的那份不该还能花钱。
+      const other=cookies(await login('alice@example.com'));
+      const third=(await send('/api/me/web/session-key',{},other)).json().token;
+      await auth('/sign-out',{},other);
+      assert.equal((await call(third)).statusCode,401);
+      // 这把是本测试自己造的第二个会话，清掉——后面那个测试要数「一个会话一行」。
+      await db.query('DELETE FROM access_tokens WHERE prefix=$1',[third.slice(0,12)]);
+    });
     let desktopAliceToken;
     await t.test('desktop bootstrap binds credentials to the session and preserves other devices and API Keys',async()=>{
       assert.equal((await send('/api/me/desktop/bootstrap',{})).statusCode,401);

@@ -5,7 +5,7 @@ import { emailOTP } from 'better-auth/plugins/email-otp';
 import { fromNodeHeaders } from 'better-auth/node';
 import { getMigrations } from 'better-auth/db/migration';
 import { randomUUID } from 'node:crypto';
-import { hash, httpError, RateLimiter } from './security.mjs';
+import { hash, httpError, token, RateLimiter } from './security.mjs';
 import { unavailableCaptcha } from './captcha.mjs';
 import { takeAuthLimit, verifyAuthCaptcha } from './auth-abuse.mjs';
 
@@ -131,6 +131,32 @@ export function customerAuthRoutes(app,options) {
     const user=(await db.query('SELECT id,name,email,email_verified,created_at FROM users WHERE id=$1',[req.apiUser.id])).rows[0];
     const credential=(await db.query('SELECT prefix,created_at FROM access_tokens WHERE user_id=$1 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1',[user.id])).rows[0]??null;
     return {user,credential};
+  });
+  // 网页端要打 /v1/*（生图、对话），而那条路只认 Bearer 令牌，不认登录 cookie。
+  // 这里按**登录会话**签一把令牌：一个会话一行（唯一索引 desktop_session_token），
+  // 刷新页面只是轮换同一行的密钥，不会攒出一堆永久 Key；退出登录会话失效，令牌跟着失效。
+  // 桌面端 bootstrap 用的是同一个模式和同一张索引——两边是不同的登录会话，互不影响。
+  app.post('/api/me/web/session-key',async(req)=>{
+    if(!req.apiUser.session_id)throw httpError(403,'customer_login_required');
+    limiter.take('web-key:'+req.apiUser.id,30,600000);
+    // 网页登录后也要把 lanehub 的账号、密钥和新人额度备好（和注册/登录那条路同一个函数）。
+    await provisionIfEnabled(db,options,{userId:req.apiUser.id,name:req.apiUser.name}).catch(()=>{});
+    return db.tx(async(c)=>{
+      const user=(await c.query('SELECT enabled FROM users WHERE id=$1 FOR UPDATE',[req.apiUser.id])).rows[0];
+      if(!user?.enabled)throw httpError(403,'account_disabled');
+      const session=(await c.query('SELECT "expiresAt" FROM auth_sessions WHERE id=$1 AND "userId"=$2 AND "expiresAt">now()',
+        [req.apiUser.session_id,req.apiUser.auth_user_id])).rows[0];
+      if(!session)throw httpError(401,'customer_login_required');
+      const value=token('ipz_');
+      const result=await c.query(`INSERT INTO access_tokens(id,user_id,token_hash,prefix,name,expires_at,auth_session_id)
+        VALUES($1,$2,$3,$4,'IPZSK 网页',$5,$6)
+        ON CONFLICT(auth_session_id) WHERE plugin_id IS NULL DO UPDATE SET token_hash=EXCLUDED.token_hash,prefix=EXCLUDED.prefix,
+        expires_at=EXCLUDED.expires_at WHERE access_tokens.revoked_at IS NULL RETURNING id`,
+        [randomUUID(),req.apiUser.id,hash(value),value.slice(0,12),session.expiresAt,req.apiUser.session_id]);
+      if(!result.rowCount)throw httpError(403,'web_access_revoked');
+      await c.query('INSERT INTO audit_events(action,target_id) VALUES($1,$2)',['web.session_key',result.rows[0].id]);
+      return {token:value,expires_at:session.expiresAt};
+    });
   });
   app.post('/api/me/token',async(req)=>{
     if(!req.apiUser.session_id)throw httpError(403,'email_login_required');
