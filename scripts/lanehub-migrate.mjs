@@ -50,7 +50,8 @@ if (!(usdCny > 0)) {
 }
 
 const db = await databaseFromEnv();
-const upstream = new Upstream(db, env('SECRET_DIR', './secrets'));
+// 与服务端同名同默认：写错目录就是把新签的客户密钥落在一个没人挂载的路径上。
+const upstream = new Upstream(db, env('UPSTREAM_SECRET_DIR', '/run/upstream'));
 const lanehub = new Lanehub({ baseUrl, adminToken });
 
 // 余额口径复用 billing.wallet()：它算的是 credit - debit - held。
