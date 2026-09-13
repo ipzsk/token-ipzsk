@@ -253,7 +253,13 @@ export LANEHUB_ADMIN_TOKEN=<lanehub root 的 access_token>
 
 node scripts/lanehub-e2e.mjs            # 不花钱：建号、新人额度、报价、报价校验
 node scripts/lanehub-e2e.mjs --spend    # 连真实生成、扣费回写、分成基数一起验（会扣真钱）
+node scripts/skill-chain-e2e.mjs       # 提示词型 skill 的变现全链路（会扣真钱，文本模型一次几厘）
 ```
+
+`skill-chain-e2e.mjs` 验的是**变现那条链**，而且请求从网关的 HTTP 入口进去，
+走完整的鉴权 → 归属 → 计费 → 补记 → 计提 → 结算单：装成插件的 skill 调一次真模型
+（默认 `deepseek-v4-flash`），断言 token 记下了、归属落到插件、扣费从 lanehub 的
+消费日志补回来、作者的计提 = 实扣 × 比例、重复补记不会算两遍。
 
 打的是真 lanehub 和真库，不是 mock——单元测试能证明幂等逻辑对，证明不了「对面的接口
 真是这个形状」。这一轮就是靠它打出了四个只有真打才看得见的错：用户名 12 字上限、

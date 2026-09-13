@@ -188,6 +188,17 @@ node scripts/lanehub-switch.mjs off      # 立刻回滚，不做检查
 | 单元 | `npm test` | 折算、幂等、日志缺失分支、汇率兜底 |
 | 整链（真库 + 假 lanehub） | `test/lanehub-chain.test.mjs` | 建号→插件归属→token→回写→分成报表→余额 |
 | 真钱 E2E | `node scripts/lanehub-e2e.mjs --spend` | 真 lanehub + 真上游，报价 = 实扣 = 回写 |
+| 变现链真钱 E2E | `node scripts/skill-chain-e2e.mjs` | 从 HTTP 入口进：提示词型 skill → 归属 → token → 扣费补记 → 作者计提 → 结算单 |
+
+2026-09-13 实跑（APIMart 的 `deepseek-v4-flash`，经 lanehub 转发）：
+
+```
+用量        入 11 / 出 40 / 共 51 tokens
+lanehub 扣  quota 13  →  ¥0.00017440（× 6.7078 / 500000）
+作者计提    ¥0.00005232 = 实扣 × 30%
+结算单      ¥0.00005232 / 1 条明细，已冻结
+13/13 通过，连跑两次幂等
+```
 
 ---
 
