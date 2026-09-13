@@ -13,6 +13,65 @@ import { creditAccount, provisionIfEnabled, lanehubMode } from './lanehub.mjs';
 // 比例和归属取 `requests` 上的**发生时快照**（plugin_share_bps / plugin_owner_user_id），
 // 不读 plugins 表的当前值：事后改分成比例不能改写历史账。
 
+/**
+ * 从请求体里认出这一轮加载了哪些 skill。
+ *
+ * 依据是 `@deepseek-ai/dsh-skill` 的 renderSkillContent：每个被加载的 skill 都渲染成
+ * `<skill_content name="...">`，**模型自主加载和用户显式调用共用同一个渲染**，
+ * 所以两条路都认得出来。
+ *
+ * 为什么扫请求体而不是让客户端报请求头：**这是可证实的事实，不是客户端的声称**。
+ * skill 内容确确实实在上下文里，用户为它付了 token；而请求头可以随便填。
+ * 附带的好处是客户端一行都不用改，harness 也不用打补丁。
+ *
+ * 代价写在这儿：这依赖 harness 的渲染格式。哪天它改了标签名，我方会**漏记**
+ * （不会错记）——漏记的后果是作者少拿，能从「某个 skill 的调用数突然归零」看出来。
+ * 请求头那条路仍然保留，别的客户端可以显式上报。
+ */
+// 必须一路匹配到**结束引号**：只锚开头的话，name="../../etc/passwd" 会被截成 ".."，
+// 凭空造出一个不存在的 skill 名。查登记表查不到所以无害，但账上多一条噪声。
+const SKILL_CONTENT = /<skill_content\s+name=\\?"([A-Za-z0-9._-]{1,200})\\?"/g;
+export function skillsInRequest(body) {
+  const found = new Set();
+  const scan = (value) => {
+    if (typeof value === 'string') {
+      for (const match of value.matchAll(SKILL_CONTENT)) found.add(match[1]);
+      return;
+    }
+    if (Array.isArray(value)) { for (const item of value) scan(item); return; }
+    if (value && typeof value === 'object') { for (const item of Object.values(value)) scan(item); }
+  };
+  scan(body?.system);
+  scan(body?.messages);
+  return [...found].slice(0, 8);
+}
+
+/**
+ * 记下这一次请求用到的 skill，并按**调用次数**给它们的作者计提。
+ *
+ * 和 accrueEarning 的分工：那个按 token 实扣的比例算（给自己发请求的插件），
+ * 这个按次数算（给提示词型 skill）。两边的计量单位故意不同——用户为算力付费，
+ * 作者为「他的方法论被用了一次」收费，理由见 schema.sql 里那段。
+ *
+ * 三条纪律：
+ *   · **只认登记过的 skill**：plugin_skills 里没有就当没报过，不报错也不计提。
+ *     skills 是本地文件，谁都能往目录里扔一个，不设这道闸就是开着门送钱。
+ *   · 单价取自 plugins.price_per_call_cny，**默认 0**：管道先跑起来，
+ *     等真实调用分布看清楚了再定价，那时定价有依据。单价为 0 时仍然记一行
+ *     （金额 0），因为「这次用了哪个 skill」本身就是要统计的事实。
+ *   · 一次请求可以用多个 skill，各记各的一行；重复上报由唯一索引挡掉。
+ */
+export async function recordSkillInvocations(c, requestId, skillRefs) {
+  const refs = [...new Set((skillRefs ?? []).filter((ref) => typeof ref === 'string' && ref.length > 0 && ref.length <= 200))];
+  if (!refs.length) return 0;
+  const inserted = await c.query(`INSERT INTO plugin_earnings (id,request_id,owner_user_id,plugin_id,kind,amount_cny,skill_ref)
+    SELECT gen_random_uuid(),$1,p.owner_user_id,p.id,'invocation',p.price_per_call_cny,s.skill_ref
+    FROM plugin_skills s JOIN plugins p ON p.id=s.plugin_id
+    WHERE s.skill_ref = ANY($2::text[]) AND p.enabled AND p.owner_user_id IS NOT NULL
+    ON CONFLICT DO NOTHING`, [requestId, refs]);
+  return inserted.rowCount;
+}
+
 /** 一笔请求结算之后计提作者分成。同一笔只会有一行（唯一索引兜底）。 */
 export async function accrueEarning(c, requestId) {
   await c.query(`INSERT INTO plugin_earnings (id,request_id,owner_user_id,plugin_id,kind,amount_cny)
@@ -92,6 +151,50 @@ export function earningsRoutes(app,options){
       });
     }
     return {ok:true,refunded_cny:value,clawback_cny:plan.clawback};
+  });
+
+  // ── skill 登记与单价 ─────────────────────────────────────────────────────
+  // 分成的前提是登记过：本地随手放的 skill 照常能用，只是不产生任何计提。
+
+  app.get('/admin/api/plugin-skills',async()=>({
+    rows:(await db.query(`SELECT s.skill_ref,s.display_name,s.created_at,p.id AS plugin_id,p.name AS plugin_name,
+      p.price_per_call_cny,d.display_name AS owner_name,
+      (SELECT count(*)::int FROM plugin_earnings e WHERE e.skill_ref=s.skill_ref AND e.kind='invocation') AS invocations,
+      (SELECT coalesce(sum(e.amount_cny),0) FROM plugin_earnings e WHERE e.skill_ref=s.skill_ref AND e.kind='invocation') AS accrued_cny
+      FROM plugin_skills s JOIN plugins p ON p.id=s.plugin_id
+      LEFT JOIN developer_profiles d ON d.user_id=p.owner_user_id ORDER BY s.skill_ref`)).rows,
+  }));
+
+  app.post('/admin/api/plugin-skills',async(req)=>{
+    const ref=req.body?.skill_ref;
+    if(typeof ref!=='string'||!/^[A-Za-z0-9._-]{1,200}$/.test(ref))throw httpError(400,'invalid_skill_ref');
+    const pluginId=uuid(req.body?.plugin_id);
+    const name=String(req.body?.display_name??'').slice(0,200);
+    return db.tx(async(c)=>{
+      const plugin=(await c.query('SELECT id,owner_user_id FROM plugins WHERE id=$1',[pluginId])).rows[0];
+      if(!plugin)throw httpError(404,'plugin_not_found');
+      // 首次登记确权，之后只能改显示名——归属不能被后来的请求或改名悄悄挪走。
+      await c.query(`INSERT INTO plugin_skills (skill_ref,plugin_id,display_name) VALUES ($1,$2,$3)
+        ON CONFLICT (skill_ref) DO UPDATE SET display_name=EXCLUDED.display_name`,[ref,pluginId,name]);
+      const row=(await c.query('SELECT * FROM plugin_skills WHERE skill_ref=$1',[ref])).rows[0];
+      if(row.plugin_id!==pluginId)throw httpError(409,'skill_already_owned');
+      await c.query('INSERT INTO audit_events(action,target_id,administrator_id,details) VALUES($1,$2,$3,$4)',
+        ['plugin_skill.register',pluginId,req.administrator.id,JSON.stringify({skill_ref:ref})]);
+      return row;
+    });
+  });
+
+  app.post('/admin/api/plugins/:id/call-price',async(req)=>{
+    const id=uuid(req.params.id),price=req.body?.price_per_call_cny;
+    if(typeof price!=='string'||!/^(0|[1-9]\d{0,4})(\.\d{1,8})?$/.test(price))throw httpError(400,'invalid_price');
+    return db.tx(async(c)=>{
+      // 改价**只影响之后的调用**：已经记下的计提是当时那个价，不回溯。
+      const r=await c.query('UPDATE plugins SET price_per_call_cny=$2 WHERE id=$1 RETURNING price_per_call_cny',[id,price]);
+      if(!r.rowCount)throw httpError(404,'plugin_not_found');
+      await c.query('INSERT INTO audit_events(action,target_id,administrator_id,details) VALUES($1,$2,$3,$4)',
+        ['plugin.call_price',id,req.administrator.id,JSON.stringify({price_per_call_cny:price})]);
+      return r.rows[0];
+    });
   });
 
   // ── 结算单 ───────────────────────────────────────────────────────────────

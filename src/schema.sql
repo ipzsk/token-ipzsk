@@ -355,3 +355,42 @@ END $$;
 INSERT INTO plugins(id,slug,name,repository,package_name,publisher_ref,allowed_models,runtime_id,runtime_config,credential_paths)
 VALUES('7d8b7d87-b85f-49f1-bde7-a0b1a2f33402','ipzsk-doc-to-excel','文档转 Excel','JayceHuang/ipzsk-doc-to-excel','dsh-doc-to-excel','JayceHuang',
  ARRAY['gpt-5.6-sol'],'doc-to-excel','{}','[]') ON CONFLICT DO NOTHING;
+
+-- ── 按调用次数给 skill 作者计提 ──────────────────────────────────────────
+--
+-- 用户侧按 token 收费（真实成本），作者侧按**调用次数**计提。两边的计量单位
+-- 故意不同：用户为算力付费，作者为「他的方法论被用了一次」收费。
+--
+-- 为什么不按 token 分给作者：实测一次 agent 调用 17644 token，同样一句话裸调用
+-- 只要 56——99% 的消耗是 harness 的系统提示词、工具定义和工作区上下文，跟 skill
+-- 作者无关。按 token 分，等于让作者分走平台基础设施产生的消耗；还带出一串没有
+-- 标准答案的问题（一轮加载两个 skill 怎么分、加载后第五轮还算不算、作者故意让
+-- skill 常驻套利）。按次数计，这四个问题一次消失。
+--
+-- 市面上的成熟做法也支持这个判断：SKILL.md 类市场（Agensi 等）走一次性买断，
+-- OpenRouter 做了完整的 app 归属却刻意不与收入挂钩，真正按用量分成的
+-- （Apify、MCP server）都是「作者的代码在跑」，归属天然成立。
+ALTER TABLE plugins ADD COLUMN IF NOT EXISTS price_per_call_cny numeric(20,8) NOT NULL DEFAULT 0
+  CHECK(price_per_call_cny>=0);
+
+-- skill 登记：**分成的前提是上架登记过**。skills 是本地文件，谁都能往
+-- ~/.dsh/skills 里扔一个，所以只有登记在案、且归属到某个插件的 skill 才计提；
+-- 本地随手放的 skill 照常能用，只是不产生任何计提。
+--
+-- 借 OpenRouter 那条做法：**首次登记时确权，之后请求头只做匹配、不改写归属**。
+-- 请求里报的 skill 名对不上任何一行，就当没报过——不报错、不计提。
+CREATE TABLE IF NOT EXISTS plugin_skills (
+  skill_ref text PRIMARY KEY,
+  plugin_id uuid NOT NULL REFERENCES plugins(id),
+  display_name text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS plugin_skills_plugin ON plugin_skills(plugin_id);
+
+ALTER TABLE plugin_earnings ADD COLUMN IF NOT EXISTS skill_ref text;
+ALTER TABLE plugin_earnings DROP CONSTRAINT IF EXISTS plugin_earnings_kind_check;
+ALTER TABLE plugin_earnings ADD CONSTRAINT plugin_earnings_kind_check
+  CHECK(kind IN ('accrual','refund','invocation'));
+-- 一次请求可以加载多个 skill，各记各的一条，所以唯一键要带上 skill_ref。
+CREATE UNIQUE INDEX IF NOT EXISTS plugin_earnings_invocation
+  ON plugin_earnings(request_id,skill_ref) WHERE kind='invocation';

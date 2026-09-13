@@ -19,8 +19,12 @@ export function createCustomerAuth({db,secret,origin,mailer,captcha=unavailableC
     user:{modelName:'auth_users'},account:{modelName:'auth_accounts'},
     session:{modelName:'auth_sessions',expiresIn:7*86400,updateAge:86400,cookieCache:{enabled:false}},
     verification:{modelName:'auth_verifications',storeIdentifier:'hashed'},
-    advanced:{cookiePrefix:'ipzsk_customer',useSecureCookies:true,database:{generateId:()=>randomUUID()},
-      defaultCookieAttributes:{httpOnly:true,secure:true,sameSite:'lax'},ipAddress:{ipAddressHeaders:['x-forwarded-for']}},
+    // secure cookie 跟着 origin 走：线上是 https，恒为 true；本机联调用 http://127.0.0.1
+    // 时浏览器和 Electron 都会把 secure cookie 丢掉，登录永远不成立，于是只能改成
+    // 按协议判。**判据是 origin 的协议，不是某个开关**——没人能靠环境变量把线上的
+    // secure 关掉。
+    advanced:{cookiePrefix:'ipzsk_customer',useSecureCookies:origin.startsWith('https://'),database:{generateId:()=>randomUUID()},
+      defaultCookieAttributes:{httpOnly:true,secure:origin.startsWith('https://'),sameSite:'lax'},ipAddress:{ipAddressHeaders:['x-forwarded-for']}},
     rateLimit:{enabled:true,storage:'database',modelName:'auth_rate_limits',window:60,max:100},
     plugins:[emailOTP({overrideDefaultEmailVerification:true,disableSignUp:true,otpLength:6,expiresIn:300,allowedAttempts:5,storeOTP:'hashed',
       async sendVerificationOTP({email,otp,type}) {

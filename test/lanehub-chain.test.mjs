@@ -172,6 +172,45 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
       assert.equal((await ask({'x-ipzsk-plugin-token':'not-a-token'})).json().error.code,'invalid_plugin_token');
     });
 
+    await t.test('skill 按调用次数计提：普通对话不计，用了 skill 才计', async () => {
+      const SKILL = 'ip-workbench-ppt';
+      await db.query(`INSERT INTO plugin_skills (skill_ref,plugin_id,display_name) VALUES ($1,$2,'PPT skill')
+        ON CONFLICT (skill_ref) DO NOTHING`, [SKILL, PLUGIN_ID]);
+      await db.query(`UPDATE plugins SET price_per_call_cny='0.05' WHERE id=$1`, [PLUGIN_ID]);
+      const personal = token('ipz_');
+      await db.query(`INSERT INTO access_tokens (id,user_id,token_hash,prefix,name) VALUES ($1,$2,$3,$4,'普通令牌')`,
+        [randomUUID(), userId, hash(personal), personal.slice(0, 12)]);
+      const ask = (content) => app.inject({ url: '/v1/chat/completions', method: 'POST',
+        headers: { authorization: 'Bearer ' + personal },
+        payload: { model: 'test-model', messages: [{ role: 'user', content }] } });
+      const invocations = async () => (await db.query(
+        `SELECT e.* FROM plugin_earnings e JOIN requests r ON r.id=e.request_id
+         WHERE e.kind='invocation' AND r.user_id=$1 ORDER BY e.created_at DESC`, [userId])).rows;
+
+      // 普通对话：上下文里没有 skill 内容，一分钱都不该计给作者。
+      await ask('今天天气怎么样');
+      assert.equal((await invocations()).length, 0, '普通对话不能产生计提');
+
+      // 用了 skill：请求体里带着 dsh-skill 渲染的 <skill_content>，这是可证实的事实。
+      await ask(`做个 PPT\n<skill_content name="${SKILL}">\n<skill_instructions>按大纲出片</skill_instructions>\n</skill_content>`);
+      const rows = await invocations();
+      assert.equal(rows.length, 1, '用了 skill 要计一次');
+      assert.equal(rows[0].skill_ref, SKILL);
+      assert.equal(Number(rows[0].amount_cny), 0.05, '按次数计价，与烧了多少 token 无关');
+      assert.equal(rows[0].owner_user_id, ownerId);
+
+      // 没登记过的 skill 当没报过：skills 是本地文件，谁都能往目录里扔一个。
+      await ask('随便写点\n<skill_content name="someone-elses-local-skill">\n</skill_content>');
+      assert.equal((await invocations()).length, 1, '未登记的 skill 不能计提');
+
+      // 单价为 0 时仍然记一行：「这次用了哪个 skill」本身就是要统计的事实。
+      await db.query(`UPDATE plugins SET price_per_call_cny=0 WHERE id=$1`, [PLUGIN_ID]);
+      await ask(`再来一次\n<skill_content name="${SKILL}">\n</skill_content>`);
+      const zero = (await invocations())[0];
+      assert.equal(Number(zero.amount_cny), 0);
+      assert.equal(zero.skill_ref, SKILL);
+    });
+
     await t.test('人工退款：钱回到用户额度，作者的计提同额冲掉', async () => {
       const login=await app.inject({url:'/admin/api/login',method:'POST',payload:{password:'test-administrator-password'},
         headers:{origin:'https://api.ipzsk.com'}});

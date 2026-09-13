@@ -3,6 +3,7 @@ import { publicImageTask, imageUrls, fetchResultImage } from './image-results.mj
 import { adaptModelRequest } from './model-catalog.mjs';
 import { lanehubMode, provisionCustomer } from './lanehub.mjs';
 import { reserveRequest, settleRequest } from './billing.mjs';
+import { recordSkillInvocations, skillsInRequest } from './earnings.mjs';
 import { customerOrigin } from './customer-auth.mjs';
 import { randomUUID } from 'node:crypto';
 import { checkDesktopSession } from './desktop.mjs';
@@ -110,6 +111,15 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     // 两层都改名等于改两次，而第二次改的是它不认识的键。
     const viaLanehub = Boolean(lanehub) && await lanehubMode(db);
     const body = audio?.metadata??(viaLanehub?requested:adaptModelRequest(path,requested));
+    // 这一轮用到了哪些 skill。客户端只报**事实**（用了什么），算给谁、算多少
+    // 全在服务端：登记表里查不到的 skill 当没报过，不报错也不计提。
+    // 这样客户端不需要知道插件 id、分成比例，改归属和改价钱也不用发版。
+    // 主路径是**扫请求体**：skill 内容以 <skill_content name="..."> 出现在上下文里，
+    // 那是可证实的事实。请求头是备用，给不经过 harness 的客户端显式上报用。
+    const declaredSkills = String(req.headers['x-ipzsk-skill'] ?? '')
+      .split(',').map((ref) => ref.trim()).filter((ref) => /^[A-Za-z0-9._-]{1,200}$/.test(ref));
+    const skillRefs = [...new Set([...skillsInRequest(requested), ...declaredSkills])].slice(0, 8);
+
     // 归属到哪个插件。两条来源：
     //   1. 用插件自己的凭据发请求（生图这类插件自己发请求，天然归属）
     //   2. 主令牌 + X-IPZSK-Plugin-Token 头（skill 型插件：提示词是它给的，
@@ -172,6 +182,8 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
           usage?.output ?? null,usage?.total ?? null,upstreamId ?? null,httpStatus ?? null,errorCode,Date.now()-started,
           estimate.amount,JSON.stringify(estimate.details)]);
         await settleRequest(c,id,{status,submitted,errorCode,usage:billingUsage,serviceTier:responseTier??body.service_tier,billableTools:body.tools?.some(t=>t.type!=='function')});
+        // skill 计提只认**执行过**的请求：没发出去的（参数错、余额不足）不算一次调用。
+        if(status==='succeeded'||status==='uncertain')await recordSkillInvocations(c,id,skillRefs);
         if (attemptId) await c.query(`UPDATE request_attempts SET upstream_id=$2,http_status=$3,error_code=$4,
           usage=$5,completed_at=now() WHERE id=$1`, [attemptId,upstreamId ?? null,httpStatus ?? null,errorCode,usage ? JSON.stringify(usage) : null]);
       });

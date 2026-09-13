@@ -59,7 +59,7 @@ export function adminRoutes(app, { db, upstream, scheduler, origin, secureCookie
     if (!result.rowCount) throw httpError(401, 'admin_login_required');
     req.administrator=result.rows[0];
     const route=req.routeOptions.url;
-    const roleScoped=/^\/admin\/api\/(?:developers|plugins|plugin-usage|settlements|vouchers|wallet|ledger|overview|requests|audit)(?:[/?]|$)/.test(route);
+    const roleScoped=/^\/admin\/api\/(?:developers|plugins|plugin-usage|plugin-skills|settlements|vouchers|wallet|ledger|overview|requests|audit)(?:[/?]|$)/.test(route);
     const sensitive=roleScoped||route.startsWith('/admin/api/administrators')||route.startsWith('/admin/api/billing')||route.includes('/export')||route.endsWith('/charge');
     if(req.administrator.role!=='superadmin' && (sensitive || (req.administrator.role==='viewer'&&!['GET','HEAD'].includes(req.method)&&!['/admin/api/logout','/admin/api/password'].includes(route))))throw httpError(403,'admin_permission_denied');
     adminLimit.take(result.rows[0].token_hash, 180);

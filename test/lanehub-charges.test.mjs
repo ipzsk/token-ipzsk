@@ -136,3 +136,24 @@ test('完成的任务照常记账（上面那条不能把正常的也挡掉）',
   assert.equal(await recordLanehubCharge(db, lanehub, { ...request, task_status: 'completed' }, RATES), 'settled');
   assert.equal(db.billing[0].amount, quotaToCny(4250, 7, 500000));
 });
+
+import { skillsInRequest } from '../src/earnings.mjs';
+
+// 归属的依据是请求体里真的有 skill 内容——用户为它付了 token，这是可证实的事实，
+// 不是客户端的声称。格式来自 dsh-skill 的 renderSkillContent，两条加载路径共用。
+test('从请求体认出这一轮加载了哪些 skill', () => {
+  const skill = (name) => `<skill_content name="${name}">\n<skill_instructions>做事</skill_instructions>\n</skill_content>`;
+  assert.deepEqual(skillsInRequest({ messages: [{ role: 'user', content: '你好' }] }), [], '普通对话不该认出任何 skill');
+  assert.deepEqual(skillsInRequest({
+    messages: [{ role: 'user', content: '做个 PPT' }, { role: 'tool', content: [{ type: 'text', text: skill('ip-workbench-ppt') }] }],
+  }), ['ip-workbench-ppt']);
+  // 一轮可以加载多个，各记各的；同一个重复出现只算一次。
+  assert.deepEqual(skillsInRequest({
+    system: skill('punk-cover'),
+    messages: [{ role: 'tool', content: skill('ip-workbench-ppt') }, { role: 'tool', content: skill('punk-cover') }],
+  }).sort(), ['ip-workbench-ppt', 'punk-cover']);
+  // JSON 里转义过的引号也要认得出来（请求体经过序列化的那条路）。
+  assert.deepEqual(skillsInRequest({ messages: [{ content: '<skill_content name=\\"escaped-one\\">' }] }), ['escaped-one']);
+  // 名字里的怪字符不收：登记表的键就是这个，别让它变成注入点。
+  assert.deepEqual(skillsInRequest({ messages: [{ content: '<skill_content name="../../etc/passwd">' }] }), []);
+});
