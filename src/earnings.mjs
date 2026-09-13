@@ -100,7 +100,8 @@ export function earningsRoutes(app,options){
 
   app.get('/admin/api/settlements',async(req)=>{
     const owner=req.query.owner_user_id?uuid(req.query.owner_user_id):null;
-    const rows=(await db.query(`SELECT s.*,d.display_name AS owner_name FROM settlements s
+    const rows=(await db.query(`SELECT s.*,s.period_from::text AS period_from,s.period_to::text AS period_to,
+      d.display_name AS owner_name FROM settlements s
       JOIN developer_profiles d ON d.user_id=s.owner_user_id
       WHERE ($1::uuid IS NULL OR s.owner_user_id=$1) ORDER BY s.created_at DESC LIMIT 100`,[owner])).rows;
     // 还没出单的计提：运营要先看见这个数，才知道该给谁出单。
@@ -114,7 +115,8 @@ export function earningsRoutes(app,options){
 
   app.get('/admin/api/settlements/:id',async(req)=>{
     const id=uuid(req.params.id);
-    const row=(await db.query('SELECT * FROM settlements WHERE id=$1',[id])).rows[0];
+    const row=(await db.query(`SELECT s.*,s.period_from::text AS period_from,s.period_to::text AS period_to
+      FROM settlements s WHERE id=$1`,[id])).rows[0];
     if(!row)throw httpError(404,'not_found');
     const items=(await db.query(`SELECT e.kind,e.amount_cny,e.created_at,e.request_id,p.name AS plugin_name,r.model
       FROM plugin_earnings e LEFT JOIN plugins p ON p.id=e.plugin_id LEFT JOIN requests r ON r.id=e.request_id
@@ -185,7 +187,7 @@ export function earningsRoutes(app,options){
 
   // 作者自己看：只读，且只看得到自己的单。
   app.get('/api/me/developer/settlements',async(req)=>({
-    rows:(await db.query(`SELECT id,period_from,period_to,state,amount_cny,item_count,paid_at,frozen_at,created_at
+    rows:(await db.query(`SELECT id,period_from::text AS period_from,period_to::text AS period_to,state,amount_cny,item_count,paid_at,frozen_at,created_at
       FROM settlements WHERE owner_user_id=$1 AND state<>'void' ORDER BY created_at DESC LIMIT 50`,[req.apiUser.id])).rows,
     pending:(await db.query(`SELECT coalesce(sum(amount_cny),0) AS amount_cny,count(*)::int AS item_count
       FROM plugin_earnings WHERE owner_user_id=$1 AND settlement_id IS NULL`,[req.apiUser.id])).rows[0],

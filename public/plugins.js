@@ -13,7 +13,7 @@ export function setupPlugins({api,action,el,table,cell,button,rowActions,charge,
     const [{plugins},{rows:developers},queue]=await Promise.all([api('/plugins'),api('/developers'),api('/plugins/review-queue')]);
     section.replaceChildren();const tabs=el('div',undefined,'role-tabs');section.append(tabs);
     const pending=developers.filter(d=>d.state==='pending');
-    for(const [id,label] of [['review',`待审核 (${pending.length+queue.releases.length})`],['plugins','插件管理'],['finance','收支']]){
+    for(const [id,label] of [['review',`待审核 (${pending.length+queue.releases.length})`],['plugins','插件管理'],['finance','收支'],['settlements','结算单']]){
       const tab=button(label,async()=>{view=id;await refresh();},view===id?'primary':'secondary');tab.setAttribute('aria-pressed',String(view===id));tabs.append(tab);
     }
     if(view==='review'){
@@ -37,6 +37,7 @@ export function setupPlugins({api,action,el,table,cell,button,rowActions,charge,
       for(const f of Object.values(fields)){f.n.required=true;form.append(f.l);}const submit=el('button','登记','primary');submit.type='submit';form.append(submit);
       form.addEventListener('submit',action(async e=>{e.preventDefault();const body=Object.fromEntries(Object.entries(fields).map(([k,f])=>[k,f.n.value]));await api('/plugins','POST',{...body,publisher_ref:body.name,allowed_models:[]});await refresh();}));create.append(form);section.append(create);return;
     }
+    if(view==='settlements'){await settlements();return;}
     const today=new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Shanghai'});reportQuery??={from:today.slice(0,8)+'01',to:today,plugin_id:''};
     const from=input('开始日期',reportQuery.from,'date'),to=input('结束日期',reportQuery.to,'date'),select=el('select');select.setAttribute('aria-label','插件');select.append(new Option('全部插件',''),...plugins.map(p=>new Option(p.name,p.id)));select.value=reportQuery.plugin_id;
     const filters=el('div',undefined,'filters'),report=el('div',undefined,'table-wrap');let reportData;
@@ -49,6 +50,66 @@ export function setupPlugins({api,action,el,table,cell,button,rowActions,charge,
       if(!reportData)return;const keys=['plugin_id','plugin_name','model','requests','failed_requests','input_tokens','output_tokens','total_tokens','unknown_token_requests','charged_cny','confirmed_cost_cny','unknown_cost_requests','confirmed_margin_cny','developer_earnings_cny','refunded_cny'];
       const quote=v=>'"'+String(v??'').replace(/^[\s]*[=+@-]/,"'$&").replaceAll('"','""')+'"';const data='\ufeff'+[keys,...reportData.rows.map(r=>keys.map(k=>r[k]))].map(row=>row.map(quote).join(',')).join('\r\n');const url=URL.createObjectURL(new Blob([data],{type:'text/csv;charset=utf-8'})),a=el('a');a.href=url;a.download=`plugin-usage-${reportData.from}-${reportData.to}.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
     }));section.append(filters,report,el('p','毛利只计收入和成本均已确认的调用，未扣开发者分成。应计分成尚未打款。','footnote'));await load();
+  }
+  // 结算单：打款是人工的，这一屏只做凭据——把还没出单的计提圈成一张单，
+  // 冻结锁金额，打完款登记转账单号。冻结之后的退款不回溯改单，会作为负数计提
+  // 落进下一张单，所以「待出单」那一栏出现负数是正常的。
+  const settlementState={draft:'草稿',frozen:'已冻结',paid:'已打款',void:'已作废'};
+  async function settlements(){
+    const {rows,pending}=await api('/settlements');
+    section.append(el('h2','待出单的计提'));
+    const pendingBox=el('div',undefined,'table-wrap');section.append(pendingBox);
+    table(pendingBox,['开发者','未结算金额','明细数','最早一笔','操作'],pending.map(p=>[
+      p.owner_name,charge(p.amount_cny),number(p.item_count),time(p.since),
+      button('出结算单',()=>draft(p))]));
+
+    section.append(el('h2','结算单'));
+    const box=el('div',undefined,'table-wrap');section.append(box);
+    table(box,['开发者','区间','状态','金额','明细数','操作'],rows.map(r=>[
+      r.owner_name,cell(`${r.period_from} ~ ${r.period_to}`,r.paid_note||r.note||''),
+      settlementState[r.state]??r.state,charge(r.amount_cny),number(r.item_count),
+      rowActions(
+        button('明细',()=>detail(r)),
+        ...(r.state==='draft'?[button('冻结',async()=>{await api('/settlements/'+r.id+'/freeze','POST',{});notice('已冻结，金额锁定');await refresh();})]:[]),
+        ...(r.state==='frozen'?[button('登记打款',()=>pay(r))]:[]),
+        ...(['draft','frozen'].includes(r.state)?[button('作废',()=>voidOne(r))]:[]))]));
+    section.append(el('p','同一条明细只会进一张单。冻结之后金额锁定：之后发生的退款作为负数计提落到下一张单，已打款的单不能作废。','footnote'));
+
+    async function draft(p){
+      const d=el('dialog'),form=el('form');
+      const today=new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Shanghai'});
+      const from=input('开始日期','2000-01-01','date'),to=input('结束日期',today,'date'),note=input('备注（可选）');
+      form.append(el('h2','给 '+p.owner_name+' 出结算单'),
+        el('p','只会圈进区间内还没归属任何结算单的计提；圈完可以先看明细再冻结。','footnote'),from.l,to.l,note.l);
+      const save=el('button','出单','primary');save.type='submit';form.append(save,button('取消',()=>d.close()));
+      form.addEventListener('submit',action(async e=>{e.preventDefault();
+        const created=await api('/settlements','POST',{owner_user_id:p.owner_user_id,from:from.n.value,to:to.n.value,note:note.n.value});
+        d.close();notice(`已出单 ${created.item_count} 条明细，合计 ${created.amount_cny} 元`);await refresh();}));
+      d.append(form);document.body.append(d);d.addEventListener('close',()=>d.remove());d.showModal();
+    }
+    async function detail(r){
+      const {settlement,items}=await api('/settlements/'+r.id);
+      const d=dialog(`结算单 · ${r.owner_name} · ${settlementState[settlement.state]}`);
+      const box=el('div',undefined,'table-wrap');d.append(box);
+      table(box,['时间','插件 / 模型','类型','金额'],items.map(i=>[
+        time(i.created_at),cell(i.plugin_name??'未知插件',i.model??''),i.kind==='refund'?'退款冲销':'计提',charge(i.amount_cny)]));
+    }
+    async function pay(r){
+      const d=el('dialog'),form=el('form');
+      const note=input('打款凭据（转账单号 / 渠道 / 日期，至少 5 个字）');note.n.required=true;note.n.minLength=5;
+      form.append(el('h2','登记打款'),el('p','这里只登记事实，系统不发起任何转账。凭据写清楚，出账时要对得上。','footnote'),
+        cell(`${r.owner_name} · ${charge(r.amount_cny)}`),note.l);
+      const save=el('button','确认已打款','primary');save.type='submit';form.append(save,button('取消',()=>d.close()));
+      form.addEventListener('submit',action(async e=>{e.preventDefault();
+        await api('/settlements/'+r.id+'/pay','POST',{paid_note:note.n.value});d.close();notice('已登记打款');await refresh();}));
+      d.append(form);document.body.append(d);d.addEventListener('close',()=>d.remove());d.showModal();
+    }
+    async function voidOne(r){
+      const why=prompt('作废原因（至少 5 个字）：');
+      if(!why)return;
+      await api('/settlements/'+r.id+'/void','POST',{reason:why});
+      notice('已作废，明细已释放，可以重新出单');await refresh();
+    }
   }
   async function ownership(p,developers){
     const dialog=el('dialog'),form=el('form'),select=el('select');

@@ -201,8 +201,12 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
       assert.equal(mine.statusCode,403,'开发者后台只认登录会话');
 
       const paid=(await admin('/settlements?owner_user_id='+ownerId)).json();
-      assert.equal(paid.rows.find(r=>r.id===draft.id).state,'paid');
-      assert.ok(paid.rows.find(r=>r.id===draft.id).paid_note.includes('X1'),'打款凭据要留痕');
+      const one=paid.rows.find(r=>r.id===draft.id);
+      assert.equal(one.state,'paid');
+      // 区间是 DATE 列，驱动会把它变成带时区的 Date（页面上会差一天）——必须原样是日期串。
+      assert.equal(one.period_from,'2000-01-01');
+      assert.equal(one.period_to,'2099-12-31');
+      assert.ok(one.paid_note.includes('X1'),'打款凭据要留痕');
     });
 
     await t.test('余额读的是 lanehub，不是本地那张只剩充值流水的表', async () => {
