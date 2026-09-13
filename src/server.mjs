@@ -36,8 +36,14 @@ await refreshProxyAddresses();
 const proxyTimer=setInterval(refreshProxyAddresses,60000);proxyTimer.unref();
 // lanehub 客户端只在配好时才建：没配就是没开这条路，createApp 里那个 `Boolean(lanehub)`
 // 会把整条分支关掉——不会出现「开关是 on 但没有客户端」的半开状态。
-const lanehub = process.env.LANEHUB_BASE_URL && process.env.LANEHUB_ADMIN_TOKEN
-  ? new Lanehub({ baseUrl:process.env.LANEHUB_BASE_URL, adminToken:process.env.LANEHUB_ADMIN_TOKEN })
+// 管理令牌优先从文件读：这台机器上别的密钥（数据库口令、管理员口令）都走
+// *_FILE，权限 600、不进 compose.yaml，这一个不该例外。
+const lanehubAdminToken = process.env.LANEHUB_ADMIN_TOKEN
+  ?? (process.env.LANEHUB_ADMIN_TOKEN_FILE
+    ? (await readFile(process.env.LANEHUB_ADMIN_TOKEN_FILE, 'utf8')).trim()
+    : undefined);
+const lanehub = process.env.LANEHUB_BASE_URL && lanehubAdminToken
+  ? new Lanehub({ baseUrl:process.env.LANEHUB_BASE_URL, adminToken:lanehubAdminToken })
   : null;
 
 const lanehubUsdCny=Number(process.env.LANEHUB_USD_CNY ?? 0);
