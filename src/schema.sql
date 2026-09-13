@@ -394,3 +394,15 @@ ALTER TABLE plugin_earnings ADD CONSTRAINT plugin_earnings_kind_check
 -- 一次请求可以加载多个 skill，各记各的一条，所以唯一键要带上 skill_ref。
 CREATE UNIQUE INDEX IF NOT EXISTS plugin_earnings_invocation
   ON plugin_earnings(request_id,skill_ref) WHERE kind='invocation';
+
+-- 未登记 skill 的观测。
+--
+-- 没登记的 skill 不计提（分成的前提是上架确权），但**不该静默丢掉**：有人在大量
+-- 使用某个还没上架的 skill，正是最该去谈合作的线索。实测就撞见过一次——用户机器上
+-- 的 guizang-ppt-skill 被高频调用，而我方只看得到自己登记过的那个。
+CREATE TABLE IF NOT EXISTS skill_sightings (
+  skill_ref text PRIMARY KEY,
+  sightings bigint NOT NULL DEFAULT 0,
+  first_seen timestamptz NOT NULL DEFAULT now(),
+  last_seen timestamptz NOT NULL DEFAULT now()
+);

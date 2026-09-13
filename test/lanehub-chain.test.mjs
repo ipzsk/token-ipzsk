@@ -202,9 +202,25 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
       // 没登记过的 skill 当没报过：skills 是本地文件，谁都能往目录里扔一个。
       await ask('随便写点\n<skill_content name="someone-elses-local-skill">\n</skill_content>');
       assert.equal((await invocations()).length, 1, '未登记的 skill 不能计提');
+      // 但要**看得见**：有人在大量用一个还没上架的 skill，那是该去谈合作的线索。
+      const sighting = (await db.query(`SELECT * FROM skill_sightings WHERE skill_ref=$1`, ['someone-elses-local-skill'])).rows[0];
+      assert.ok(sighting && Number(sighting.sightings) >= 1, '未登记的 skill 要记一笔观测');
+      assert.equal((await db.query(`SELECT count(*)::int AS n FROM skill_sightings WHERE skill_ref=$1`, [SKILL])).rows[0].n,
+        0, '已登记的不该出现在线索表里');
+
+      // agent 跑一轮会发好几次请求，skill 内容一旦加载就留在后续每一次的上下文里。
+      // 不去重的话用户说一句话会被计五六次——实测一轮 6 步计了 5 次，金额翻五倍。
+      for (let step = 0; step < 4; step++) await ask(`第 ${step} 步\n<skill_content name="${SKILL}">\n</skill_content>`);
+      assert.equal((await invocations()).length, 1, '同一轮的后续每一步都不该再计一次');
+
+      // 窗口之外就是新的一次调用：把上一条计提的时间往前挪，模拟十分钟后再用。
+      await db.query(`UPDATE plugin_earnings SET created_at=now()-interval '2 hours' WHERE kind='invocation'`);
+      await ask(`过了很久再来\n<skill_content name="${SKILL}">\n</skill_content>`);
+      assert.equal((await invocations()).length, 2, '窗口之外要算新的一次');
 
       // 单价为 0 时仍然记一行：「这次用了哪个 skill」本身就是要统计的事实。
       await db.query(`UPDATE plugins SET price_per_call_cny=0 WHERE id=$1`, [PLUGIN_ID]);
+      await db.query(`UPDATE plugin_earnings SET created_at=now()-interval '2 hours' WHERE kind='invocation'`);
       await ask(`再来一次\n<skill_content name="${SKILL}">\n</skill_content>`);
       const zero = (await invocations())[0];
       assert.equal(Number(zero.amount_cny), 0);

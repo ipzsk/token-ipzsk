@@ -14,6 +14,18 @@ import { creditAccount, provisionIfEnabled, lanehubMode } from './lanehub.mjs';
 // 不读 plugins 表的当前值：事后改分成比例不能改写历史账。
 
 /**
+ * 同一个人、同一个 skill 的计提去重窗口（分钟）。
+ *
+ * 网关看到的是一串独立的 HTTP 请求，看不到「一轮对话」的边界；而 agent 一轮会调
+ * 五六次模型，skill 内容从加载那一刻起就留在后续每一次的上下文里。不去重的话，
+ * 用户说一句话会被计成五六次——实测一轮 6 步计了 5 次，金额翻了五倍。
+ *
+ * 十分钟是个判断：同一个人在十分钟内反复用同一个 skill，从计费直觉上就是「用了一次」。
+ * 长了会把连续两次真实调用吞掉一次（作者少拿），短了会把一轮拆成多次（作者多拿）。
+ */
+const SKILL_WINDOW_MINUTES = Number(process.env.SKILL_INVOCATION_WINDOW_MINUTES ?? 10);
+
+/**
  * 从请求体里认出这一轮加载了哪些 skill。
  *
  * 依据是 `@deepseek-ai/dsh-skill` 的 renderSkillContent：每个被加载的 skill 都渲染成
@@ -61,14 +73,29 @@ export function skillsInRequest(body) {
  *     （金额 0），因为「这次用了哪个 skill」本身就是要统计的事实。
  *   · 一次请求可以用多个 skill，各记各的一行；重复上报由唯一索引挡掉。
  */
-export async function recordSkillInvocations(c, requestId, skillRefs) {
+export async function recordSkillInvocations(c, requestId, skillRefs, windowMinutes = SKILL_WINDOW_MINUTES) {
   const refs = [...new Set((skillRefs ?? []).filter((ref) => typeof ref === 'string' && ref.length > 0 && ref.length <= 200))];
   if (!refs.length) return 0;
   const inserted = await c.query(`INSERT INTO plugin_earnings (id,request_id,owner_user_id,plugin_id,kind,amount_cny,skill_ref)
-    SELECT gen_random_uuid(),$1,p.owner_user_id,p.id,'invocation',p.price_per_call_cny,s.skill_ref
-    FROM plugin_skills s JOIN plugins p ON p.id=s.plugin_id
-    WHERE s.skill_ref = ANY($2::text[]) AND p.enabled AND p.owner_user_id IS NOT NULL
-    ON CONFLICT DO NOTHING`, [requestId, refs]);
+    SELECT gen_random_uuid(),r.id,p.owner_user_id,p.id,'invocation',p.price_per_call_cny,s.skill_ref
+    FROM requests r JOIN plugin_skills s ON s.skill_ref = ANY($2::text[])
+      JOIN plugins p ON p.id=s.plugin_id
+    WHERE r.id=$1 AND p.enabled AND p.owner_user_id IS NOT NULL
+      -- 同一个人、同一个 skill，窗口内只算一次。agent 跑一轮会发好几次请求，
+      -- 而 skill 内容一旦加载就留在后续每一次的上下文里——不去重的话，用户说
+      -- 一句话会被计成五六次（实测一轮 6 步计了 5 次）。
+      AND NOT EXISTS (
+        SELECT 1 FROM plugin_earnings prior JOIN requests pr ON pr.id=prior.request_id
+        WHERE prior.kind='invocation' AND prior.skill_ref=s.skill_ref AND pr.user_id=r.user_id
+          AND prior.created_at > now() - ($3 || ' minutes')::interval)
+    ON CONFLICT DO NOTHING`, [requestId, refs, String(windowMinutes)]);
+
+  // 没登记的照样记一笔观测：不计钱，但要看得见。有人在大量用一个还没上架的 skill，
+  // 那正是该去谈合作的线索——静默丢掉就等于这条线索从来没出现过。
+  await c.query(`INSERT INTO skill_sightings (skill_ref,sightings) 
+    SELECT ref,1 FROM unnest($1::text[]) AS ref
+    WHERE NOT EXISTS (SELECT 1 FROM plugin_skills s WHERE s.skill_ref=ref)
+    ON CONFLICT (skill_ref) DO UPDATE SET sightings=skill_sightings.sightings+1,last_seen=now()`, [refs]);
   return inserted.rowCount;
 }
 
@@ -155,6 +182,11 @@ export function earningsRoutes(app,options){
 
   // ── skill 登记与单价 ─────────────────────────────────────────────────────
   // 分成的前提是登记过：本地随手放的 skill 照常能用，只是不产生任何计提。
+
+  // 被用过但还没登记的 skill：招募作者的线索表。
+  app.get('/admin/api/skill-sightings',async()=>({
+    rows:(await db.query(`SELECT * FROM skill_sightings ORDER BY sightings DESC, last_seen DESC LIMIT 100`)).rows,
+  }));
 
   app.get('/admin/api/plugin-skills',async()=>({
     rows:(await db.query(`SELECT s.skill_ref,s.display_name,s.created_at,p.id AS plugin_id,p.name AS plugin_name,

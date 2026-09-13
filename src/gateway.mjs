@@ -182,8 +182,9 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
           usage?.output ?? null,usage?.total ?? null,upstreamId ?? null,httpStatus ?? null,errorCode,Date.now()-started,
           estimate.amount,JSON.stringify(estimate.details)]);
         await settleRequest(c,id,{status,submitted,errorCode,usage:billingUsage,serviceTier:responseTier??body.service_tier,billableTools:body.tools?.some(t=>t.type!=='function')});
-        // skill 计提只认**执行过**的请求：没发出去的（参数错、余额不足）不算一次调用。
-        if(status==='succeeded'||status==='uncertain')await recordSkillInvocations(c,id,skillRefs);
+        // skill 计提只认**真正跑成**的请求：没发出去的（参数错、余额不足）和中途断流的
+        // 都不算一次调用——断流那次用户什么都没拿到，不该给作者记一笔。
+        if(status==='succeeded')await recordSkillInvocations(c,id,skillRefs);
         if (attemptId) await c.query(`UPDATE request_attempts SET upstream_id=$2,http_status=$3,error_code=$4,
           usage=$5,completed_at=now() WHERE id=$1`, [attemptId,upstreamId ?? null,httpStatus ?? null,errorCode,usage ? JSON.stringify(usage) : null]);
       });
