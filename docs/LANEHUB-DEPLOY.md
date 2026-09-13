@@ -123,6 +123,25 @@ node scripts/lanehub-switch.mjs off        # 立刻回到本地钱包，不做�
 开关关掉之后，网关回到原来的多上游池与本地钱包。已经迁到 lanehub 的额度不会自动退回来——
 那是一笔真实的转账，要退得人工做。所以第 6 步之前先想清楚。
 
+## 首次上线实际踩到的（都已修进仓库）
+
+按顺序，每一个都是「配置在 compose 里明明给了、脚本却说没有」那类：
+
+1. `upstream_accounts` 的 https 白名单挡掉了 `http://lanehub:3000`。compose 内网的服务名
+   现在单独放行（`src/admin.mjs` 的 `PLAIN_HTTP_HOSTS` + schema 里的 CHECK），不是放开成任意 http。
+2. `scripts/` 不在镜像里。已加 `COPY scripts ./scripts`。
+3. 迁移脚本只认 `LANEHUB_ADMIN_TOKEN`，compose 给的是 `..._FILE` → `adminTokenFromEnv()`。
+4. 脚本没有 `DATABASE_URL`，连到默认库报 `backend_startup.c` → `databaseFromEnv()`。
+5. 脚本的密钥目录写成 `./secrets`，容器里是 `/run/upstream`。
+6. done-hub 的**显示名上限 20 字符**，而传进去的是客户邮箱 —— 超过 20 的邮箱建不出号。
+   `createUser` 现在截断。同时对面的错误原文（HTTP 200 + `success:false` 里的 message）
+   以前被丢掉，只剩一个 `lanehub_api_failed`，现在带上。
+
+另外两条运行时的：**汇率默认 7.3 是没同步过的占位**，第一次同步会被幅度闸拦下
+（相对当前值变动超 3%），确认后用 `{"force":true}` 再点一次；`PaymentUSDRate` 最终 6.7082。
+管理员口令文件 `secrets/admin-password` 只在首次 bootstrap 用过，后来改过口令，
+**不能拿它调管理接口**。
+
 ## 已知的行为变更
 
 lanehub 这次带了 `canonical.Caps.Required`：**不带 `resolution` / `duration` 的
