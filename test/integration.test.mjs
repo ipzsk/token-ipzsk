@@ -84,6 +84,15 @@ test('gateway integration against an isolated PostgreSQL test schema', async (t)
     let cookie='',account,keyId,alice,bob;
     const admin=(path,method='GET',payload)=>app.inject({url:'/admin/api'+path,method,payload,headers:{cookie,origin:'https://api.ipzsk.com'}});
     const ask=(who,body={},extra={})=>app.inject({url:'/v1/chat/completions',method:'POST',payload:{model:'test-model',messages:[{role:'user',content:'hello'}],...body},headers:{authorization:'Bearer '+who.token,...extra}});
+    // 官网靠这些路由活着。2026-09-13 一次覆盖部署把它们整批弄丢（那份代码从没进过 git），
+    // 症状只有页面上一句「云端暂时未连接」。钉住路由表：少一条就红，不用等用户报。
+    await t.test('web (official site) routes stay registered',async()=>{
+      for(const [method,url] of [['GET','/api/me/workspace'],['POST','/api/me/workspace'],['GET','/api/me/workspace/models'],['POST','/api/me/workspace/quote'],
+        ['POST','/api/me/workspace/chat'],['POST','/api/me/chat/completions'],['POST','/api/me/image-prompt'],['POST','/api/me/images/generations'],
+        ['GET','/api/me/tasks/:id'],['GET','/api/me/tasks/:id/image/:index'],['GET','/api/me/images'],['POST','/api/me/message-billing'],['GET','/api/me/requests/:id'],['GET','/api/me/wallet']]){
+        assert.ok(app.hasRoute({method,url}),`官网路由不见了: ${method} ${url}`);
+      }
+    });
     await t.test('admin requires authentication and same-origin mutations',async()=>{
       assert.equal((await app.inject('/admin/api/keys')).statusCode,401);
       assert.equal((await app.inject({url:'/admin/api/login',method:'POST',payload:{password:'test-administrator-password'}})).statusCode,403);
