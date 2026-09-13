@@ -99,12 +99,18 @@ export async function reconcileLanehubCharges(db, lanehub, options) {
  * 兑换成功后的那次调用失败（lanehub 抖一下）时，这个扫描就是唯一的补救。
  */
 export async function reconcileLanehubTopups(db, lanehub, options, provision) {
-  const { rows } = await db.query(`SELECT e.id,e.user_id,e.voucher_id,e.amount_cny,u.name FROM wallet_entries e
+  const { rows } = await db.query(`SELECT e.id,e.user_id,e.voucher_id,e.amount_cny,e.created_at,u.name,
+      (SELECT min(m.created_at) FROM lanehub_credits m WHERE m.user_id=e.user_id AND m.reference LIKE 'migrate:%') AS migrated_at
+    FROM wallet_entries e
     JOIN users u ON u.id=e.user_id
     LEFT JOIN lanehub_credits c ON c.reference='voucher:'||e.voucher_id
     WHERE e.voucher_id IS NOT NULL AND c.reference IS NULL ORDER BY e.created_at LIMIT 20`);
   let applied = 0, failed = 0;
   for (const row of rows) {
+    // 迁移搬的是**净余额**，历史兑换码早已包含在里面。不设这道闸的话，老客户的每一张
+    // 旧兑换码都会被当成「没补上的充值」再加一遍——2026-09-13 上线时就是这么多送出去
+    // ¥130 的。没有迁移记录的客户（迁移之后才注册的）不受影响，他的兑换码全都要补。
+    if (row.migrated_at && new Date(row.created_at) <= new Date(row.migrated_at)) continue;
     try {
       const account = await provision({ userId: row.user_id, name: row.name });
       if (!account) break;               // 开关关着，这整件事就不该发生

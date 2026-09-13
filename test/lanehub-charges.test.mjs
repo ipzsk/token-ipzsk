@@ -96,6 +96,23 @@ test('充值补账按 voucher 幂等', async () => {
   assert.equal(db.credits.get('voucher:v1').quota, Math.round((10 / 7) * 500000));
 });
 
+// 迁移搬的是净余额，历史兑换码已经在里面了。再补一遍就是白送——上线当天送出去 ¥130。
+test('迁移之前的兑换码不再补账，之后的照补', async () => {
+  const db = fakeDb([
+    { id: 'e1', user_id: 'u1', voucher_id: 'v1', amount_cny: '50', name: 'A',
+      created_at: '2026-09-01T00:00:00Z', migrated_at: '2026-09-13T08:30:00Z' },
+    { id: 'e2', user_id: 'u1', voucher_id: 'v2', amount_cny: '10', name: 'A',
+      created_at: '2026-09-13T09:00:00Z', migrated_at: '2026-09-13T08:30:00Z' },
+    { id: 'e3', user_id: 'u2', voucher_id: 'v3', amount_cny: '20', name: 'B',
+      created_at: '2026-09-01T00:00:00Z', migrated_at: null },
+  ]);
+  const result = await reconcileLanehubTopups(db, fakeLanehub([]), RATES, async () => ({ lanehub_user_id: 7 }));
+  assert.equal(result.applied, 2);
+  assert.equal(db.credits.has('voucher:v1'), false, '迁移之前的那张已经在净余额里了');
+  assert.ok(db.credits.has('voucher:v2'), '迁移之后兑的要补');
+  assert.ok(db.credits.has('voucher:v3'), '没迁移过的客户全都要补');
+});
+
 test('开关关着时一分钱都不搬', async () => {
   const db = fakeDb([{ id: 'e1', user_id: 'u1', voucher_id: 'v1', amount_cny: '10', name: 'A' }]);
   const lanehub = fakeLanehub([]);
