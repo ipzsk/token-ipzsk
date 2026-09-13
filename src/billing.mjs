@@ -14,6 +14,32 @@ export const mediaAmount=s=>{
   if(s.billing_unit==='per_second')usd=multiply(usd,s.duration_sec);
   return multiply(multiply(usd,s.usd_cny),s.multiplier);
 };
+export const POINTS_PER_CNY = 100;
+// 点数 = 元 × 100，8 位小数串（与 charged_cny 同精度）。网页/桌面端只认「点」。
+export function points(value) {
+  if(value===null||value===undefined)return null;
+  const raw=String(value),negative=raw.startsWith('-');
+  const scaled=units(negative?raw.slice(1):raw)*100n;
+  return (negative?'-':'')+decimal(scaled);
+}
+export function pointBalances(value){return {...value,balance_points:points(value.balance_cny),available_points:points(value.available_cny),frozen_points:points(value.frozen_cny),points_per_cny:POINTS_PER_CNY};}
+// 一笔请求收了多少：网页在每条回复旁标点数用。
+export async function requestCharge(db,id,userId){
+  const row=(await db.query(`SELECT r.id AS request_id,r.model,r.input_tokens,r.output_tokens,r.total_tokens,r.status,
+    b.state AS billing_state,b.charged_cny,b.reserved_cny FROM requests r LEFT JOIN request_billing b ON b.request_id=r.id
+    WHERE r.id=$1 AND r.user_id=$2`,[id,userId])).rows[0];
+  if(!row)throw httpError(404,'request_not_found');
+  return {...row,charged_points:points(row.charged_cny),reserved_points:points(row.reserved_cny)};
+}
+// 工作台报价：一次文本调用最多预扣多少。保守上界，不是 tokenizer。
+export function quoteTextHold(body,policy){
+  const model=prices.models[body.model],output=body.max_completion_tokens??body.max_output_tokens??body.max_tokens;
+  const input=Buffer.byteLength(JSON.stringify(body),'utf8')*2+4096;
+  const maxRate=field=>model.tiers.reduce((max,t)=>{const n=units(t[field]??t.input);return n>max?n:max;},0n);
+  const inputRate=[maxRate('input'),maxRate('cached_input'),maxRate('cache_write')].reduce((a,b)=>a>b?a:b);
+  const base=decimal((BigInt(input)*inputRate+BigInt(output)*maxRate('output')+999999n)/1000000n);
+  return multiply(base,policy.multiplier);
+}
 export async function wallet(c,userId){
   return (await c.query(`SELECT credit-debit AS balance_cny,held AS frozen_cny,credit-debit-held AS available_cny FROM
     (SELECT coalesce((SELECT sum(amount_cny) FROM wallet_entries WHERE user_id=$1),0) AS credit,

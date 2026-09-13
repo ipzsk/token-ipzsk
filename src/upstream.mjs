@@ -70,7 +70,7 @@ export class Upstream {
     const key = await this.secret(c.secret_ref);
     return this.fetcher(c.base_url.replace(/\/+$/,'') + path, {
       ...options, redirect: 'error',
-      headers: { 'Content-Type': 'application/json', ...options.headers, Authorization: `Bearer ${key}` },
+      headers: { ...(options.body instanceof FormData?{}:{'Content-Type': 'application/json'}), ...options.headers, Authorization: `Bearer ${key}` },
     });
   }
   async channelByRef(ref) {

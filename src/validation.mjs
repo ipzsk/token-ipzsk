@@ -18,7 +18,7 @@ export function bool(value) {
   return value;
 }
 export function models(value) {
-  if (!Array.isArray(value) || !value.length || value.length > 100) throw httpError(400, 'invalid_models');
+  if (!Array.isArray(value) || !value.length || value.length > 1000) throw httpError(400, 'invalid_models');
   return [...new Set(value.map((x) => text(x, 128)))];
 }
 export function chat(body) {

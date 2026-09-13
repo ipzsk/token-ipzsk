@@ -10,6 +10,8 @@ import { createImageCaptcha } from './captcha.mjs';
 import { createApp } from './app.mjs';
 import { Lanehub, adminTokenFromEnv } from './lanehub.mjs';
 import { LanehubCatalog } from './lanehub-catalog.mjs';
+import { loadR2Storage } from './r2-storage.mjs';
+import { syncImageArchives } from './image-archive.mjs';
 import { reconcileLanehubCharges, reconcileLanehubTopups } from './lanehub-charges.mjs';
 import { provisionIfEnabled } from './lanehub.mjs';
 
@@ -25,6 +27,8 @@ const voucherKey=Buffer.from((await readFile('/run/secrets/voucher-encryption-ke
 const origin=process.env.PUBLIC_ORIGIN ?? 'https://api.ipzsk.com';
 const customerAuthSecret=(await readFile('/run/secrets/customer-auth-secret','utf8')).trim();
 const customerAuth=createCustomerAuth({db,origin,secret:customerAuthSecret,
+  // 接了 lanehub 时新人赠额由对面发（provisionCustomer），本地不再发，否则一个新用户拿两份。
+  localSignupBonus:!process.env.LANEHUB_BASE_URL,
   mailer:await loadMailer('/run/mail/tencent-ses.json'),captcha:createImageCaptcha({db,secret:customerAuthSecret})});
 await customerAuth.migrate();
 let trustedProxyAddresses=new Set(['127.0.0.1','::1']);
@@ -48,7 +52,9 @@ const lanehubQuotaPerUnit=Number(process.env.LANEHUB_QUOTA_PER_UNIT ?? 500000);
 // 型号目录跟着 lanehub 走：启动拉一次，之后每 10 分钟刷新；拉不到保留上一份。
 const lanehubCatalog = lanehub ? new LanehubCatalog(lanehub, { log: (o,msg)=>console.error(msg, o) }) : null;
 if (lanehubCatalog) await lanehubCatalog.start();
-const appOptions = { db,upstream,voucherKey,customerAuth,
+// R2 图片归档：没配 R2_CONFIG_FILE 就关掉（日志里会有 image_archive_disabled），生图不受影响。
+const imageStorage = process.env.R2_CONFIG_FILE ? await loadR2Storage(process.env.R2_CONFIG_FILE) : null;
+const appOptions = { db,upstream,voucherKey,customerAuth,imageStorage,
   lanehub,lanehubCatalog,lanehubAccountId:process.env.LANEHUB_ACCOUNT_ID ?? null,
   // 新人额度：默认 ¥5。折算汇率显式给，不从对面实时取——同一批新用户按不同汇率
   // 折算会让「都送了 5 块」变成各自不同的积分。
@@ -75,14 +81,21 @@ const syncCharges = () => upstream.syncTaskCharges().then(result => {
   }).catch(() => app.log.error('lanehub_charge_sync_failed'));
 const chargeTimer = setInterval(syncCharges,120_000);
 chargeTimer.unref();
+let archivePending;
+const syncArchives = () => {
+  if (!archivePending && imageStorage) archivePending = syncImageArchives(db,imageStorage)
+    .catch(() => app.log.error('image_archive_sync_failed')).finally(() => { archivePending=null; });
+};
+const archiveTimer=setInterval(syncArchives,5000);archiveTimer.unref();syncArchives();
+if (!imageStorage) app.log.warn('image_archive_disabled');
 let mediaPending;
 const syncMedia = () => { if (!mediaPending) mediaPending=syncMediaTasks(db,upstream).finally(()=>{mediaPending=null;}).catch(()=>{}); };
 const mediaTimer=setInterval(syncMedia,5000);mediaTimer.unref();syncMedia();
 let stopping = false;
 for (const event of ['SIGTERM','SIGINT']) process.on(event,async () => {
   if (stopping) return; stopping=true;
-  clearInterval(mediaTimer);clearInterval(syncTimer);clearInterval(proxyTimer);clearInterval(chargeTimer); upstream.close();
-  await app.close(); await upstream.pending?.catch(() => {}); await upstream.taskChargesPending?.catch(() => {}); await mediaPending; await db.close();
+  clearInterval(archiveTimer);clearInterval(mediaTimer);clearInterval(syncTimer);clearInterval(proxyTimer);clearInterval(chargeTimer); upstream.close();
+  await app.close(); await upstream.pending?.catch(() => {}); await upstream.taskChargesPending?.catch(() => {}); await mediaPending; await archivePending; await db.close();
 });
 await app.listen({ host:'0.0.0.0',port:3000 });
 console.log('gateway_listening');

@@ -165,10 +165,13 @@ export function voucherRoutes(app,options) {
     const balances=account
       ?await lanehubBalance(lanehub,account,{usdCnyRate:lanehubUsdCny,quotaPerUnit:lanehubQuotaPerUnit})
       :await wallet(db,req.apiUser.id);
-    const rows=(await db.query(`SELECT id,amount_cny,balance_after_cny,created_at,'recharge' AS kind FROM wallet_entries WHERE user_id=$1 UNION ALL SELECT id,-amount_cny,balance_after_cny,created_at,'consumption' AS kind FROM wallet_debits WHERE user_id=$1 ORDER BY created_at DESC,id LIMIT 30`,[req.apiUser.id])).rows;
+    const rows=(await db.query(`SELECT id,amount_cny,balance_after_cny,created_at,
+      CASE WHEN source='signup_bonus' THEN 'signup_bonus' ELSE 'recharge' END AS kind
+      FROM wallet_entries WHERE user_id=$1 UNION ALL SELECT id,-amount_cny,balance_after_cny,created_at,'consumption' AS kind FROM wallet_debits WHERE user_id=$1 ORDER BY created_at DESC,id LIMIT 30`,[req.apiUser.id])).rows;
     return {user:{id:req.apiUser.id,name:req.apiUser.name},...balances,
       balance_points:points(balances.balance_cny),frozen_points:points(balances.frozen_cny),available_points:points(balances.available_cny),
-      currency:'CNY',source:account?'lanehub':'local',entries:rows};
+      currency:'CNY',source:account?'lanehub':'local',
+      entries:rows.map(row=>({...row,amount_points:points(row.amount_cny),balance_after_points:points(row.balance_after_cny)}))};
   });
   app.post('/api/me/vouchers/redeem',async(req)=>{
     limiter.take('redeem-ip:'+req.ip,30);limiter.take('redeem-user:'+req.apiUser.id,10);
