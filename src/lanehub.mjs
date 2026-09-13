@@ -50,14 +50,20 @@ export class Lanehub {
     let payload;
     try { payload = await response.json(); } catch { payload = null; }
     if (!response.ok || payload?.success === false) {
-      throw httpError(502, 'lanehub_api_failed', payload?.message ?? ('http_' + response.status));
+      // done-hub 用 HTTP 200 + success:false 报业务错，原文只在 message 里。丢掉它的话，
+      // 排查时只剩一个 lanehub_api_failed，既不知道是哪条校验也不知道该改什么。
+      const detail = payload?.message || ('http_' + response.status);
+      throw Object.assign(httpError(502, 'lanehub_api_failed'), { detail, path, message: 'lanehub_api_failed: ' + detail });
     }
     return payload?.data ?? payload;
   }
 
   /** 建一个 lanehub 用户。用户名就是客户 id，重名时由调用方按映射表判重。 */
   async createUser(username, displayName) {
-    await this.call('/api/user/', { method: 'POST', body: { username, display_name: displayName, password: randomPassword() } });
+    // done-hub 的显示名上限 20 个字符，而这里传进来的是客户邮箱——超过 20 的邮箱很常见，
+    // 不截就是一半客户建不出号。截断只影响后台列表里的展示，username 才是身份。
+    const display = String(displayName ?? username).slice(0, 20);
+    await this.call('/api/user/', { method: 'POST', body: { username, display_name: display, password: randomPassword() } });
     // 建号接口只回 success，不回用户对象——再查一次拿 id。
     return this.findUser(username);
   }
