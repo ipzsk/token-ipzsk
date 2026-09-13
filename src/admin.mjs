@@ -10,12 +10,15 @@ import { providerTypes, providerOptions } from './upstream.mjs';
 // 唯一的例外是**回环地址**：本机自检要能把 lanehub 起在 http://localhost:3000 上打一遍。
 // 这个口子开得起——回环流量不出网卡，密钥不会在链路上裸奔；而没有这个口子的代价是
 // 整条链路只能在生产上第一次跑通，而形状类的错（字段名、任务结构）恰恰只有真打才看得见。
-const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
+// 明文 http 只放两类地址：回环（本机自检），以及 compose 内部网络里的 lanehub 服务名。
+// 后者的流量走 docker 的 host-local 网桥，不出网卡，信任级别与回环相同；放开成任意
+// http 主机就等于把上游密钥交给随便哪条明文链路。
+const PLAIN_HTTP_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1', 'lanehub']);
 function baseUrl(value) {
   let url;
   try { url = new URL(v.text(value, 200)); } catch { throw httpError(400, 'invalid_base_url'); }
-  const loopback = url.protocol === 'http:' && LOOPBACK.has(url.hostname);
-  if ((url.protocol !== 'https:' && !loopback) || url.search || url.hash || url.username || url.password) throw httpError(400, 'invalid_base_url');
+  const plainOk = url.protocol === 'http:' && PLAIN_HTTP_HOSTS.has(url.hostname);
+  if ((url.protocol !== 'https:' && !plainOk) || url.search || url.hash || url.username || url.password) throw httpError(400, 'invalid_base_url');
   return (url.origin + url.pathname).replace(/\/+$/, '');
 }
 function providerType(value) {

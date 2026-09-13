@@ -264,7 +264,9 @@ ALTER TABLE upstream_accounts DROP CONSTRAINT IF EXISTS upstream_accounts_base_u
 -- 回环流量不出网卡，密钥不会裸奔；理由同 src/admin.mjs 的 baseUrl()。
 ALTER TABLE upstream_accounts ADD CONSTRAINT upstream_accounts_base_url_https
   CHECK (base_url LIKE 'https://%' OR base_url LIKE 'http://localhost%'
-      OR base_url LIKE 'http://127.0.0.1%' OR base_url LIKE 'http://[::1]%');
+      OR base_url LIKE 'http://127.0.0.1%' OR base_url LIKE 'http://[::1]%'
+      -- compose 内部网络里的服务名：流量走 docker 的 host-local 网桥，不出网卡。
+      OR base_url LIKE 'http://lanehub:%');
 INSERT INTO schema_version(version) VALUES(14) ON CONFLICT DO NOTHING;
 
 -- 媒体按 USD 报价，钱包记 CNY。汇率是管理员维护的账本参数，不在请求时联网取值，
