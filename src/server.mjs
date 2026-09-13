@@ -1,7 +1,7 @@
 import { syncMediaTasks } from './media-task-sync.mjs';
 import { lookup } from 'node:dns/promises';
 import { readFile } from 'node:fs/promises';
-import { database, bootstrap } from './database.mjs';
+import { databaseFromEnv, bootstrap } from './database.mjs';
 import { Upstream } from './upstream.mjs';
 import { Scheduler } from './scheduler.mjs';
 import { createCustomerAuth } from './customer-auth.mjs';
@@ -12,8 +12,7 @@ import { Lanehub, adminTokenFromEnv } from './lanehub.mjs';
 import { reconcileLanehubCharges, reconcileLanehubTopups } from './lanehub-charges.mjs';
 import { provisionIfEnabled } from './lanehub.mjs';
 
-const db = database({ host:process.env.PGHOST ?? 'db', port:Number(process.env.PGPORT ?? 5432),
-  user:'gateway', database:'gateway', password:(await readFile(process.env.PGPASSWORD_FILE ?? '/run/secrets/db-password','utf8')).trim() });
+const db = await databaseFromEnv();
 const secretDir = process.env.UPSTREAM_SECRET_DIR ?? '/run/upstream';
 const upstream = new Upstream(db,secretDir);
 await db.migrate();

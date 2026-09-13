@@ -16,12 +16,12 @@
  *
  * 关掉不做检查：回滚要能立刻生效。
  */
-import { database } from '../src/database.mjs';
+import { databaseFromEnv } from '../src/database.mjs';
 import { wallet } from '../src/billing.mjs';
 
 const [action] = process.argv.slice(2);
 const force = process.argv.includes('--force');
-const db = database({ connectionString: process.env.DATABASE_URL });
+const db = await databaseFromEnv();
 
 async function mode() {
   return (await db.query("SELECT value FROM app_settings WHERE key='lanehub_mode'")).rows[0]?.value ?? 'off';

@@ -13,7 +13,7 @@
  *
  * 不加 --apply 只打印会发生什么。**默认不写任何东西。**
  */
-import { database } from '../src/database.mjs';
+import { databaseFromEnv } from '../src/database.mjs';
 import { wallet } from '../src/billing.mjs';
 import { Upstream } from '../src/upstream.mjs';
 import { Lanehub, ensureAccount, creditAccount, adminTokenFromEnv } from '../src/lanehub.mjs';
@@ -49,7 +49,7 @@ if (!(usdCny > 0)) {
   process.exit(2);
 }
 
-const db = database({ connectionString: env('DATABASE_URL') });
+const db = await databaseFromEnv();
 const upstream = new Upstream(db, env('SECRET_DIR', './secrets'));
 const lanehub = new Lanehub({ baseUrl, adminToken });
 

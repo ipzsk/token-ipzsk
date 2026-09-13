@@ -4,6 +4,17 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { hash, passwordHash } from './security.mjs';
 
+/**
+ * 按环境建库连接：容器里给的是 PGHOST + PGPASSWORD_FILE（口令 600、不进 compose.yaml），
+ * 本机自检给的是 DATABASE_URL。服务端和运维脚本共用这一份——各写各的时，脚本会在
+ * 容器里因为「没有 DATABASE_URL」连到默认库上报一句看不懂的启动包错误。
+ */
+export async function databaseFromEnv(env = process.env) {
+  if (env.DATABASE_URL) return database({ connectionString: env.DATABASE_URL });
+  return database({ host: env.PGHOST ?? 'db', port: Number(env.PGPORT ?? 5432), user: 'gateway', database: 'gateway',
+    password: (await readFile(env.PGPASSWORD_FILE ?? '/run/secrets/db-password', 'utf8')).trim() });
+}
+
 export function database(config) {
   const pool = new pg.Pool({ ...config, max: 8, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 5000,
     statement_timeout: 10_000, application_name: 'ipzsk-gateway' });
