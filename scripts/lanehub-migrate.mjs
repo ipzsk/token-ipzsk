@@ -16,7 +16,7 @@
 import { database } from '../src/database.mjs';
 import { wallet } from '../src/billing.mjs';
 import { Upstream } from '../src/upstream.mjs';
-import { Lanehub, ensureAccount, creditAccount } from '../src/lanehub.mjs';
+import { Lanehub, ensureAccount, creditAccount, adminTokenFromEnv } from '../src/lanehub.mjs';
 
 const args = process.argv.slice(2);
 const flag = (name, fallback) => {
@@ -34,7 +34,7 @@ if (!batch) {
 
 const env = (name, fallback) => process.env[name] ?? fallback;
 const baseUrl = env('LANEHUB_BASE_URL');
-const adminToken = env('LANEHUB_ADMIN_TOKEN');
+const adminToken = await adminTokenFromEnv();
 const accountId = env('LANEHUB_ACCOUNT_ID');
 const usdCny = Number(env('LANEHUB_USD_CNY', '0'));
 const quotaPerUnit = Number(env('LANEHUB_QUOTA_PER_UNIT', '500000'));

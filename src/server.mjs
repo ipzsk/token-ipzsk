@@ -8,7 +8,7 @@ import { createCustomerAuth } from './customer-auth.mjs';
 import { loadMailer } from './email.mjs';
 import { createImageCaptcha } from './captcha.mjs';
 import { createApp } from './app.mjs';
-import { Lanehub } from './lanehub.mjs';
+import { Lanehub, adminTokenFromEnv } from './lanehub.mjs';
 import { reconcileLanehubCharges, reconcileLanehubTopups } from './lanehub-charges.mjs';
 import { provisionIfEnabled } from './lanehub.mjs';
 
@@ -38,10 +38,7 @@ const proxyTimer=setInterval(refreshProxyAddresses,60000);proxyTimer.unref();
 // 会把整条分支关掉——不会出现「开关是 on 但没有客户端」的半开状态。
 // 管理令牌优先从文件读：这台机器上别的密钥（数据库口令、管理员口令）都走
 // *_FILE，权限 600、不进 compose.yaml，这一个不该例外。
-const lanehubAdminToken = process.env.LANEHUB_ADMIN_TOKEN
-  ?? (process.env.LANEHUB_ADMIN_TOKEN_FILE
-    ? (await readFile(process.env.LANEHUB_ADMIN_TOKEN_FILE, 'utf8')).trim()
-    : undefined);
+const lanehubAdminToken = await adminTokenFromEnv();
 const lanehub = process.env.LANEHUB_BASE_URL && lanehubAdminToken
   ? new Lanehub({ baseUrl:process.env.LANEHUB_BASE_URL, adminToken:lanehubAdminToken })
   : null;

@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { hash, httpError } from './security.mjs';
 
 // lanehub 接入：**额度真源在 lanehub**，这一侧只负责账号映射、充值入账和转发。
@@ -14,6 +15,17 @@ import { hash, httpError } from './security.mjs';
 //   · 充值入账必须**按支付单号幂等**：回调重放就是白送钱。
 
 const LANE_DEFAULT = 'official';
+
+/**
+ * 管理令牌优先从文件读：这台机器上别的密钥（数据库口令、管理员口令）都走 *_FILE，
+ * 权限 600、不进 compose.yaml，这一个不该例外。服务端和运维脚本共用这一份解析——
+ * 各写各的会让脚本在「compose 里明明配好了」的情况下报缺配置。
+ */
+export async function adminTokenFromEnv(env = process.env) {
+  if (env.LANEHUB_ADMIN_TOKEN) return env.LANEHUB_ADMIN_TOKEN;
+  if (env.LANEHUB_ADMIN_TOKEN_FILE) return (await readFile(env.LANEHUB_ADMIN_TOKEN_FILE, 'utf8')).trim();
+  return undefined;
+}
 
 /** lanehub 的管理 API 客户端。只用它建号、加额度、读额度——转发走既有的 upstream.request。 */
 export class Lanehub {
