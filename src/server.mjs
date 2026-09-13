@@ -1,3 +1,5 @@
+import { loadR2Storage } from './r2-storage.mjs';
+import { syncImageArchives } from './image-archive.mjs';
 import { syncMediaTasks } from './media-task-sync.mjs';
 import { lookup } from 'node:dns/promises';
 import { readFile } from 'node:fs/promises';
@@ -31,7 +33,8 @@ async function refreshProxyAddresses(){
 }
 await refreshProxyAddresses();
 const proxyTimer=setInterval(refreshProxyAddresses,60000);proxyTimer.unref();
-const app = await createApp({ db,upstream,voucherKey,customerAuth,
+const imageStorage = await loadR2Storage(process.env.R2_CONFIG_FILE);
+const app = await createApp({ db,upstream,voucherKey,customerAuth,imageStorage,
   trustProxy:(address)=>trustedProxyAddresses.has(address.replace(/^::ffff:/,'')),scheduler:new Scheduler(),
   origin:process.env.PUBLIC_ORIGIN ?? 'https://api.ipzsk.com',secureCookies:true,
   logger:{ level:'warn', redact:['req.headers.authorization','req.headers.cookie','res.headers.set-cookie','password','key','token'] } });
@@ -45,11 +48,18 @@ chargeTimer.unref();
 let mediaPending;
 const syncMedia = () => { if (!mediaPending) mediaPending=syncMediaTasks(db,upstream).finally(()=>{mediaPending=null;}).catch(()=>{}); };
 const mediaTimer=setInterval(syncMedia,5000);mediaTimer.unref();syncMedia();
+let archivePending;
+const syncArchives = () => {
+  if (!archivePending && imageStorage) archivePending = syncImageArchives(db,imageStorage)
+    .catch(() => app.log.error('image_archive_sync_failed')).finally(() => { archivePending=null; });
+};
+const archiveTimer=setInterval(syncArchives,5000);archiveTimer.unref();syncArchives();
+if (!imageStorage) app.log.warn('image_archive_disabled');
 let stopping = false;
 for (const event of ['SIGTERM','SIGINT']) process.on(event,async () => {
   if (stopping) return; stopping=true;
-  clearInterval(mediaTimer);clearInterval(syncTimer);clearInterval(proxyTimer);clearInterval(chargeTimer); upstream.close();
-  await app.close(); await upstream.pending?.catch(() => {}); await upstream.taskChargesPending?.catch(() => {}); await mediaPending; await db.close();
+  clearInterval(archiveTimer);clearInterval(mediaTimer);clearInterval(syncTimer);clearInterval(proxyTimer);clearInterval(chargeTimer); upstream.close();
+  await app.close(); await upstream.pending?.catch(() => {}); await upstream.taskChargesPending?.catch(() => {}); await mediaPending; await archivePending; await db.close();
 });
 await app.listen({ host:'0.0.0.0',port:3000 });
 console.log('gateway_listening');

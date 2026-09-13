@@ -38,7 +38,7 @@ export class Upstream {
     const key = await this.secret(ref);
     return this.fetcher(`https://api.apimart.ai${path}`, {
       ...options, redirect: 'error',
-      headers: { 'Content-Type': 'application/json', ...options.headers, Authorization: `Bearer ${key}` },
+      headers: { ...(options.body instanceof FormData?{}:{'Content-Type': 'application/json'}), ...options.headers, Authorization: `Bearer ${key}` },
     });
   }
   async balance(ref, path) {

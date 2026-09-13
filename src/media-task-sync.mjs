@@ -1,3 +1,4 @@
+import { settleMediaRequest } from './billing.mjs';
 import { recordTaskCharge } from './task-charges.mjs';
 
 const terminal = ['completed', 'failed', 'cancelled'];
@@ -21,6 +22,7 @@ export async function refreshMediaTask(db, upstream, id) {
         ...(terminal.includes(data.status) && data.status !== 'completed' ? {error:{message:'Media generation failed.'}} : {})};
       await c.query('UPDATE media_tasks SET status=$2,result=$3 WHERE id=$1',[id,data.status,JSON.stringify(result)]);
       await recordTaskCharge({tx:fn=>fn(c)},task,data);
+      if(data.id===task.upstream_task_id)await settleMediaRequest(c,id,data);
     } catch {
       // A transient network error leaves the remote task pending, with backoff.
     } finally {

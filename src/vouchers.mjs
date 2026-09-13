@@ -1,4 +1,4 @@
-import { wallet } from './billing.mjs';
+import { wallet, points, pointBalances } from './billing.mjs';
 import { randomUUID, randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
 import { hash, httpError, RateLimiter } from './security.mjs';
 import * as v from './validation.mjs';
@@ -150,8 +150,10 @@ export function voucherRoutes(app,{db,voucherKey}) {
   });
   app.get('/api/me/wallet',async(req)=>{
     const balances=await wallet(db,req.apiUser.id);
-    const rows=(await db.query(`SELECT id,amount_cny,balance_after_cny,created_at,'recharge' AS kind FROM wallet_entries WHERE user_id=$1 UNION ALL SELECT id,-amount_cny,balance_after_cny,created_at,'consumption' AS kind FROM wallet_debits WHERE user_id=$1 ORDER BY created_at DESC,id LIMIT 30`,[req.apiUser.id])).rows;
-    return {user:{id:req.apiUser.id,name:req.apiUser.name},...balances,currency:'CNY',entries:rows};
+    const rows=(await db.query(`SELECT id,amount_cny,balance_after_cny,created_at,
+      CASE WHEN source='signup_bonus' THEN 'signup_bonus' ELSE 'recharge' END AS kind
+      FROM wallet_entries WHERE user_id=$1 UNION ALL SELECT id,-amount_cny,balance_after_cny,created_at,'consumption' AS kind FROM wallet_debits WHERE user_id=$1 ORDER BY created_at DESC,id LIMIT 30`,[req.apiUser.id])).rows;
+    return {user:{id:req.apiUser.id,name:req.apiUser.name},...pointBalances(balances),currency:'CNY',entries:rows.map(row=>({...row,amount_points:points(row.amount_cny),balance_after_points:points(row.balance_after_cny)}))};
   });
   app.post('/api/me/vouchers/redeem',async(req)=>{
     limiter.take('redeem-ip:'+req.ip,30);limiter.take('redeem-user:'+req.apiUser.id,10);
@@ -169,7 +171,7 @@ export function voucherRoutes(app,{db,voucherKey}) {
       if(!user.enabled||!credential.rowCount)throw httpError(401,'invalid_api_token');
       if(code.state==='redeemed'&&code.redeemed_by===req.apiUser.id){
         const prior=required(await c.query('SELECT id,amount_cny,balance_after_cny FROM wallet_entries WHERE voucher_id=$1',[code.id]));
-        return {ok:true,replayed:true,ledger_id:prior.id,amount_cny:prior.amount_cny,balance_after_cny:prior.balance_after_cny};
+        return {ok:true,replayed:true,ledger_id:prior.id,amount_cny:prior.amount_cny,amount_points:points(prior.amount_cny),balance_after_cny:prior.balance_after_cny};
       }
       if(code.state!=='unused'||!batch.assigned_at||(batch.expires_at&&batch.expires_at<=new Date()))throw httpError(400,'voucher_unavailable');
       const balance=(await c.query('SELECT coalesce(sum(amount_cny),0)+$2::numeric-coalesce((SELECT sum(amount_cny) FROM wallet_debits WHERE user_id=$1),0) AS amount FROM wallet_entries WHERE user_id=$1',[req.apiUser.id,batch.amount_cny])).rows[0].amount;
@@ -178,7 +180,7 @@ export function voucherRoutes(app,{db,voucherKey}) {
       await c.query("UPDATE voucher_codes SET state='redeemed',redeemed_by=$2,redeemed_at=now() WHERE id=$1",[code.id,req.apiUser.id]);
       await c.query('INSERT INTO audit_events(action,target_id,details) VALUES($1,$2,$3)',
         ['voucher.redeem',code.id,JSON.stringify({user_id:req.apiUser.id,amount_cny:batch.amount_cny,ledger_id:ledgerId})]);
-      return {ok:true,replayed:false,ledger_id:ledgerId,amount_cny:batch.amount_cny,balance_after_cny:balance};
+      return {ok:true,replayed:false,ledger_id:ledgerId,amount_cny:batch.amount_cny,amount_points:points(batch.amount_cny),balance_after_cny:balance};
     });
   });
 }

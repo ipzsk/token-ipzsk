@@ -1,3 +1,5 @@
+import { workspaceRoutes } from './workspace.mjs';
+import { imageArchiveRoutes } from './image-archive.mjs';
 import {desktopReleaseRoutes} from './desktop-releases.mjs';
 import {developerRoutes} from './developers.mjs';
 import { pluginRoutes } from './plugins.mjs';
@@ -41,7 +43,8 @@ export async function createApp(options) {
     // Never return SQL details, upstream credentials, request bodies, or headers.
     const code = dbConflict ? 'already_exists' : (error.statusCode && error.code ? error.code : (status < 500 ? 'invalid_request' : 'internal_error'));
     if (status === 500) app.log.error({ request_id:req.id },'request_failed');
-    reply.code(status).send({ error:{ code, message:code } });
+    const messages={insufficient_balance:'点数不足，请先使用充值码充值后再使用。',billing_unavailable:'计费服务暂不可用，请稍后重试。',billing_requires_priced_text_and_output_limit:'此模型或服务尚未配置可靠价格，暂不可用。',unpriced_image_options:'此图片规格暂未开放计费。'};
+    reply.code(status).send({ error:{ code, message:messages[code]??code } });
   });
   app.get('/healthz', async () => { await options.db.query('SELECT 1'); return { status:'ok' }; });
   app.get('/', async (_req, reply) => reply.redirect('/admin'));
@@ -54,6 +57,8 @@ export async function createApp(options) {
   desktopReleaseRoutes(app,options);
   adminRoutes(app,options);
   gatewayRoutes(app,options);
+  imageArchiveRoutes(app,options);
+  workspaceRoutes(app,options);
   voucherRoutes(app,options);
   customerAuthRoutes(app,options);
   accountKeyRoutes(app,options);

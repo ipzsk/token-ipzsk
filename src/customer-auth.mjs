@@ -44,7 +44,16 @@ export function createCustomerAuth({db,secret,origin,mailer,captcha=unavailableC
         VALUES($1,$2,$3,$4,true) ON CONFLICT(auth_user_id) DO NOTHING RETURNING id`,
         [randomUUID(),(user.name||user.email).slice(0,100),user.id,user.email.toLowerCase()]);
       const row=(await c.query('SELECT id,name,rpm,enabled,auth_user_id,email FROM users WHERE auth_user_id=$1',[user.id])).rows[0];
-      if(result.rowCount)await c.query('INSERT INTO audit_events(action,target_id) VALUES($1,$2)',['customer.register',row.id]);
+      if(result.rowCount){
+        const amount='5.00000000',ledgerId=randomUUID();
+        const balance=(await c.query(`SELECT coalesce(sum(amount_cny),0)+$2::numeric-
+          coalesce((SELECT sum(amount_cny) FROM wallet_debits WHERE user_id=$1),0) AS amount
+          FROM wallet_entries WHERE user_id=$1`,[row.id,amount])).rows[0].amount;
+        await c.query(`INSERT INTO wallet_entries(id,user_id,voucher_id,amount_cny,balance_after_cny,source)
+          VALUES($1,$2,NULL,$3,$4,'signup_bonus') ON CONFLICT DO NOTHING`,[ledgerId,row.id,amount,balance]);
+        await c.query('INSERT INTO audit_events(action,target_id,details) VALUES($1,$2,$3)',
+          ['customer.register',row.id,JSON.stringify({signup_bonus_cny:amount,ledger_id:ledgerId})]);
+      }
       if(!row.enabled)throw httpError(403,'account_disabled');
       return row;
     });

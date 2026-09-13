@@ -1,14 +1,17 @@
+import { uploadImageReferences } from './image-references.mjs';
+import { workspaceChat } from './workspace.mjs';
+import { ownedArchivedImage } from './image-archive.mjs';
 import { refreshMediaTask } from './media-task-sync.mjs';
 import { publicImageTask, imageUrls, fetchResultImage } from './image-results.mjs';
 import { adaptModelRequest } from './model-catalog.mjs';
-import { reserveRequest, settleRequest } from './billing.mjs';
+import { reserveRequest, settleRequest, requestCharge, points, units, decimal } from './billing.mjs';
 import { customerOrigin } from './customer-auth.mjs';
 import { randomUUID } from 'node:crypto';
 import { checkDesktopSession } from './desktop.mjs';
 import { Readable } from 'node:stream';
 import { hash, httpError, RateLimiter } from './security.mjs';
 import { UsageReader, extractUsage, extractBillingUsage } from './usage.mjs';
-import { estimateTextCost } from './text-pricing.mjs';
+import { estimateTextCost, prices } from './text-pricing.mjs';
 import { agentRequest, agentResponse, agentHeaders } from './agent-protocols.mjs';
 import { uuid } from './validation.mjs';
 import { listRequests } from './admin.mjs';
@@ -29,7 +32,7 @@ function stable(value) {
   if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map((k) => [k, stable(value[k])]));
   return value;
 }
-export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, origin, requestTimeoutMs = 180_000 }) {
+export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, origin, imageStorage, requestTimeoutMs = 180_000 }) {
   const limiter = new RateLimiter();
   app.decorateRequest('apiUser', null);
   app.addHook('onRequest', async (req) => {
@@ -55,20 +58,38 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
   app.get('/v1/models', async () => {
     const { rows } = await db.query(`SELECT DISTINCT unnest(k.models) AS model FROM upstream_keys k
       JOIN upstream_accounts a ON a.id=k.account_id WHERE k.enabled AND a.enabled ORDER BY model`);
-    return { object: 'list', data: rows.map((r) => ({ id:r.model, object:'model', owned_by:'ipzsk' })) };
+    return { object: 'list', data: rows.filter(r=>prices.models[r.model]&&!r.model.includes('search')||['gpt-image-2','gpt-image-2.5-flare','gemini-3.1-flash-image-preview'].includes(r.model)).map((r) => ({ id:r.model, object:'model', owned_by:'ipzsk' })) };
   });
   app.get('/api/me/usage', async (req) => {
     const records = await listRequests(db, req.query, req.apiUser.id);
     // Public user responses do not expose the upstream pool's identity.
-    records.rows = records.rows.map(({ key_name, upstream_id, cost_cny, cost_reference, cost_recorded_at, estimated_cost_cny, pricing_details, ...row }) => row);
+    records.rows = records.rows.map(({ key_name, upstream_id, cost_cny, cost_reference, cost_recorded_at, estimated_cost_cny, pricing_details, ...row }) => ({...row,charged_points:points(row.charged_cny)}));
     const summary = (await db.query(`SELECT count(*) AS requests,coalesce(sum(input_tokens),0) AS input_tokens,
       coalesce(sum(output_tokens),0) AS output_tokens,coalesce(sum(total_tokens),0) AS total_tokens,
       count(*) FILTER(WHERE usage_state='unknown') AS unknown FROM requests WHERE user_id=$1`, [req.apiUser.id])).rows[0];
     return { ...records, summary };
   });
-  app.get('/v1/tasks/:id/image/:index', async (req,reply) => {
+  app.post('/api/me/message-billing',async req=>{
+    const ids=req.body?.response_ids;
+    if(!Array.isArray(ids)||!ids.length||ids.length>128||ids.some(id=>typeof id!=='string'||!id.length||id.length>200))throw httpError(400,'invalid_response_ids');
+    const unique=[...new Set(ids)];
+    const rows=(await db.query(`SELECT r.id AS request_id,r.upstream_id,r.model,r.input_tokens,r.output_tokens,b.state AS billing_state,b.charged_cny
+      FROM requests r LEFT JOIN request_billing b ON b.request_id=r.id WHERE r.user_id=$1 AND r.upstream_id=ANY($2::text[])`,[req.apiUser.id,unique])).rows;
+    const complete=rows.length===unique.length&&unique.every(id=>rows.filter(r=>r.upstream_id===id).length===1)&&rows.every(r=>r.charged_cny!==null&&['settled','released'].includes(r.billing_state));
+    const amount=complete?decimal(rows.reduce((sum,r)=>sum+units(r.charged_cny),0n)):null;
+    return {billing_state:complete?'settled':'pending',charged_points:points(amount),rows:rows.map(({upstream_id,charged_cny,...r})=>({...r,charged_points:points(charged_cny)}))};
+  });
+  app.get('/api/me/requests/:id',async req=>requestCharge(db,uuid(req.params.id),req.apiUser.id));
+  for(const imagePath of ['/v1/tasks/:id/image/:index','/api/me/tasks/:id/image/:index'])app.get(imagePath, async (req,reply) => {
     const id=uuid(req.params.id);
     if(!/^[0-9]{1,2}$/.test(req.params.index))throw httpError(404,'image_not_found');
+    if (imageStorage) {
+      const archived = await ownedArchivedImage(db,req.apiUser,id,Number(req.params.index));
+      if (archived) {
+        if(req.url.startsWith('/api/me/')){const image=await fetchResultImage(imageStorage.getUrl(archived.object_key));return reply.type(image.type).send(image.body);}
+        return reply.redirect(imageStorage.getUrl(archived.object_key));
+      }
+    }
     const task=(await db.query(`SELECT t.result FROM media_tasks t JOIN requests r ON r.id=t.id
       WHERE t.id=$1 AND r.user_id=$2 AND t.status='completed' AND ($3::uuid IS NULL OR r.plugin_id=$3)`,[id,req.apiUser.id,req.apiUser.plugin_id??null])).rows[0];
     const url=imageUrls(task?.result)[Number(req.params.index)];
@@ -76,7 +97,7 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     const image=await fetchResultImage(url);
     return reply.type(image.type).send(image.body);
   });
-  app.get('/v1/tasks/:id', async (req) => {
+  for(const taskPath of ['/v1/tasks/:id','/api/me/tasks/:id'])app.get(taskPath, async (req) => {
     const id=uuid(req.params.id);
     const task=(await db.query(`SELECT t.*,k.secret_ref FROM media_tasks t
       JOIN requests r ON r.id=t.id JOIN upstream_keys k ON k.id=r.key_id
@@ -84,14 +105,30 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     if(!task)throw httpError(404,'task_not_found');
     await refreshMediaTask(db,upstream,id).catch(()=>{});
     const saved=(await db.query('SELECT status,result FROM media_tasks WHERE id=$1',[id])).rows[0];
-    return {code:200,data:publicImageTask(saved.result??{id,status:saved.status,progress:0,result:null},origin)};
+    return {code:200,data:publicImageTask(saved.result??{id,status:saved.status,progress:0,result:null},origin),billing:await requestCharge(db,id,req.apiUser.id)};
   });
   app.addContentTypeParser(/^multipart\/form-data(?:;|$)/i,{parseAs:'buffer'},(req,body,done)=>{
     if(!['/v1/audio/transcriptions','/v1/images/edits','/v1/images/generations'].includes(req.url.split('?')[0]))return done(httpError(415,'unsupported_content_type'));
     done(null,body);
   });
-  for (const routePath of ['/v1/chat/completions','/v1/responses','/v1/messages','/v1/images/generations','/v1/images/edits','/v1/videos/generations','/v1/audio/transcriptions']) app.post(routePath, {bodyLimit:routePath==='/v1/audio/transcriptions'?26_000_000:32_000_000}, async (req, reply) => {
-    const path=routePath==='/v1/images/edits'?'/v1/images/generations':routePath;
+  for (const routePath of ['/api/me/workspace/chat','/api/me/chat/completions','/api/me/image-prompt','/api/me/images/generations','/v1/chat/completions','/v1/responses','/v1/messages','/v1/images/generations','/v1/images/edits','/v1/videos/generations','/v1/audio/transcriptions']) app.post(routePath, {bodyLimit:routePath==='/v1/audio/transcriptions'?26_000_000:32_000_000}, async (req, reply) => {
+    const webPrompt=routePath==='/api/me/image-prompt';
+    if(webPrompt){
+      const prompt=req.body?.prompt;
+      if(typeof prompt!=='string'||!prompt.trim()||prompt.length>16000)throw httpError(400,'invalid_prompt');
+      req.body={model:'gpt-5',stream:false,max_completion_tokens:4000,reasoning_effort:'minimal',messages:[{role:'system',content:'你是生图提示词编辑。将用户需求扩展为准确、可执行的简体中文生图提示词，保留主体、画幅、文字和限制。只输出最终提示词。'},{role:'user',content:prompt}]};
+    }
+    const workspace=routePath==='/api/me/workspace/chat';
+    let workspaceId,workspaceBudget;
+    if(workspace){
+      if(!req.apiUser.session_id)throw httpError(403,'email_login_required');
+      limiter.take('chat:'+req.apiUser.id,req.apiUser.rpm);
+      workspaceId=req.body?.request_id;uuid(workspaceId);
+      const {budget_cny,policy_version}=req.body;
+      if(!Number.isSafeInteger(policy_version)||(budget_cny!==null&&(typeof budget_cny!=='string'||!/^\d{1,10}\.\d{8}$/.test(budget_cny))))throw httpError(400,'workspace_quote_required');
+      workspaceBudget={version:policy_version,amount:budget_cny};req.body=workspaceChat(req.body);
+    }
+    const path=workspace||webPrompt||routePath==='/api/me/chat/completions'?'/v1/chat/completions':['/v1/images/edits','/api/me/images/generations'].includes(routePath)?'/v1/images/generations':routePath;
     const image=path==='/v1/images/generations'&&Buffer.isBuffer(req.body)?await imageUpload(req.body,req.headers['content-type']):null;
     if(routePath==='/v1/images/edits'&&!image)throw httpError(400,'invalid_image_upload');
     const audio=path==='/v1/audio/transcriptions'?await audioRequest(req.body,req.headers['content-type']):null;
@@ -104,7 +141,7 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     const protocolHeaders=agentHeaders(path,req.headers);
     if(audio)protocolHeaders['Content-Type']=audio.contentType;
     const id = randomUUID(), started = Date.now();
-    const idempotency = req.headers['idempotency-key'] ?? null;
+    const idempotency = workspace ? 'workspace:'+workspaceId : req.headers['idempotency-key'] ?? null;
     if (idempotency !== null && (typeof idempotency !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(idempotency))) {
       throw httpError(400,'invalid_idempotency_key');
     }
@@ -146,13 +183,18 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       finalized = true;
     };
     try {
-      await reserveRequest(db,id,req.apiUser.id,body,path);
+      await reserveRequest(db,id,req.apiUser.id,body,path,workspaceBudget);
       lease = await scheduler.acquire(() => upstream.candidates(body.model), controller.signal);
       controller.signal.throwIfAborted();
-      const stillValid = await db.query(`SELECT t.id,t.user_id,t.auth_session_id,t.plugin_id FROM access_tokens t JOIN users u ON u.id=t.user_id
-        WHERE t.id=$1 AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at>now()) AND u.enabled`, [req.apiUser.token_id]);
-      if (!stillValid.rowCount) throw httpError(401,'invalid_api_token');
-      await checkDesktopSession(db,stillValid.rows[0]);
+      if(req.apiUser.session_id){
+        const current=await customerAuth.identify(req.headers);
+        if(current.id!==req.apiUser.id||current.session_id!==req.apiUser.session_id)throw httpError(401,'customer_login_required');
+      }else{
+        const stillValid = await db.query(`SELECT t.id,t.user_id,t.auth_session_id,t.plugin_id FROM access_tokens t JOIN users u ON u.id=t.user_id
+          WHERE t.id=$1 AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at>now()) AND u.enabled`, [req.apiUser.token_id]);
+        if (!stillValid.rowCount) throw httpError(401,'invalid_api_token');
+        await checkDesktopSession(db,stillValid.rows[0]);
+      }
       attemptId = randomUUID();
       await db.tx(async (c) => {
         await c.query('UPDATE access_tokens SET last_used_at=now() WHERE id=$1',[req.apiUser.token_id]);
@@ -164,6 +206,7 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       if(media)delete payload.stream;
       // Require usage for SSE. Models that omit it remain explicitly unverified.
       if (payload.stream && path==='/v1/chat/completions') payload.stream_options = { ...payload.stream_options, include_usage:true };
+      if(payload.model==='gpt-image-2.5-flare' && payload.image_urls?.length)payload.image_urls=await uploadImageReferences(upstream,lease.row.secret_ref,payload.image_urls,controller.signal);
       submitted = true;
       const response = await upstream.request(lease.row.secret_ref, path, {
         method:'POST', body:audio?.payload??JSON.stringify(payload), headers:protocolHeaders, signal:controller.signal,
@@ -239,7 +282,8 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       upstreamId = typeof value.id === 'string' ? value.id.slice(0,200) : upstreamId;
       await finalize('succeeded',observedUsage);
       cleanup();
-      return reply.send(value);
+      const billing=await requestCharge(db,id,req.apiUser.id);
+      return reply.send(webPrompt?{prompt:value.choices?.[0]?.message?.content,billing}:{...value,billing});
     } catch (error) {
       await finalize(submitted ? 'uncertain' : 'failed',observedUsage,
         submitted ? 'upstream_result_uncertain' : (error.statusCode ? error.code : 'request_cancelled'))

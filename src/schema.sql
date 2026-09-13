@@ -253,3 +253,51 @@ CREATE TABLE IF NOT EXISTS image_captchas (
 );
 CREATE INDEX IF NOT EXISTS image_captchas_expiry ON image_captchas(expires_at);
 INSERT INTO schema_version(version) VALUES(13) ON CONFLICT DO NOTHING;
+
+-- R2 image archive: ownership remains authoritative in requests.user_id/plugin_id.
+CREATE TABLE IF NOT EXISTS image_archives (
+  task_id uuid PRIMARY KEY REFERENCES media_tasks(id),
+  state text NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','completed')),
+  attempts integer NOT NULL DEFAULT 0 CHECK(attempts>=0),
+  next_attempt_at timestamptz NOT NULL DEFAULT now(),
+  last_error text, archived_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS image_archives_pending ON image_archives(next_attempt_at) WHERE state='pending';
+CREATE TABLE IF NOT EXISTS archived_images (
+  task_id uuid NOT NULL REFERENCES image_archives(task_id),
+  image_index integer NOT NULL CHECK(image_index>=0),
+  object_key text NOT NULL UNIQUE,
+  content_type text NOT NULL CHECK(content_type IN ('image/png','image/jpeg','image/webp')),
+  bytes integer NOT NULL CHECK(bytes>0 AND bytes<=32000000),
+  sha256 text NOT NULL CHECK(length(sha256)=64),
+  PRIMARY KEY(task_id,image_index)
+);
+INSERT INTO schema_version(version) VALUES(14) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS content_workspaces (
+ user_id uuid PRIMARY KEY REFERENCES users(id),
+ revision integer NOT NULL DEFAULT 1 CHECK(revision>0),
+ payload jsonb NOT NULL CHECK(octet_length(payload::text)<=2500000),
+ updated_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO schema_version(version) VALUES(15) ON CONFLICT DO NOTHING;
+
+-- One-time switch to prepaid points. Existing credits and settled price snapshots remain intact.
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT 1 FROM schema_version WHERE version=16) THEN
+    UPDATE billing_policy SET enabled=true,multiplier=2.5,version=version+1,updated_at=now() WHERE id=1;
+    INSERT INTO schema_version(version) VALUES(16);
+  END IF;
+END $$;
+
+-- A verified, newly created email account receives one 5 CNY (500 point) signup credit.
+ALTER TABLE wallet_entries ALTER COLUMN voucher_id DROP NOT NULL;
+ALTER TABLE wallet_entries ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'voucher';
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conname='wallet_entries_source_check') THEN
+    ALTER TABLE wallet_entries ADD CONSTRAINT wallet_entries_source_check
+      CHECK((source='voucher' AND voucher_id IS NOT NULL) OR (source='signup_bonus' AND voucher_id IS NULL));
+  END IF;
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS wallet_entries_signup_bonus ON wallet_entries(user_id) WHERE source='signup_bonus';
+INSERT INTO schema_version(version) VALUES(17) ON CONFLICT DO NOTHING;
