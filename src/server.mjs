@@ -9,6 +9,7 @@ import { loadMailer } from './email.mjs';
 import { createImageCaptcha } from './captcha.mjs';
 import { createApp } from './app.mjs';
 import { Lanehub, adminTokenFromEnv } from './lanehub.mjs';
+import { LanehubCatalog } from './lanehub-catalog.mjs';
 import { reconcileLanehubCharges, reconcileLanehubTopups } from './lanehub-charges.mjs';
 import { provisionIfEnabled } from './lanehub.mjs';
 
@@ -44,8 +45,11 @@ const lanehub = process.env.LANEHUB_BASE_URL && lanehubAdminToken
 
 const lanehubUsdCny=Number(process.env.LANEHUB_USD_CNY ?? 0);
 const lanehubQuotaPerUnit=Number(process.env.LANEHUB_QUOTA_PER_UNIT ?? 500000);
+// 型号目录跟着 lanehub 走：启动拉一次，之后每 10 分钟刷新；拉不到保留上一份。
+const lanehubCatalog = lanehub ? new LanehubCatalog(lanehub, { log: (o,msg)=>console.error(msg, o) }) : null;
+if (lanehubCatalog) await lanehubCatalog.start();
 const appOptions = { db,upstream,voucherKey,customerAuth,
-  lanehub,lanehubAccountId:process.env.LANEHUB_ACCOUNT_ID ?? null,
+  lanehub,lanehubCatalog,lanehubAccountId:process.env.LANEHUB_ACCOUNT_ID ?? null,
   // 新人额度：默认 ¥5。折算汇率显式给，不从对面实时取——同一批新用户按不同汇率
   // 折算会让「都送了 5 块」变成各自不同的积分。
   lanehubSignupCny:Number(process.env.LANEHUB_SIGNUP_CNY ?? 5),

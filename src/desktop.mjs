@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { hash, token, httpError, RateLimiter } from './security.mjs';
 
 import { desktopCatalog } from './model-catalog.mjs';
-import { provisionIfEnabled } from './lanehub.mjs';
+import { provisionIfEnabled, lanehubMode } from './lanehub.mjs';
 
 export async function checkDesktopSession(db,credential) {
   if(credential?.plugin_id){
@@ -29,7 +29,9 @@ export function desktopRoutes(app,options) {
     const rows=(await db.query(`SELECT DISTINCT unnest(k.models) AS model FROM upstream_keys k
       JOIN upstream_accounts a ON a.id=k.account_id WHERE k.enabled AND a.enabled`)).rows;
     const available=new Set(rows.map(row=>row.model));
-    const {models,image_models,video_models,canonical_params,default_model}=desktopCatalog(available);
+    // lanehub 模式下目录从 lanehub 派生（真源在那边）；旧模式仍读本地快照。
+    const {models,image_models,video_models,canonical_params,default_model}=
+      (options.lanehubCatalog&&await lanehubMode(db))?options.lanehubCatalog.desktop(available):desktopCatalog(available);
     if(!models.length)throw httpError(503,'desktop_models_unavailable');
     return db.tx(async c=>{
       const user=(await c.query('SELECT enabled FROM users WHERE id=$1 FOR UPDATE',[req.apiUser.id])).rows[0];
