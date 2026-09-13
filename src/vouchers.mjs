@@ -5,6 +5,12 @@ import * as v from './validation.mjs';
 import { provisionIfEnabled } from './lanehub.mjs';
 import { lanehubBalance, creditVoucher } from './lanehub-charges.mjs';
 
+// 官网和客户端对用户只说「点」，从不显示人民币：1 点 = 0.01 元（充值文案写死的
+// 「10 元 = 1,000 点」）。换算只在这一个地方做——散到各页面里，任何一处写错都是
+// 用户看到的余额和实际能花的钱对不上。
+const POINTS_PER_CNY = 100;
+const points = (cny) => (Number(cny ?? 0) * POINTS_PER_CNY).toFixed(2);
+
 export function voucherVault(key) {
   if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('invalid_voucher_encryption_key');
   return {
@@ -160,7 +166,9 @@ export function voucherRoutes(app,options) {
       ?await lanehubBalance(lanehub,account,{usdCnyRate:lanehubUsdCny,quotaPerUnit:lanehubQuotaPerUnit})
       :await wallet(db,req.apiUser.id);
     const rows=(await db.query(`SELECT id,amount_cny,balance_after_cny,created_at,'recharge' AS kind FROM wallet_entries WHERE user_id=$1 UNION ALL SELECT id,-amount_cny,balance_after_cny,created_at,'consumption' AS kind FROM wallet_debits WHERE user_id=$1 ORDER BY created_at DESC,id LIMIT 30`,[req.apiUser.id])).rows;
-    return {user:{id:req.apiUser.id,name:req.apiUser.name},...balances,currency:'CNY',source:account?'lanehub':'local',entries:rows};
+    return {user:{id:req.apiUser.id,name:req.apiUser.name},...balances,
+      balance_points:points(balances.balance_cny),frozen_points:points(balances.frozen_cny),available_points:points(balances.available_cny),
+      currency:'CNY',source:account?'lanehub':'local',entries:rows};
   });
   app.post('/api/me/vouchers/redeem',async(req)=>{
     limiter.take('redeem-ip:'+req.ip,30);limiter.take('redeem-user:'+req.apiUser.id,10);
@@ -178,7 +186,8 @@ export function voucherRoutes(app,options) {
       if(!user.enabled||!credential.rowCount)throw httpError(401,'invalid_api_token');
       if(code.state==='redeemed'&&code.redeemed_by===req.apiUser.id){
         const prior=required(await c.query('SELECT id,amount_cny,balance_after_cny FROM wallet_entries WHERE voucher_id=$1',[code.id]));
-        return {ok:true,replayed:true,ledger_id:prior.id,amount_cny:prior.amount_cny,balance_after_cny:prior.balance_after_cny,voucher_id:code.id};
+        return {ok:true,replayed:true,ledger_id:prior.id,amount_cny:prior.amount_cny,amount_points:points(prior.amount_cny),
+          balance_after_cny:prior.balance_after_cny,balance_after_points:points(prior.balance_after_cny),voucher_id:code.id};
       }
       if(code.state!=='unused'||!batch.assigned_at||(batch.expires_at&&batch.expires_at<=new Date()))throw httpError(400,'voucher_unavailable');
       const balance=(await c.query('SELECT coalesce(sum(amount_cny),0)+$2::numeric-coalesce((SELECT sum(amount_cny) FROM wallet_debits WHERE user_id=$1),0) AS amount FROM wallet_entries WHERE user_id=$1',[req.apiUser.id,batch.amount_cny])).rows[0].amount;
@@ -187,8 +196,8 @@ export function voucherRoutes(app,options) {
       await c.query("UPDATE voucher_codes SET state='redeemed',redeemed_by=$2,redeemed_at=now() WHERE id=$1",[code.id,req.apiUser.id]);
       await c.query('INSERT INTO audit_events(action,target_id,details) VALUES($1,$2,$3)',
         ['voucher.redeem',code.id,JSON.stringify({user_id:req.apiUser.id,amount_cny:batch.amount_cny,ledger_id:ledgerId})]);
-      return {ok:true,replayed:false,ledger_id:ledgerId,amount_cny:batch.amount_cny,balance_after_cny:balance,
-        voucher_id:code.id};
+      return {ok:true,replayed:false,ledger_id:ledgerId,amount_cny:batch.amount_cny,amount_points:points(batch.amount_cny),
+        balance_after_cny:balance,balance_after_points:points(balance),voucher_id:code.id};
     }).then(async(result)=>{
       // 事务外再把钱搬到 lanehub：跨网络调用塞进事务会把它拖长，失败还会连兑换一起回滚。
       // 幂等键是 voucher:<id>，所以这里失败也不丢——lanehub-charges 的扫描会补上。

@@ -59,8 +59,12 @@ test('voucher and wallet lifecycle in an isolated database schema',async(t)=>{
       const winner=race[0].statusCode===200?alice:bob;
       const repeat=await redeem(winner,codes[0]);assert.equal(repeat.statusCode,200);assert.equal(repeat.json().replayed,true);
       assert.equal(Number(repeat.json().amount_cny),10);
+      // 官网只认「点」：10 元 = 1,000 点。这几个字段缺一个，页面就只剩「点数暂时无法读取」。
+      assert.equal(repeat.json().amount_points,'1000.00');
       assert.equal((await db.query('SELECT count(*) FROM wallet_entries')).rows[0].count,'1');
       const wallet=(await own(alice,'wallet')).json();assert.equal(wallet.user.id,alice.id);assert.equal(wallet.user.name,'Voucher Alice');
+      assert.equal(wallet.available_points,(Number(wallet.available_cny)*100).toFixed(2));
+      assert.equal(typeof wallet.frozen_points,'string');
       const before=Number(wallet.balance_cny);
       const two=await Promise.all([redeem(alice,codes[1]),redeem(alice,codes[2])]);assert.ok(two.every(r=>r.statusCode===200));
       assert.equal(Number((await own(alice,'wallet?user_id='+bob.id)).json().balance_cny),before+20);
