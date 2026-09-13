@@ -113,11 +113,23 @@ try {
   check('对照：不带插件凭据的同一个调用不归属任何插件', plain.statusCode === 200 &&
     (await db.query(`SELECT plugin_id FROM requests WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1`, [CUSTOMER])).rows[0].plugin_id === null);
 
+  // ── 1b. 另一条归属路径：插件**自己的凭据**直接作 Authorization ────────
+  // 走 Host llm 服务的插件（文档转 Excel 那类）就是这么调的：桌面端给它单独注册
+  // 一条 provider，apiKey 就是这把凭据。这条路不需要额外的头，归属天然成立。
+  const asPlugin = await app.inject({ url: '/v1/chat/completions', method: 'POST',
+    headers: { authorization: 'Bearer ' + credential },
+    payload: { model: MODEL, messages: [{ role: 'user', content: '用一句话说明什么是分成' }], max_tokens: 40 } });
+  const pluginRow = (await db.query(`SELECT * FROM requests WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1`, [CUSTOMER])).rows[0];
+  check('归属（插件凭据直连）：同样记在插件头上', asPlugin.statusCode === 200 && pluginRow.plugin_id === PLUGIN,
+    `HTTP ${asPlugin.statusCode} / 插件 ${pluginRow.plugin_id ?? '空'} / ${pluginRow.total_tokens} tokens`);
+
   // ── 2. 扣费补记：钱是 lanehub 扣的，账要回到这一侧 ────────────────────
   // 补记刻意跳过刚完成 30 秒内的请求（对面的消费日志可能还没落库），把时间往前挪。
   await db.query(`UPDATE requests SET completed_at=now()-interval '2 minutes' WHERE user_id=$1`, [CUSTOMER]);
   const first = await reconcileLanehubCharges(db, lanehub, { usdCnyRate: USD_CNY, quotaPerUnit: QUOTA_PER_UNIT });
   const bill = (await db.query(`SELECT * FROM request_billing WHERE request_id=$1`, [row.id])).rows[0];
+  const pluginBill = (await db.query(`SELECT * FROM request_billing WHERE request_id=$1`, [pluginRow.id])).rows[0];
+  check('扣费（插件凭据直连）：这一单同样结算了', pluginBill?.state === 'settled', `¥${pluginBill?.charged_cny ?? '-'}`);
   check('扣费：从 lanehub 的消费日志补回来了', bill?.state === 'settled',
     `${bill?.state ?? '无账单'} ¥${bill?.charged_cny ?? '-'}（本轮补记 ${first.settled} 条）`);
   check('扣费：金额取自对面的 quota，不是这边估的', Number(bill?.price_snapshot?.quota) > 0,

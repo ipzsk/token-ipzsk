@@ -347,3 +347,11 @@ DO $$ BEGIN
     INSERT INTO schema_version(version) VALUES(11);
   END IF;
 END $$;
+
+-- 文档转 Excel：**自己不发模型请求**的插件，模型走 Host 的 llm 服务。
+-- credential_paths 是空的，这不是漏了——它没有自己的密钥配置槽。桌面端据此为它
+-- 单独注册一条 provider（凭据走环境变量，不落盘），请求因此带着这个插件的凭据，
+-- 网关才归属得到它，作者的分成才算得出来。
+INSERT INTO plugins(id,slug,name,repository,package_name,publisher_ref,allowed_models,runtime_id,runtime_config,credential_paths)
+VALUES('7d8b7d87-b85f-49f1-bde7-a0b1a2f33402','ipzsk-doc-to-excel','文档转 Excel','JayceHuang/ipzsk-doc-to-excel','dsh-doc-to-excel','JayceHuang',
+ ARRAY['gpt-5.6-sol'],'doc-to-excel','{}','[]') ON CONFLICT DO NOTHING;

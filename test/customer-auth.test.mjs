@@ -143,13 +143,22 @@ test('password login, verified registration and recovery',async t=>{
       assert.deepEqual(first.json().models.map(m=>m.id),['gpt-5.6-sol']);
       assert.deepEqual(first.json().image_models.map(m=>m.id),['gpt-image-2']);
       assert.equal((await call(first.json().token)).statusCode,200);
-      const firstPlugin=first.json().plugin_configs[0];
-      assert.equal(firstPlugin.plugin_id,'7d8b7d87-b85f-49f1-bde7-a0b1a2f33401');
+      // 按 id 取，不按下标：插件表里不止一个插件，顺序按 slug 排，加一个新插件就会串位。
+      const pluginOf=(response,id)=>response.json().plugin_configs.find(p=>p.plugin_id===id);
+      const firstPlugin=pluginOf(first,'7d8b7d87-b85f-49f1-bde7-a0b1a2f33401');
+      assert.ok(firstPlugin,'生图插件的凭据要下发');
       assert.notEqual(firstPlugin.credential,first.json().token);
       assert.equal((await call(firstPlugin.credential)).statusCode,200);
       const second=await send('/api/me/desktop/bootstrap',{},aliceCookie);desktopAliceToken=second.json().token;
       assert.equal((await call(firstPlugin.credential)).statusCode,401);
-      assert.equal((await call(second.json().plugin_configs[0].credential)).statusCode,200);
+      assert.equal((await call(pluginOf(second,'7d8b7d87-b85f-49f1-bde7-a0b1a2f33401').credential)).statusCode,200);
+      // 走 Host llm 服务的插件（credential_paths 为空）同样要拿到自己的凭据——
+      // 桌面端据此给它单独注册一条 provider，否则它花的钱归属不到它头上。
+      const docToExcel=pluginOf(second,'7d8b7d87-b85f-49f1-bde7-a0b1a2f33402');
+      assert.ok(docToExcel,'自己不发请求的插件也要有凭据');
+      assert.deepEqual(docToExcel.credential_paths,[]);
+      assert.notEqual(docToExcel.credential,second.json().token);
+      assert.equal((await call(docToExcel.credential)).statusCode,200);
       assert.equal((await call(first.json().token)).statusCode,401);
       assert.equal((await call(desktopAliceToken)).statusCode,200);
       assert.equal((await db.query('SELECT count(*) FROM access_tokens WHERE user_id=$1 AND auth_session_id IS NOT NULL AND plugin_id IS NULL',[aliceId])).rows[0].count,'1');
