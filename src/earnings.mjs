@@ -99,14 +99,32 @@ export async function recordSkillInvocations(c, requestId, skillRefs, windowMinu
   return inserted.rowCount;
 }
 
-/** 一笔请求结算之后计提作者分成。同一笔只会有一行（唯一索引兜底）。 */
+/**
+ * 一笔请求结算之后计提作者分成。同一笔只会有一行（唯一索引兜底）。
+ *
+ * 两种计价，**由插件自己配的单价决定走哪条**：
+ *
+ *   price_per_call_cny > 0  → 按次：一次调用一个固定价，和这一单收了多少钱无关。
+ *                              适合「一次调用就是一件完整的活」——生图、生视频。
+ *   price_per_call_cny = 0  → 按比例：实扣 × 分成比例。用户付得多作者分得多，
+ *                              4K 图比 1K 图贵，作者跟着多拿。
+ *
+ * 两种都留着是因为它们各有道理，而哪种合适是**商业判断不是技术判断**：
+ * 按次让作者收入可预测，按比例让作者跟着用户的消费走。配哪个由运营定，
+ * 代码不替他们选。
+ *
+ * 比例那条要求 `charged-refunded > 0`：没收到钱就没有可分的。按次那条不看金额，
+ * 但仍然要求这一单**结算过**——没跑成的调用不该给作者记一笔。
+ */
 export async function accrueEarning(c, requestId) {
   await c.query(`INSERT INTO plugin_earnings (id,request_id,owner_user_id,plugin_id,kind,amount_cny)
     SELECT $2,r.id,r.plugin_owner_user_id,r.plugin_id,'accrual',
-      round((b.charged_cny-b.refunded_cny)*r.plugin_share_bps/10000,8)
-    FROM requests r JOIN request_billing b ON b.request_id=r.id
-    WHERE r.id=$1 AND r.plugin_owner_user_id IS NOT NULL AND coalesce(r.plugin_share_bps,0)>0
-      AND b.state='settled' AND (b.charged_cny-b.refunded_cny)>0
+      CASE WHEN p.price_per_call_cny > 0 THEN p.price_per_call_cny
+           ELSE round((b.charged_cny-b.refunded_cny)*r.plugin_share_bps/10000,8) END
+    FROM requests r JOIN request_billing b ON b.request_id=r.id JOIN plugins p ON p.id=r.plugin_id
+    WHERE r.id=$1 AND r.plugin_owner_user_id IS NOT NULL AND b.state='settled'
+      AND (p.price_per_call_cny > 0
+           OR (coalesce(r.plugin_share_bps,0)>0 AND (b.charged_cny-b.refunded_cny)>0))
     ON CONFLICT DO NOTHING`, [requestId, randomUUID()]);
 }
 
