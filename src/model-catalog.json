@@ -12,7 +12,8 @@
     "档位键查不到时必须报 400，绝不回落成 1 —— 静默回落等于按错的价扣钱。",
     "require_tier=true 的模型没有可信的基准档名，前端必须让用户显式选一档。",
     "unsupported 列出该模型不支持的 canonical 字段：报 400 并说明原因，不静默丢弃（丢了用户以为生效了）。",
-    "chat 型号不参与 tiers 计价，billing_unit/base_usd/tiers 为 null；force_params 是提交前必须覆盖的固定入参。"
+    "chat 型号不参与 tiers 计价，billing_unit/base_usd/tiers 为 null；force_params 是提交前必须覆盖的固定入参。",
+    "lanehub 模式下这份文件**不再是真源**：桌面端目录从 lanehub 的 GET /api/catalog 派生（src/lanehub-catalog.mjs）。这里只服务旧的多上游模式。"
   ],
   "models": {
     "gpt-5.6-sol": {

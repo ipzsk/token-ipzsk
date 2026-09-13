@@ -142,6 +142,15 @@ node scripts/lanehub-switch.mjs off        # 立刻回到本地钱包，不做�
 管理员口令文件 `secrets/admin-password` 只在首次 bootstrap 用过，后来改过口令，
 **不能拿它调管理接口**。
 
+## 型号目录从 lanehub 派生（2026-09-13 起）
+
+网关不再维护 `src/model-catalog.json` 里的型号清单：lanehub 模式下 `desktop/bootstrap` 的目录
+来自 `GET http://lanehub:3000/api/catalog`（启动拉一次、每 10 分钟刷新）。**部署顺序因此有
+依赖：先起新版 lanehub，再起网关**——反过来网关启动时拉不到目录，桌面端登录会 503
+`catalog_unavailable`，直到下一次刷新成功。
+
+lanehub 侧的真源索引见 lanehub 仓库 `docs/source-of-truth.md`。
+
 ## 已知的行为变更
 
 lanehub 这次带了 `canonical.Caps.Required`：**不带 `resolution` / `duration` 的
