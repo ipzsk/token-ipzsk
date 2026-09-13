@@ -96,7 +96,7 @@ test('gateway integration against an isolated PostgreSQL test schema', async (t)
     await t.test('pool stores secrets outside returned metadata and groups balances',async()=>{
       const a=await admin('/accounts','POST',{name:'Test account',concurrency:1});assert.equal(a.statusCode,200,a.body);account=a.json().id;
       for(const n of ['one','two']){
-        const k=await admin('/keys','POST',{account_id:account,name:n,key:'sk-test-only-not-real-credential-'+n,models:['test-model'],concurrency:1});
+        const k=await admin('/keys','POST',{account_id:account,name:n,key:'sk-test-only-not-real-credential-'+n,models:['test-model','gpt-image-2','seedance-2.0-mini'],concurrency:1});
         assert.equal(k.statusCode,200,k.body);keyId=k.json().id;
       }
       upstream.close();await upstream.refresh();
@@ -181,7 +181,7 @@ test('gateway integration against an isolated PostgreSQL test schema', async (t)
     await t.test('image edit uploads reach upstream as JSON references and retain task isolation',async()=>{
       const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aE9sAAAAASUVORK5CYII=','base64');
       for(const path of ['/v1/images/edits','/v1/images/generations']){
-        const form=new FormData();form.set('model','test-model');form.set('prompt','Product selling points');
+        const form=new FormData();form.set('model','gpt-image-2');form.set('prompt','Product selling points');
         form.append('image[]',new Blob([png],{type:'image/png'}),'product.png');form.append('image[]',new Blob([png],{type:'image/png'}),'detail.png');
         const wire=new Request('https://test.invalid',{method:'POST',body:form}),payload=Buffer.from(await wire.arrayBuffer());
         const headers={authorization:'Bearer '+alice.token,'content-type':wire.headers.get('content-type')};
@@ -196,7 +196,7 @@ test('gateway integration against an isolated PostgreSQL test schema', async (t)
     });
     await t.test('background worker finishes tasks without a client and stops polling completed tasks',async()=>{
       const headers={authorization:'Bearer '+alice.token};
-      const submitted=await app.inject({url:'/v1/images/generations',method:'POST',headers,payload:{model:'test-model',prompt:'worker fixture'}});
+      const submitted=await app.inject({url:'/v1/images/generations',method:'POST',headers,payload:{model:'gpt-image-2',prompt:'worker fixture'}});
       const id=submitted.json().data[0].task_id;
       await db.query("UPDATE media_tasks SET updated_at=now()-interval '1 minute' WHERE id=$1",[id]);
       await syncMediaTasks(db,upstream);
@@ -207,7 +207,7 @@ test('gateway integration against an isolated PostgreSQL test schema', async (t)
     });
     await t.test('media task IDs are platform-owned and cannot be polled by another user',async()=>{
       const headers={authorization:'Bearer '+alice.token};
-      const submitted=await app.inject({url:'/v1/images/generations',method:'POST',headers,payload:{model:'test-model',prompt:'A mountain',image_urls:['data:image/png;base64,fixture']}});
+      const submitted=await app.inject({url:'/v1/images/generations',method:'POST',headers,payload:{model:'gpt-image-2',prompt:'A mountain',image_urls:['data:image/png;base64,fixture']}});
       assert.equal(submitted.statusCode,200,submitted.body);
       const id=submitted.json().data[0].task_id;
       assert.notEqual(id,'task_upstream_fixture');
@@ -227,7 +227,7 @@ test('gateway integration against an isolated PostgreSQL test schema', async (t)
     });
     await t.test('background task billing records without user polling, validates final charges and preserves manual amounts',async()=>{
       const headers={authorization:'Bearer '+alice.token};
-      const submitted=await app.inject({url:'/v1/videos/generations',method:'POST',headers,payload:{model:'test-model',prompt:'A mountain'}});
+      const submitted=await app.inject({url:'/v1/videos/generations',method:'POST',headers,payload:{model:'seedance-2.0-mini',prompt:'A mountain',resolution:'480p',duration:5}});
       const id=submitted.json().data[0].task_id;
       const task={id,upstream_task_id:'task_upstream_fixture'};
       for(const data of [
