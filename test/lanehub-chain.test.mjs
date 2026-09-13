@@ -134,6 +134,44 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
       assert.equal(Number(row.developer_earnings_cny).toFixed(8),(charged*0.3).toFixed(8),'作者分成 = 实扣 × 30%');
     });
 
+    await t.test('skill 型插件：主令牌 + 插件凭据声明归属，token 消耗记到插件头上', async () => {
+      // skill 装成插件之后，提示词是它给的，模型请求却由 agent 主循环用**主令牌**发出。
+      // 这条路让它出示插件凭据来声明归属——只带一个 plugin_id 是不行的，
+      // 那样谁都能把消费记到任意插件头上，而作者按这个数分钱。
+      const personal=token('ipz_');
+      await db.query(`INSERT INTO access_tokens (id,user_id,token_hash,prefix,name) VALUES ($1,$2,$3,$4,'主令牌')`,
+        [randomUUID(),userId,hash(personal),personal.slice(0,12)]);
+      const pluginCredential=token('ipz_');
+      await db.query(`INSERT INTO access_tokens (id,user_id,token_hash,prefix,name,plugin_id) VALUES ($1,$2,$3,$4,'skill 凭据',$5)`,
+        [randomUUID(),userId,hash(pluginCredential),pluginCredential.slice(0,12),PLUGIN_ID]);
+      const ask=(extra)=>app.inject({url:'/v1/chat/completions',method:'POST',
+        payload:{model:'test-model',messages:[{role:'user',content:'skill'}]},
+        headers:{authorization:'Bearer '+personal,...extra}});
+
+      const attributed=await ask({'x-ipzsk-plugin-token':pluginCredential});
+      assert.equal(attributed.statusCode,200,attributed.body);
+      const row=(await db.query(`SELECT plugin_id,plugin_owner_user_id,plugin_share_bps,total_tokens FROM requests
+        WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1`,[userId])).rows[0];
+      assert.equal(row.plugin_id,PLUGIN_ID,'归属要落到插件上');
+      assert.equal(row.plugin_owner_user_id,ownerId);
+      assert.equal(row.plugin_share_bps,3000);
+      assert.equal(Number(row.total_tokens),20,'token 消耗照常记下来');
+
+      // 不带头就是普通调用，不归属任何插件。
+      assert.equal((await ask({})).statusCode,200);
+      assert.equal((await db.query(`SELECT plugin_id FROM requests WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1`,[userId])).rows[0].plugin_id,null);
+
+      // 别人的插件凭据不认（否则等于给伪造者选一个收款人）。
+      const stranger=randomUUID();
+      await db.query(`INSERT INTO users (id,name,rpm) VALUES ($1,'别人',60)`,[stranger]);
+      const otherCredential=token('ipz_');
+      await db.query(`INSERT INTO access_tokens (id,user_id,token_hash,prefix,name,plugin_id) VALUES ($1,$2,$3,$4,'别人的',$5)`,
+        [randomUUID(),stranger,hash(otherCredential),otherCredential.slice(0,12),PLUGIN_ID]);
+      assert.equal((await ask({'x-ipzsk-plugin-token':otherCredential})).json().error.code,'plugin_token_denied');
+      assert.equal((await ask({'x-ipzsk-plugin-token':'ipz_'+'z'.repeat(43)})).json().error.code,'plugin_token_denied');
+      assert.equal((await ask({'x-ipzsk-plugin-token':'not-a-token'})).json().error.code,'invalid_plugin_token');
+    });
+
     await t.test('人工退款：钱回到用户额度，作者的计提同额冲掉', async () => {
       const login=await app.inject({url:'/admin/api/login',method:'POST',payload:{password:'test-administrator-password'},
         headers:{origin:'https://api.ipzsk.com'}});

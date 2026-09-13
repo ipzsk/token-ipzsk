@@ -110,9 +110,27 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     // 两层都改名等于改两次，而第二次改的是它不认识的键。
     const viaLanehub = Boolean(lanehub) && await lanehubMode(db);
     const body = audio?.metadata??(viaLanehub?requested:adaptModelRequest(path,requested));
+    // 归属到哪个插件。两条来源：
+    //   1. 用插件自己的凭据发请求（生图这类插件自己发请求，天然归属）
+    //   2. 主令牌 + X-IPZSK-Plugin-Token 头（skill 型插件：提示词是它给的，
+    //      模型请求却由 agent 主循环发出，用的是主令牌）
+    //
+    // 第 2 条为什么不是「头里带个 plugin_id 就认」：那样任何人都能把自己的消费
+    // 记到任意插件头上，而插件作者按这个数分钱——等于给伪造者选一个收款人。
+    // 所以声明归属必须**出示那个插件的凭据**，而且凭据必须属于同一个用户。
+    const declared=req.headers['x-ipzsk-plugin-token'];
+    let pluginId=req.apiUser.plugin_id;
+    if(!pluginId&&typeof declared==='string'){
+      if(!/^ipz_[A-Za-z0-9_-]{43}$/.test(declared))throw httpError(400,'invalid_plugin_token');
+      const claim=(await db.query(`SELECT plugin_id FROM access_tokens WHERE token_hash=$1 AND user_id=$2
+        AND plugin_id IS NOT NULL AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())`,
+      [hash(declared),req.apiUser.id])).rows[0];
+      if(!claim)throw httpError(403,'plugin_token_denied');
+      pluginId=claim.plugin_id;
+    }
     let plugin;
-    if(req.apiUser.plugin_id){
-      plugin=(await db.query('SELECT id,publisher_ref,allowed_models,owner_user_id,revenue_share_bps FROM plugins WHERE id=$1 AND enabled',[req.apiUser.plugin_id])).rows[0];
+    if(pluginId){
+      plugin=(await db.query('SELECT id,publisher_ref,allowed_models,owner_user_id,revenue_share_bps FROM plugins WHERE id=$1 AND enabled',[pluginId])).rows[0];
       if(!plugin || !plugin.allowed_models.includes(body.model))throw httpError(403,'plugin_model_denied');
     }
     const protocolHeaders=agentHeaders(path,req.headers);
