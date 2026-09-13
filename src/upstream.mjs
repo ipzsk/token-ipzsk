@@ -13,6 +13,12 @@ const providers = {
     validBalance:(d) => d.success === true && ['remain_balance','used_balance','remain_credits','used_credits'].every((f) => Number.isFinite(d[f])) },
   // 通用 OpenAI 兼容中转（one-api / new-api 系，如书虫 / BBshare）：只转发对话与媒体同步接口。
   openai_relay: { label:'通用 OpenAI 中转', keyBalance:null, accountBalance:null, task:null, validBalance:null },
+  // lanehub：线路矩阵网关。它有异步任务接口，且**任务响应已经是规范化形状**
+  // （data.id / data.status 小写词表 / data.result / data.charge_cny），
+  // 所以 media-task-sync 那套解析可以原样用在它身上。
+  // 余额不在这一侧看：额度真源在 lanehub，它自己的用户页就是账本。
+  lanehub: { label:'lanehub 线路矩阵', keyBalance:null, accountBalance:null,
+    task:(id) => '/v1/tasks/'+encodeURIComponent(id), validBalance:null },
 };
 export const providerTypes = Object.keys(providers);
 export const providerOptions = Object.entries(providers).map(([type, p]) => ({ type, label:p.label }));
@@ -39,7 +45,10 @@ export class Upstream {
     return (await readFile(join(this.secretDir, ref), 'utf8')).trim();
   }
   async addKey({ account_id, name, key, concurrency = 3, models = [] }, existingRef) {
-    if (!/^sk-[A-Za-z0-9_-]{16,240}$/.test(key)) throw httpError(400, 'invalid_upstream_key');
+    // `sk-` 前缀是 APIMart 那家的写法，不是通用的：lanehub 的令牌就没有前缀
+    // （实测 addKey 把它判成 invalid_upstream_key 才发现）。前缀改成可选，
+    // 字符集与长度仍然要卡——那两条挡的是「把整段 JSON 粘进输入框」这类错。
+    if (!/^(sk-)?[A-Za-z0-9_-]{16,240}$/.test(key)) throw httpError(400, 'invalid_upstream_key');
     const fingerprint = hash(key);
     const existing = await this.db.query('SELECT id FROM upstream_keys WHERE fingerprint=$1', [fingerprint]);
     if (existing.rowCount) throw httpError(409, 'key_already_exists');
@@ -157,7 +166,10 @@ export class Upstream {
   async reconcileTaskCharges() {
     const tasks = (await this.db.query(`SELECT t.id,t.upstream_task_id,k.secret_ref,a.base_url,a.provider_type FROM media_tasks t
       JOIN requests r ON r.id=t.id JOIN upstream_keys k ON k.id=r.key_id JOIN upstream_accounts a ON a.id=k.account_id
-      WHERE r.cost_cny IS NULL ORDER BY t.updated_at LIMIT 20`)).rows;
+      -- lanehub 的任务永远不会有 cost_cny（recordTaskCharge 只认 apimart 的 credits_cost 口径），
+      -- 不排掉的话这 20 个名额会被它们永久占满，真正等着记成本的 apimart 任务再也轮不上。
+      -- lanehub 那条线的金额走 lanehub-charges.mjs，从对面的消费日志取。
+      WHERE r.cost_cny IS NULL AND a.provider_type<>'lanehub' ORDER BY t.updated_at LIMIT 20`)).rows;
     let recorded = 0, failed = 0;
     for (const task of tasks) {
       try {

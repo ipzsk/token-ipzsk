@@ -167,3 +167,118 @@ Better Auth 1.7.2 提供六位邮箱验证码登录，首次验证成功创建�
 `POST /api/me/desktop/bootstrap` 仅接受已验证账户的登录会话，返回会话绑定的模型调用凭证、可用聊天模型和默认模型。模型目录定义在 `src/desktop.mjs`，与启用号池取交集，默认优先 `gpt-5.6-sol`，其次 `gpt-4o-mini`。桌面端使用内置 API 地址，无需手动复制 Key。
 
 schema 9 为 access_tokens 增加可空唯一 `auth_session_id`；一个登录会话对应一个桌面凭证记录，重复初始化轮换秘密，不影响其他会话或普通 API Key，不占普通 Key 的 20 个配额。网关在入口与排队后的上游提交前验证关联会话；退出、密码重置、用户禁用、凭证撤销和过期都能阻止后续调用。原请求的 token_id 保留，账单归属继续使用同一业务用户。
+
+## lanehub 模式（额度真源在 lanehub）
+
+开启后，这一侧不再预扣、不再改写字段、不再换线，请求带着**该客户自己的 lanehub 令牌**
+转发过去；额度、价目、扣费、账本全在 lanehub。这一侧保留账号、登录、插件授权、
+桌面端 bootstrap、并发闸与幂等边缘。
+
+环境变量：
+
+```
+LANEHUB_BASE_URL=https://lane.example      # lanehub 地址
+LANEHUB_ADMIN_TOKEN=...                    # lanehub 的管理令牌（建号、加额度用）
+LANEHUB_ACCOUNT_ID=<uuid>                  # 后台里那个 provider_type=lanehub 的上游账户
+LANEHUB_SIGNUP_CNY=5                       # 新用户注册赠送额度（人民币，默认 5）
+LANEHUB_USD_CNY=7                          # 折算汇率，显式给，不从对面实时取
+LANEHUB_QUOTA_PER_UNIT=500000              # lanehub 的 1 美元 = 多少 quota
+```
+
+### 一个客户一个密钥
+
+客户**注册/登录当场**就会在 lanehub 建好账号并签一个令牌，映射表的主键
+就是客户 id——一个客户永远只有一个密钥。桌面端 bootstrap 和第一次发请求各会再备一次，
+三处都幂等（同一个 `provisionIfEnabled`）。不等到首单才建号，是因为在那之前
+新用户在后台查不到、余额显示 0，而「注册送 5 块」是注册页答应过的。
+
+令牌按客户的档位（官方线 / 便宜线）签发，`unlimited_quota=true`：**额度管在用户身上，
+不是令牌上**，这样后台看到的「这个客户还剩多少」就是唯一那个数。
+
+首次建号时发放 `LANEHUB_SIGNUP_CNY` 的新人额度，幂等键 `signup:<客户 id>`：
+重复登录不会重复发；**余额迁移脚本先建过映射的老客户不会被当成新人**（created 为 false）；
+发放失败不影响登录——额度事后能补，登录不能卡。
+
+三条不配就不生效：没有客户端时整条分支关闭，不会出现「开关是 on 但没有客户端」的半开状态。
+
+### 扣费回到这一侧（插件分成的地基）
+
+lanehub 模式下这一侧**不预扣也不扣钱**，但「这一单收了多少」必须回来：插件作者的
+分成口径（`/api/me/developer/usage`、插件后台）读的是 `request_billing.charged_cny`，
+没有这张表的行，作者收益永远是 0——而那正是要卖的东西。
+
+数据来源是 **lanehub 的消费日志**，按 `request_id` 反查（这一侧早就把 lanehub 回的
+`X-Oneapi-Request-Id` 存进了 `requests.upstream_id`），所以 lanehub 侧不用改任何东西。
+折算汇率取**对面现行的** `PaymentUSDRate`，不是这边配的那个——实测两边差过 4%
+（配 7 / 对面 6.7078），差的就是作者分成的基数。配置值只在读不到时兜底。
+
+补记跑在和余额刷新同一个定时器上（120 秒），幂等键是 `request_id`：
+
+- 查到消费日志 → 写一条 `settled` 行，`charged_cny` 就是客户实扣（E2E 验到分毫不差）
+- 查不到，且完成不到 10 分钟 → 什么都不做，下一轮再来（日志可能还没落库）
+- 查不到，且已超过 10 分钟 → 写一条 `released` 行终止重试（失败的请求本来就没扣钱）
+
+媒体请求要等任务走到终态才补记：lanehub 那边任务失败会退费，中途查到的数字会被退掉。
+
+`reconcileTaskCharges`（APIMart 的 `credits_cost` 口径）已排除 lanehub 渠道——
+不排的话那 20 个名额会被永远查不出结果的 lanehub 任务占满。
+
+### 充值也要搬过去
+
+兑换码的钱写在这一侧的 `wallet_entries` 上，lanehub 模式下客户花的却是 lanehub 的额度，
+不搬过去那笔钱就躺在一个花不掉的钱包里。兑换成功后（事务外）立刻搬一次，失败了由同一个
+定时器扫描补上，幂等键 `voucher:<兑换码 id>`。
+
+`GET /api/me/wallet` 在 lanehub 模式下读的也是对面的余额（`source: "lanehub"`），
+不再是本地那张只剩充值流水的表。
+
+### 切换与回滚（幂等）
+
+```
+node scripts/lanehub-switch.mjs status     # 看当前状态 + 前置检查
+node scripts/lanehub-switch.mjs on         # 四项前置检查全过才开
+node scripts/lanehub-switch.mjs off        # 立刻回滚，不做检查
+```
+
+前置检查挡的都是「跑起来才会发现、而发现时钱已经错了」的那类：lanehub 账户不存在或
+类型写错、还有客户的余额没迁走、`billing_policy` 仍开着（两边都预扣 = 同一笔钱冻两次）、
+还有未结算的预扣（切过去会永远停在 reserved）。
+
+### 端到端自检（可反复跑）
+
+```
+export DATABASE_URL=postgres://user:pass@127.0.0.1:5433/ipzsk_e2e
+export LANEHUB_BASE_URL=http://localhost:3000
+export LANEHUB_ADMIN_TOKEN=<lanehub root 的 access_token>
+
+node scripts/lanehub-e2e.mjs            # 不花钱：建号、新人额度、报价、报价校验
+node scripts/lanehub-e2e.mjs --spend    # 连真实生成、扣费回写、分成基数一起验（会扣真钱）
+node scripts/skill-chain-e2e.mjs       # 提示词型 skill 的变现全链路（会扣真钱，文本模型一次几厘）
+```
+
+`skill-chain-e2e.mjs` 验的是**变现那条链**，而且请求从网关的 HTTP 入口进去，
+走完整的鉴权 → 归属 → 计费 → 补记 → 计提 → 结算单：装成插件的 skill 调一次真模型
+（默认 `deepseek-v4-flash`），断言 token 记下了、归属落到插件、扣费从 lanehub 的
+消费日志补回来、作者的计提 = 实扣 × 比例、重复补记不会算两遍。
+
+打的是真 lanehub 和真库，不是 mock——单元测试能证明幂等逻辑对，证明不了「对面的接口
+真是这个形状」。这一轮就是靠它打出了四个只有真打才看得见的错：用户名 12 字上限、
+密码 20 字上限、签令牌要走 `/api/token/for_user`（`/api/token/` 只给当前登录者签，
+用管理员令牌调它会把管理员自己的密钥发给客户）、done-hub 的令牌**没有 `sk-` 前缀**。
+
+写操作的幂等键都是固定的（测试客户 id、reference），所以第二次跑会跳过建号与发钱；
+唯一不幂等的是真实生成——上游不认我们的幂等键，所以它默认关着。
+
+`UPSTREAM_SECRET_DIR` 要跨次稳定（默认 `$TMPDIR/ipzsk-e2e-secrets`）：库里存的是
+文件名，目录变了就读不到上次那把密钥。
+
+### 余额迁移（幂等）
+
+```
+node scripts/lanehub-migrate.mjs --batch 2026-09-11            # dry-run，什么都不写
+node scripts/lanehub-migrate.mjs --batch 2026-09-11 --apply
+```
+
+幂等键是 `migrate:<批次>:<客户 id>`。**同一个批次重跑不会重复加钱；换一个批次号就是
+真的再加一次**——批次号要写进运行记录，不要随手改。折算汇率由 `LANEHUB_USD_CNY`
+显式指定，不从对面实时取：用请求时抓到的汇率迁历史余额，会让同一批客户按不同汇率折算。

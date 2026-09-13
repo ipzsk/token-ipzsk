@@ -2,6 +2,8 @@ import { wallet } from './billing.mjs';
 import { randomUUID, randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
 import { hash, httpError, RateLimiter } from './security.mjs';
 import * as v from './validation.mjs';
+import { provisionIfEnabled } from './lanehub.mjs';
+import { lanehubBalance, creditVoucher } from './lanehub-charges.mjs';
 
 export function voucherVault(key) {
   if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('invalid_voucher_encryption_key');
@@ -33,7 +35,9 @@ const audit=(c,action,id,details)=>c.query('INSERT INTO audit_events(action,targ
   [action,id,JSON.stringify(details)]);
 const pageOf=(query)=>v.integer(Number(query.page??1),1,100000);
 
-export function voucherRoutes(app,{db,voucherKey}) {
+export function voucherRoutes(app,options) {
+  const {db,voucherKey,lanehub=null,lanehubUsdCny=0,lanehubQuotaPerUnit=500000}=options;
+  const provision=(user)=>provisionIfEnabled(db,options,user);
   const vault=voucherKey?voucherVault(voucherKey):null;
   const limiter=new RateLimiter();
   const ready=()=>{if(!vault)throw httpError(503,'voucher_service_unavailable');};
@@ -149,9 +153,14 @@ export function voucherRoutes(app,{db,voucherKey}) {
     return {rows,page,count,page_size:30};
   });
   app.get('/api/me/wallet',async(req)=>{
-    const balances=await wallet(db,req.apiUser.id);
+    // lanehub 模式下额度真源在对面：这边的 wallet 表只剩充值流水，余额读它就是读旧数——
+    // 用户充完看不到、花完也不减。
+    const account=lanehub?await provision({userId:req.apiUser.id,name:req.apiUser.name}).catch(()=>null):null;
+    const balances=account
+      ?await lanehubBalance(lanehub,account,{usdCnyRate:lanehubUsdCny,quotaPerUnit:lanehubQuotaPerUnit})
+      :await wallet(db,req.apiUser.id);
     const rows=(await db.query(`SELECT id,amount_cny,balance_after_cny,created_at,'recharge' AS kind FROM wallet_entries WHERE user_id=$1 UNION ALL SELECT id,-amount_cny,balance_after_cny,created_at,'consumption' AS kind FROM wallet_debits WHERE user_id=$1 ORDER BY created_at DESC,id LIMIT 30`,[req.apiUser.id])).rows;
-    return {user:{id:req.apiUser.id,name:req.apiUser.name},...balances,currency:'CNY',entries:rows};
+    return {user:{id:req.apiUser.id,name:req.apiUser.name},...balances,currency:'CNY',source:account?'lanehub':'local',entries:rows};
   });
   app.post('/api/me/vouchers/redeem',async(req)=>{
     limiter.take('redeem-ip:'+req.ip,30);limiter.take('redeem-user:'+req.apiUser.id,10);
@@ -169,7 +178,7 @@ export function voucherRoutes(app,{db,voucherKey}) {
       if(!user.enabled||!credential.rowCount)throw httpError(401,'invalid_api_token');
       if(code.state==='redeemed'&&code.redeemed_by===req.apiUser.id){
         const prior=required(await c.query('SELECT id,amount_cny,balance_after_cny FROM wallet_entries WHERE voucher_id=$1',[code.id]));
-        return {ok:true,replayed:true,ledger_id:prior.id,amount_cny:prior.amount_cny,balance_after_cny:prior.balance_after_cny};
+        return {ok:true,replayed:true,ledger_id:prior.id,amount_cny:prior.amount_cny,balance_after_cny:prior.balance_after_cny,voucher_id:code.id};
       }
       if(code.state!=='unused'||!batch.assigned_at||(batch.expires_at&&batch.expires_at<=new Date()))throw httpError(400,'voucher_unavailable');
       const balance=(await c.query('SELECT coalesce(sum(amount_cny),0)+$2::numeric-coalesce((SELECT sum(amount_cny) FROM wallet_debits WHERE user_id=$1),0) AS amount FROM wallet_entries WHERE user_id=$1',[req.apiUser.id,batch.amount_cny])).rows[0].amount;
@@ -178,7 +187,14 @@ export function voucherRoutes(app,{db,voucherKey}) {
       await c.query("UPDATE voucher_codes SET state='redeemed',redeemed_by=$2,redeemed_at=now() WHERE id=$1",[code.id,req.apiUser.id]);
       await c.query('INSERT INTO audit_events(action,target_id,details) VALUES($1,$2,$3)',
         ['voucher.redeem',code.id,JSON.stringify({user_id:req.apiUser.id,amount_cny:batch.amount_cny,ledger_id:ledgerId})]);
-      return {ok:true,replayed:false,ledger_id:ledgerId,amount_cny:batch.amount_cny,balance_after_cny:balance};
+      return {ok:true,replayed:false,ledger_id:ledgerId,amount_cny:batch.amount_cny,balance_after_cny:balance,
+        voucher_id:code.id};
+    }).then(async(result)=>{
+      // 事务外再把钱搬到 lanehub：跨网络调用塞进事务会把它拖长，失败还会连兑换一起回滚。
+      // 幂等键是 voucher:<id>，所以这里失败也不丢——lanehub-charges 的扫描会补上。
+      if(lanehub)await creditVoucher(db,lanehub,options,{userId:req.apiUser.id,name:req.apiUser.name,
+        voucherId:result.voucher_id,amountCny:result.amount_cny}).catch(()=>{});
+      return result;
     });
   });
 }

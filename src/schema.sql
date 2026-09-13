@@ -260,10 +260,149 @@ INSERT INTO schema_version(version) VALUES(13) ON CONFLICT DO NOTHING;
 ALTER TABLE upstream_accounts ADD COLUMN IF NOT EXISTS base_url text NOT NULL DEFAULT 'https://api.apimart.ai';
 ALTER TABLE upstream_accounts ADD COLUMN IF NOT EXISTS provider_type text NOT NULL DEFAULT 'apimart';
 ALTER TABLE upstream_accounts DROP CONSTRAINT IF EXISTS upstream_accounts_base_url_https;
-ALTER TABLE upstream_accounts ADD CONSTRAINT upstream_accounts_base_url_https CHECK (base_url LIKE 'https://%');
+-- https 是硬要求，回环地址例外：本机自检要能把 lanehub 起在 http://localhost 上打一遍。
+-- 回环流量不出网卡，密钥不会裸奔；理由同 src/admin.mjs 的 baseUrl()。
+ALTER TABLE upstream_accounts ADD CONSTRAINT upstream_accounts_base_url_https
+  CHECK (base_url LIKE 'https://%' OR base_url LIKE 'http://localhost%'
+      OR base_url LIKE 'http://127.0.0.1%' OR base_url LIKE 'http://[::1]%');
 INSERT INTO schema_version(version) VALUES(14) ON CONFLICT DO NOTHING;
 
 -- 媒体按 USD 报价，钱包记 CNY。汇率是管理员维护的账本参数，不在请求时联网取值，
 -- 保证迁移与历史计费可复现；每笔冻结把当时的汇率写进 price_snapshot。
 ALTER TABLE billing_policy ADD COLUMN IF NOT EXISTS usd_cny numeric(12,4) NOT NULL DEFAULT 7.3 CHECK(usd_cny>0);
 INSERT INTO schema_version(version) VALUES(15) ON CONFLICT DO NOTHING;
+
+-- ── lanehub 接入：额度真源搬到 lanehub 之后，这一侧只留映射与入账幂等 ──────────
+-- 设计说明见 src/lanehub.mjs 的文件头。
+CREATE TABLE IF NOT EXISTS app_settings (
+  key text PRIMARY KEY, value text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now()
+);
+-- 一个客户 = lanehub 的一个用户 + 一个令牌。令牌落成 upstream_keys 行，
+-- 转发 / 并发闸 / requests.key_id 外键 / 尝试记录都能原样复用。
+CREATE TABLE IF NOT EXISTS lanehub_accounts (
+  user_id uuid PRIMARY KEY REFERENCES users(id),
+  lanehub_user_id integer NOT NULL,
+  key_id uuid NOT NULL REFERENCES upstream_keys(id),
+  lane text NOT NULL DEFAULT 'official',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS lanehub_accounts_lanehub_user ON lanehub_accounts(lanehub_user_id);
+-- 充值入账的幂等表。reference = 支付单号 / 兑换码 id / 迁移批次+客户，
+-- 支付回调重放和迁移脚本重跑都落在同一行上——否则每重放一次就是白送一次钱。
+CREATE TABLE IF NOT EXISTS lanehub_credits (
+  reference text PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES users(id),
+  amount_cny numeric NOT NULL CHECK (amount_cny > 0),
+  quota bigint NOT NULL CHECK (quota > 0),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  applied_at timestamptz
+);
+
+-- 退款：已结算的账单可以被人工退掉一部分或全部。不改 charged_cny（它是「当时收了多少」
+-- 的事实），另记 refunded_cny，净额 = charged - refunded。所有分成口径都按净额算。
+ALTER TABLE request_billing ADD COLUMN IF NOT EXISTS refunded_cny numeric(20,8) NOT NULL DEFAULT 0 CHECK(refunded_cny>=0);
+
+-- 结算单：给插件作者人工打款用的凭据。冻结之后金额锁死，之后发生的退款不回溯改它，
+-- 而是作为一条负数计提落到下一张单里——已经打出去的钱不能被事后改账。
+CREATE TABLE IF NOT EXISTS settlements (
+  id uuid PRIMARY KEY,
+  owner_user_id uuid NOT NULL REFERENCES developer_profiles(user_id),
+  period_from date NOT NULL, period_to date NOT NULL,
+  state text NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','frozen','paid','void')),
+  amount_cny numeric(20,8) NOT NULL DEFAULT 0, item_count integer NOT NULL DEFAULT 0,
+  note text NOT NULL DEFAULT '', paid_note text NOT NULL DEFAULT '',
+  created_by integer REFERENCES administrators(id),
+  created_at timestamptz NOT NULL DEFAULT now(), frozen_at timestamptz, paid_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS settlements_owner ON settlements(owner_user_id,created_at DESC);
+
+-- 分成明细：**作者应得的唯一真源**。计提一行，退款再记一行负数——
+-- 报表和结算单都从这里汇总，不各自再按 charged_cny 算一遍。
+-- 两份口径只要差一点，打出去的钱就是错的。
+CREATE TABLE IF NOT EXISTS plugin_earnings (
+  id uuid PRIMARY KEY,
+  request_id uuid NOT NULL REFERENCES requests(id),
+  owner_user_id uuid NOT NULL REFERENCES developer_profiles(user_id),
+  plugin_id uuid REFERENCES plugins(id),
+  kind text NOT NULL CHECK(kind IN ('accrual','refund')),
+  amount_cny numeric(20,8) NOT NULL,
+  settlement_id uuid REFERENCES settlements(id),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+-- 一笔请求只能计提一次；退款可以多次（部分退）。
+CREATE UNIQUE INDEX IF NOT EXISTS plugin_earnings_accrual ON plugin_earnings(request_id) WHERE kind='accrual';
+CREATE INDEX IF NOT EXISTS plugin_earnings_open ON plugin_earnings(owner_user_id,created_at) WHERE settlement_id IS NULL;
+CREATE INDEX IF NOT EXISTS plugin_earnings_settlement ON plugin_earnings(settlement_id);
+-- 一次性回填：上线之前已经结算过的请求也要有计提，否则作者的第一张结算单会漏掉
+-- 全部历史收益。挂在 schema_version 上，只跑一次（ON CONFLICT 也保证重跑无害）。
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_version WHERE version=11) THEN
+    INSERT INTO plugin_earnings (id,request_id,owner_user_id,plugin_id,kind,amount_cny)
+    SELECT gen_random_uuid(),r.id,r.plugin_owner_user_id,r.plugin_id,'accrual',
+      round((b.charged_cny-b.refunded_cny)*r.plugin_share_bps/10000,8)
+    FROM requests r JOIN request_billing b ON b.request_id=r.id
+    WHERE r.plugin_owner_user_id IS NOT NULL AND coalesce(r.plugin_share_bps,0)>0
+      AND b.state='settled' AND (b.charged_cny-b.refunded_cny)>0
+    ON CONFLICT DO NOTHING;
+    INSERT INTO schema_version(version) VALUES(11);
+  END IF;
+END $$;
+
+-- 文档转 Excel：**自己不发模型请求**的插件，模型走 Host 的 llm 服务。
+-- credential_paths 是空的，这不是漏了——它没有自己的密钥配置槽。桌面端据此为它
+-- 单独注册一条 provider（凭据走环境变量，不落盘），请求因此带着这个插件的凭据，
+-- 网关才归属得到它，作者的分成才算得出来。
+INSERT INTO plugins(id,slug,name,repository,package_name,publisher_ref,allowed_models,runtime_id,runtime_config,credential_paths)
+VALUES('7d8b7d87-b85f-49f1-bde7-a0b1a2f33402','ipzsk-doc-to-excel','文档转 Excel','JayceHuang/ipzsk-doc-to-excel','dsh-doc-to-excel','JayceHuang',
+ ARRAY['gpt-5.6-sol'],'doc-to-excel','{}','[]') ON CONFLICT DO NOTHING;
+
+-- ── 按调用次数给 skill 作者计提 ──────────────────────────────────────────
+--
+-- 用户侧按 token 收费（真实成本），作者侧按**调用次数**计提。两边的计量单位
+-- 故意不同：用户为算力付费，作者为「他的方法论被用了一次」收费。
+--
+-- 为什么不按 token 分给作者：实测一次 agent 调用 17644 token，同样一句话裸调用
+-- 只要 56——99% 的消耗是 harness 的系统提示词、工具定义和工作区上下文，跟 skill
+-- 作者无关。按 token 分，等于让作者分走平台基础设施产生的消耗；还带出一串没有
+-- 标准答案的问题（一轮加载两个 skill 怎么分、加载后第五轮还算不算、作者故意让
+-- skill 常驻套利）。按次数计，这四个问题一次消失。
+--
+-- 市面上的成熟做法也支持这个判断：SKILL.md 类市场（Agensi 等）走一次性买断，
+-- OpenRouter 做了完整的 app 归属却刻意不与收入挂钩，真正按用量分成的
+-- （Apify、MCP server）都是「作者的代码在跑」，归属天然成立。
+ALTER TABLE plugins ADD COLUMN IF NOT EXISTS price_per_call_cny numeric(20,8) NOT NULL DEFAULT 0
+  CHECK(price_per_call_cny>=0);
+
+-- skill 登记：**分成的前提是上架登记过**。skills 是本地文件，谁都能往
+-- ~/.dsh/skills 里扔一个，所以只有登记在案、且归属到某个插件的 skill 才计提；
+-- 本地随手放的 skill 照常能用，只是不产生任何计提。
+--
+-- 借 OpenRouter 那条做法：**首次登记时确权，之后请求头只做匹配、不改写归属**。
+-- 请求里报的 skill 名对不上任何一行，就当没报过——不报错、不计提。
+CREATE TABLE IF NOT EXISTS plugin_skills (
+  skill_ref text PRIMARY KEY,
+  plugin_id uuid NOT NULL REFERENCES plugins(id),
+  display_name text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS plugin_skills_plugin ON plugin_skills(plugin_id);
+
+ALTER TABLE plugin_earnings ADD COLUMN IF NOT EXISTS skill_ref text;
+ALTER TABLE plugin_earnings DROP CONSTRAINT IF EXISTS plugin_earnings_kind_check;
+ALTER TABLE plugin_earnings ADD CONSTRAINT plugin_earnings_kind_check
+  CHECK(kind IN ('accrual','refund','invocation'));
+-- 一次请求可以加载多个 skill，各记各的一条，所以唯一键要带上 skill_ref。
+CREATE UNIQUE INDEX IF NOT EXISTS plugin_earnings_invocation
+  ON plugin_earnings(request_id,skill_ref) WHERE kind='invocation';
+
+-- 未登记 skill 的观测。
+--
+-- 没登记的 skill 不计提（分成的前提是上架确权），但**不该静默丢掉**：有人在大量
+-- 使用某个还没上架的 skill，正是最该去谈合作的线索。实测就撞见过一次——用户机器上
+-- 的 guizang-ppt-skill 被高频调用，而我方只看得到自己登记过的那个。
+CREATE TABLE IF NOT EXISTS skill_sightings (
+  skill_ref text PRIMARY KEY,
+  sightings bigint NOT NULL DEFAULT 0,
+  first_seen timestamptz NOT NULL DEFAULT now(),
+  last_seen timestamptz NOT NULL DEFAULT now()
+);

@@ -1,7 +1,9 @@
 import { refreshMediaTask } from './media-task-sync.mjs';
 import { publicImageTask, imageUrls, fetchResultImage } from './image-results.mjs';
 import { adaptModelRequest } from './model-catalog.mjs';
+import { lanehubMode, provisionCustomer } from './lanehub.mjs';
 import { reserveRequest, settleRequest } from './billing.mjs';
+import { recordSkillInvocations, skillsInRequest } from './earnings.mjs';
 import { customerOrigin } from './customer-auth.mjs';
 import { randomUUID } from 'node:crypto';
 import { checkDesktopSession } from './desktop.mjs';
@@ -34,7 +36,8 @@ function stable(value) {
 const retryableStatus = (status) => [401,402,403,429].includes(status);
 // 连接阶段就失败，说明请求没有到达上游。ECONNRESET 等中途错误不在其列。
 const connectFailed = (error) => ['ECONNREFUSED','ENOTFOUND','EAI_AGAIN'].includes(error?.cause?.code);
-export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, origin, requestTimeoutMs = 180_000, maxAttempts = 3 }) {
+export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, origin, lanehub = null, lanehubAccountId = null,
+  lanehubSignupCny = 0, lanehubUsdCny = 0, lanehubQuotaPerUnit = 500_000, requestTimeoutMs = 180_000, maxAttempts = 3 }) {
   const limiter = new RateLimiter();
   app.decorateRequest('apiUser', null);
   app.addHook('onRequest', async (req) => {
@@ -104,10 +107,40 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     // adaptModelRequest 之后键名已经是上游的，resolveTier 认的是内部名，
     // 拿上游 body 去解析档位会在第一个真正改名的型号上静默回落到最便宜档。
     const requested = audio?.metadata??agentRequest(path,image??req.body);
-    const body = audio?.metadata??adaptModelRequest(path,requested);
+    // lanehub 模式下**不做字段适配**：canonical 契约本来就是干这件事的，
+    // 两层都改名等于改两次，而第二次改的是它不认识的键。
+    const viaLanehub = Boolean(lanehub) && await lanehubMode(db);
+    const body = audio?.metadata??(viaLanehub?requested:adaptModelRequest(path,requested));
+    // 这一轮用到了哪些 skill。客户端只报**事实**（用了什么），算给谁、算多少
+    // 全在服务端：登记表里查不到的 skill 当没报过，不报错也不计提。
+    // 这样客户端不需要知道插件 id、分成比例，改归属和改价钱也不用发版。
+    // 主路径是**扫请求体**：skill 内容以 <skill_content name="..."> 出现在上下文里，
+    // 那是可证实的事实。请求头是备用，给不经过 harness 的客户端显式上报用。
+    const declaredSkills = String(req.headers['x-ipzsk-skill'] ?? '')
+      .split(',').map((ref) => ref.trim()).filter((ref) => /^[A-Za-z0-9._-]{1,200}$/.test(ref));
+    const skillRefs = [...new Set([...skillsInRequest(requested), ...declaredSkills])].slice(0, 8);
+
+    // 归属到哪个插件。两条来源：
+    //   1. 用插件自己的凭据发请求（生图这类插件自己发请求，天然归属）
+    //   2. 主令牌 + X-IPZSK-Plugin-Token 头（skill 型插件：提示词是它给的，
+    //      模型请求却由 agent 主循环发出，用的是主令牌）
+    //
+    // 第 2 条为什么不是「头里带个 plugin_id 就认」：那样任何人都能把自己的消费
+    // 记到任意插件头上，而插件作者按这个数分钱——等于给伪造者选一个收款人。
+    // 所以声明归属必须**出示那个插件的凭据**，而且凭据必须属于同一个用户。
+    const declared=req.headers['x-ipzsk-plugin-token'];
+    let pluginId=req.apiUser.plugin_id;
+    if(!pluginId&&typeof declared==='string'){
+      if(!/^ipz_[A-Za-z0-9_-]{43}$/.test(declared))throw httpError(400,'invalid_plugin_token');
+      const claim=(await db.query(`SELECT plugin_id FROM access_tokens WHERE token_hash=$1 AND user_id=$2
+        AND plugin_id IS NOT NULL AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())`,
+      [hash(declared),req.apiUser.id])).rows[0];
+      if(!claim)throw httpError(403,'plugin_token_denied');
+      pluginId=claim.plugin_id;
+    }
     let plugin;
-    if(req.apiUser.plugin_id){
-      plugin=(await db.query('SELECT id,publisher_ref,allowed_models,owner_user_id,revenue_share_bps FROM plugins WHERE id=$1 AND enabled',[req.apiUser.plugin_id])).rows[0];
+    if(pluginId){
+      plugin=(await db.query('SELECT id,publisher_ref,allowed_models,owner_user_id,revenue_share_bps FROM plugins WHERE id=$1 AND enabled',[pluginId])).rows[0];
       if(!plugin || !plugin.allowed_models.includes(body.model))throw httpError(403,'plugin_model_denied');
     }
     const protocolHeaders=agentHeaders(path,req.headers);
@@ -149,23 +182,38 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
           usage?.output ?? null,usage?.total ?? null,upstreamId ?? null,httpStatus ?? null,errorCode,Date.now()-started,
           estimate.amount,JSON.stringify(estimate.details)]);
         await settleRequest(c,id,{status,submitted,errorCode,usage:billingUsage,serviceTier:responseTier??body.service_tier,billableTools:body.tools?.some(t=>t.type!=='function')});
+        // skill 计提只认**真正跑成**的请求：没发出去的（参数错、余额不足）和中途断流的
+        // 都不算一次调用——断流那次用户什么都没拿到，不该给作者记一笔。
+        if(status==='succeeded')await recordSkillInvocations(c,id,skillRefs);
         if (attemptId) await c.query(`UPDATE request_attempts SET upstream_id=$2,http_status=$3,error_code=$4,
           usage=$5,completed_at=now() WHERE id=$1`, [attemptId,upstreamId ?? null,httpStatus ?? null,errorCode,usage ? JSON.stringify(usage) : null]);
       });
       finalized = true;
     };
     try {
-      await reserveRequest(db,id,req.apiUser.id,body,path,requested);
+      // lanehub 模式下**不预扣**：额度真源在对面，它自己会扣。两边都冻的结果是
+      // 同一笔钱冻两次，而用户看到的是这边那份余额——他会觉得钱少了却不知道为什么。
+      if(!viaLanehub)await reserveRequest(db,id,req.apiUser.id,body,path,requested);
       const payload = { ...body };
       const media=path==='/v1/images/generations'||path==='/v1/videos/generations';
       if(media)delete payload.stream;
       // Require usage for SSE. Models that omit it remain explicitly unverified.
       if (payload.stream && path==='/v1/chat/completions') payload.stream_options = { ...payload.stream_options, include_usage:true };
+      // lanehub 模式：这个客户自己的令牌就是唯一的候选，且**只打一次**。
+      // 不换线是对面的硬约束（换线会改变这一单的价钱），这边再换一层等于把它破掉。
+      const lanehubRow = viaLanehub
+        ? (await provisionCustomer(db, lanehub, upstream, { userId: req.apiUser.id, name: req.apiUser.name,
+            accountId: lanehubAccountId, signupCny: lanehubSignupCny, usdCnyRate: lanehubUsdCny, quotaPerUnit: lanehubQuotaPerUnit }))
+        : null;
+      const attempts = viaLanehub ? 1 : maxAttempts;
       const skip = []; let response = null, failure = null;
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      for (let attempt = 0; attempt < attempts; attempt++) {
         // 只有第一次没渠道才是 503；换渠道时拿不到别的 key 就沿用上一次的失败结果。
-        const next = await scheduler.acquire(() => upstream.candidates(body.model,skip), controller.signal)
-          .catch((error) => { if (attempt === 0 || controller.signal.aborted) throw error; return null; });
+        const next = lanehubRow
+          ? await scheduler.acquire(async () => [{ id: lanehubRow.key_id, account_id: lanehubAccountId, secret_ref: lanehubRow.secret_ref,
+              concurrency: 3, account_concurrency: 50, base_url: lanehub.baseUrl, provider_type: 'lanehub' }], controller.signal)
+          : await scheduler.acquire(() => upstream.candidates(body.model,skip), controller.signal)
+            .catch((error) => { if (attempt === 0 || controller.signal.aborted) throw error; return null; });
         if (!next) break;
         lease?.release(); lease = next;
         controller.signal.throwIfAborted();
@@ -189,13 +237,18 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
         });
         httpStatus = response?.status ?? null;
         upstreamId = response?.headers.get('x-oneapi-request-id')?.slice(0,200) ?? null;
+        // lanehub 模式下这个头就是**对面的** request id，而扣费正是按它反查回来的
+        // （lanehub-charges.mjs）。下面几处会用响应体里的 id 覆盖它——那是上游的上游的
+        // id，查不到任何账。所以 lanehub 模式下一律不覆盖。
+        const keepUpstreamId = viaLanehub;
         if (response?.ok) { failure = null; break; }
         if (response) {
           await response.body?.cancel();
           await upstream.markFailure(lease.row,response.status,response.headers.get('retry-after'));
         }
         failure = response ? `upstream_http_${response.status}` : 'upstream_connect_failed';
-        if (response && !retryableStatus(response.status)) break;
+        // lanehub 那条线一律不换（上面 attempts=1 已经保证，这里是第二道闸）
+        if (viaLanehub || (response && !retryableStatus(response.status))) break;
         skip.push(lease.row.id);
         await db.query('UPDATE request_attempts SET upstream_id=$2,http_status=$3,error_code=$4,completed_at=now() WHERE id=$1',
           [attemptId,upstreamId,httpStatus,failure]);
@@ -225,11 +278,11 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
             parser.finish();
             billingUsage=parser.billingUsage;responseTier=parser.serviceTier;
             observedUsage = parser.usage;
-            upstreamId = parser.upstreamId ?? upstreamId;
+            if(!viaLanehub)upstreamId = parser.upstreamId ?? upstreamId;
             const complete = parser.done && !parser.failed;
             await finalize(complete ? 'succeeded' : 'uncertain',parser.usage,complete ? null : 'stream_incomplete');
           } catch {
-            upstreamId = parser.upstreamId ?? upstreamId;
+            if(!viaLanehub)upstreamId = parser.upstreamId ?? upstreamId;
             await finalize('uncertain',parser.usage,'stream_interrupted');
           } finally {
             if (!finalized) await finalize('uncertain',parser.usage,'stream_interrupted').catch(() => app.log.error({request_id:id},'accounting_failed'));
@@ -255,7 +308,8 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       const value = agentResponse(path,raw);
       if(media) {
         const taskId=value.data[0].task_id;
-        upstreamId=taskId;
+        // 任务 id 另有 media_tasks.upstream_task_id 存着，这里不会丢。
+        if(!viaLanehub)upstreamId=taskId;
         await db.query('INSERT INTO media_tasks(id,upstream_task_id,kind) VALUES($1,$2,$3)',[id,taskId,path.includes('/images/')?'image':'video']);
         await finalize('succeeded',null);
         cleanup();
@@ -263,7 +317,7 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       }
       observedUsage = extractUsage(value);
       billingUsage = extractBillingUsage(value);responseTier=value.service_tier;
-      upstreamId = typeof value.id === 'string' ? value.id.slice(0,200) : upstreamId;
+      if(!viaLanehub&&typeof value.id === 'string')upstreamId = value.id.slice(0,200);
       await finalize('succeeded',observedUsage);
       cleanup();
       return reply.send(value);

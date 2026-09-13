@@ -6,10 +6,16 @@ import * as v from './validation.mjs';
 import { providerTypes, providerOptions } from './upstream.mjs';
 
 // 渠道地址必须是 https 且不带查询串；扣费口径按 provider_type 走注册表，未登记的类型直接拒绝。
+//
+// 唯一的例外是**回环地址**：本机自检要能把 lanehub 起在 http://localhost:3000 上打一遍。
+// 这个口子开得起——回环流量不出网卡，密钥不会在链路上裸奔；而没有这个口子的代价是
+// 整条链路只能在生产上第一次跑通，而形状类的错（字段名、任务结构）恰恰只有真打才看得见。
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
 function baseUrl(value) {
   let url;
   try { url = new URL(v.text(value, 200)); } catch { throw httpError(400, 'invalid_base_url'); }
-  if (url.protocol !== 'https:' || url.search || url.hash || url.username || url.password) throw httpError(400, 'invalid_base_url');
+  const loopback = url.protocol === 'http:' && LOOPBACK.has(url.hostname);
+  if ((url.protocol !== 'https:' && !loopback) || url.search || url.hash || url.username || url.password) throw httpError(400, 'invalid_base_url');
   return (url.origin + url.pathname).replace(/\/+$/, '');
 }
 function providerType(value) {
@@ -53,7 +59,7 @@ export function adminRoutes(app, { db, upstream, scheduler, origin, secureCookie
     if (!result.rowCount) throw httpError(401, 'admin_login_required');
     req.administrator=result.rows[0];
     const route=req.routeOptions.url;
-    const roleScoped=/^\/admin\/api\/(?:developers|plugins|plugin-usage|vouchers|wallet|ledger|overview|requests|audit)(?:[/?]|$)/.test(route);
+    const roleScoped=/^\/admin\/api\/(?:developers|plugins|plugin-usage|plugin-skills|skill-sightings|settlements|vouchers|wallet|ledger|overview|requests|audit)(?:[/?]|$)/.test(route);
     const sensitive=roleScoped||route.startsWith('/admin/api/administrators')||route.startsWith('/admin/api/billing')||route.includes('/export')||route.endsWith('/charge');
     if(req.administrator.role!=='superadmin' && (sensitive || (req.administrator.role==='viewer'&&!['GET','HEAD'].includes(req.method)&&!['/admin/api/logout','/admin/api/password'].includes(route))))throw httpError(403,'admin_permission_denied');
     adminLimit.take(result.rows[0].token_hash, 180);

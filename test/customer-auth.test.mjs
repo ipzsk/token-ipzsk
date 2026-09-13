@@ -107,6 +107,27 @@ test('password login, verified registration and recovery',async t=>{
       assert.equal((await send('/api/me/tokens/'+a.json().id+'/revoke',{},bobCookie)).statusCode,404);
       assert.equal((await send('/api/me/wallet?user_id='+aliceId,undefined,bobCookie)).json().user.id,bobId);
     });
+    await t.test('网页会话密钥：一个登录会话一把，退出即失效',async()=>{
+      // 官网要打 /v1/*（生图、对话），那条路只认 Bearer 令牌不认 cookie。
+      assert.equal((await send('/api/me/web/session-key',{})).statusCode,401,'没登录不给');
+      assert.equal((await send('/api/me/web/session-key',{},aliceCookie,'https://evil.example')).statusCode,403,'跨站不给');
+      const call=t=>app.inject({url:'/v1/models',headers:{authorization:'Bearer '+t}});
+      const first=(await send('/api/me/web/session-key',{},aliceCookie)).json();
+      assert.match(first.token,/^ipz_/);
+      assert.equal((await call(first.token)).statusCode,200);
+      // 刷新页面只是轮换同一行，不能攒出第二把永久 Key。
+      const second=(await send('/api/me/web/session-key',{},aliceCookie)).json();
+      assert.equal((await call(first.token)).statusCode,401,'旧密钥必须作废');
+      assert.equal((await call(second.token)).statusCode,200);
+      assert.equal((await db.query('SELECT count(*) FROM access_tokens WHERE user_id=$1 AND auth_session_id IS NOT NULL AND plugin_id IS NULL',[aliceId])).rows[0].count,'1');
+      // 退出登录，这把密钥跟着失效——浏览器里存着的那份不该还能花钱。
+      const other=cookies(await login('alice@example.com'));
+      const third=(await send('/api/me/web/session-key',{},other)).json().token;
+      await auth('/sign-out',{},other);
+      assert.equal((await call(third)).statusCode,401);
+      // 这把是本测试自己造的第二个会话，清掉——后面那个测试要数「一个会话一行」。
+      await db.query('DELETE FROM access_tokens WHERE prefix=$1',[third.slice(0,12)]);
+    });
     let desktopAliceToken;
     await t.test('desktop bootstrap binds credentials to the session and preserves other devices and API Keys',async()=>{
       assert.equal((await send('/api/me/desktop/bootstrap',{})).statusCode,401);
@@ -122,13 +143,22 @@ test('password login, verified registration and recovery',async t=>{
       assert.deepEqual(first.json().models.map(m=>m.id),['gpt-5.6-sol']);
       assert.deepEqual(first.json().image_models.map(m=>m.id),['gpt-image-2']);
       assert.equal((await call(first.json().token)).statusCode,200);
-      const firstPlugin=first.json().plugin_configs[0];
-      assert.equal(firstPlugin.plugin_id,'7d8b7d87-b85f-49f1-bde7-a0b1a2f33401');
+      // 按 id 取，不按下标：插件表里不止一个插件，顺序按 slug 排，加一个新插件就会串位。
+      const pluginOf=(response,id)=>response.json().plugin_configs.find(p=>p.plugin_id===id);
+      const firstPlugin=pluginOf(first,'7d8b7d87-b85f-49f1-bde7-a0b1a2f33401');
+      assert.ok(firstPlugin,'生图插件的凭据要下发');
       assert.notEqual(firstPlugin.credential,first.json().token);
       assert.equal((await call(firstPlugin.credential)).statusCode,200);
       const second=await send('/api/me/desktop/bootstrap',{},aliceCookie);desktopAliceToken=second.json().token;
       assert.equal((await call(firstPlugin.credential)).statusCode,401);
-      assert.equal((await call(second.json().plugin_configs[0].credential)).statusCode,200);
+      assert.equal((await call(pluginOf(second,'7d8b7d87-b85f-49f1-bde7-a0b1a2f33401').credential)).statusCode,200);
+      // 走 Host llm 服务的插件（credential_paths 为空）同样要拿到自己的凭据——
+      // 桌面端据此给它单独注册一条 provider，否则它花的钱归属不到它头上。
+      const docToExcel=pluginOf(second,'7d8b7d87-b85f-49f1-bde7-a0b1a2f33402');
+      assert.ok(docToExcel,'自己不发请求的插件也要有凭据');
+      assert.deepEqual(docToExcel.credential_paths,[]);
+      assert.notEqual(docToExcel.credential,second.json().token);
+      assert.equal((await call(docToExcel.credential)).statusCode,200);
       assert.equal((await call(first.json().token)).statusCode,401);
       assert.equal((await call(desktopAliceToken)).statusCode,200);
       assert.equal((await db.query('SELECT count(*) FROM access_tokens WHERE user_id=$1 AND auth_session_id IS NOT NULL AND plugin_id IS NULL',[aliceId])).rows[0].count,'1');
