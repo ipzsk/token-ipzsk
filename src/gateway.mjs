@@ -44,7 +44,8 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
   const limiter = new RateLimiter();
   app.decorateRequest('apiUser', null);
   app.addHook('onRequest', async (req) => {
-    if (!req.url.startsWith('/v1/') && !req.url.startsWith('/api/me/')) return;
+    // /api/videos/* 是官网视频页的入口（Bearer 令牌），鉴权与 /v1/* 同一套。
+    if (!req.url.startsWith('/v1/') && !req.url.startsWith('/api/me/') && !req.url.startsWith('/api/videos/')) return;
     if(req.url.startsWith('/api/me/')&&!req.headers.authorization&&customerAuth){
       if(!['GET','HEAD'].includes(req.method)&&![origin,customerOrigin].includes(req.headers.origin))throw httpError(403,'origin_denied');
       req.apiUser=await customerAuth.identify(req.headers);
