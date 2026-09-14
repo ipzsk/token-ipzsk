@@ -47,9 +47,9 @@ test('失败语义：无目录 503，失败保留旧值', async () => {
   const cat = new LanehubCatalog(lanehub, { log: () => {} });
   assert.throws(() => cat.desktop(new Set()), (e) => e.code === 'catalog_unavailable' && e.statusCode === 503);
   await cat.refresh();
-  assert.equal(cat.data.models.length, 4);
+  assert.equal(cat.data.models.length, 5);
   fail = true;
   await cat.refresh();
-  assert.equal(cat.data.models.length, 4, '拉失败要保留上一份');
+  assert.equal(cat.data.models.length, 5, "拉失败要保留上一份");
   assert.ok(cat.lastError, '失败要记下来，不能和刚刷新过长得一样');
 });
