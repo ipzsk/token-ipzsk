@@ -10,3 +10,4 @@ downloads/
 *.key
 *.tgz
 .DS_Store
+src/.deployed-commit
