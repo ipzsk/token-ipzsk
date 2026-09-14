@@ -273,7 +273,9 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
           await c.query('INSERT INTO request_attempts (id,request_id,key_id) VALUES ($1,$2,$3)', [attemptId,id,lease.row.id]);
         });
         // 网页生图带 data:URL 参考图时先传到上游的上传接口换成 URL（标准版只收 URL）。
-        if(payload.model==='gpt-image-2.5-flare' && payload.image_urls?.length){
+        // 官网对**所有**生图型号都用 image_urls 带参考图（data: URL），上游只收 https URL：
+        // 只要带了 data: 就先经 APIMart 的上传接口换成 URL，与型号无关。
+        if(path==='/v1/images/generations' && Array.isArray(payload.image_urls) && payload.image_urls.some((u)=>typeof u==='string'&&u.startsWith('data:'))){
           // lanehub 模式下 lease.row 是 lanehub 的令牌，而 lanehub 没有 /v1/uploads/images；
           // 上传这一步直接用网关自己留着的 APIMart key（只传图不计费，计费仍在 lanehub 那一单）。
           const uploadRow = viaLanehub
