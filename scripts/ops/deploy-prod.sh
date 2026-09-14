@@ -4,11 +4,16 @@
 set -euo pipefail
 : "${SSHPASS:?需要 SSHPASS（用 secretctl secret run 注入）}"
 SSH_USER="${SSH_USER:-ubuntu}"; SSH_HOST="${SSH_HOST:-43.135.34.238}"; REMOTE_DIR="${REMOTE_DIR:-/home/ubuntu/api-gateway}"
+# 整个脚本复用一条 SSH 主连接：只认证一次。连着多次 sshpass 登录会被 sshd 间歇拒掉
+# （实测 Permission denied, please try again ×3），而且每次都把口令交给一个新进程。
+SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ControlMaster=auto -o ControlPath=/tmp/ipzsk-cm-%r@%h:%p -o ControlPersist=300"
+sshpass -e ssh $SSH_OPTS -fN "$SSH_USER@$SSH_HOST"
+trap 'ssh $SSH_OPTS -O exit "$SSH_USER@$SSH_HOST" 2>/dev/null || true' EXIT
 cd "$(dirname "$0")/../.."
 # 先把服务器现网 src 拉回来，和**上次部署的提交**比：生产上跑过从未进 git 的代码（2026-09-13 被覆盖
 # 一次，官网整块功能静默失效）。服务器上有人改过（与上次部署的提交不同）就停下来先合并，不覆盖。
 # 第一次部署（服务器上还没有 .deployed-commit）只能人工确认：FORCE=1。
-TMP=$(mktemp -d); rsync -a --rsh="sshpass -e ssh -o StrictHostKeyChecking=accept-new" "$SSH_USER@$SSH_HOST:$REMOTE_DIR/src/" "$TMP/src/"
+TMP=$(mktemp -d); rsync -a --rsh="ssh $SSH_OPTS" "$SSH_USER@$SSH_HOST:$REMOTE_DIR/src/" "$TMP/src/"
 DEPLOYED=$(cat "$TMP/src/.deployed-commit" 2>/dev/null || true)
 if [[ -n "$DEPLOYED" ]] && git cat-file -e "$DEPLOYED^{commit}" 2>/dev/null; then
   git worktree add -q "$TMP/ref" "$DEPLOYED"
@@ -22,10 +27,10 @@ elif [[ -z "${FORCE:-}" ]]; then
 fi
 rm -rf "$TMP"
 git rev-parse HEAD > src/.deployed-commit
-rsync -a --delete --exclude "._*" --rsh="sshpass -e ssh -o StrictHostKeyChecking=accept-new" src/ "$SSH_USER@$SSH_HOST:$REMOTE_DIR/src/"
+rsync -a --delete --exclude "._*" --rsh="ssh $SSH_OPTS" src/ "$SSH_USER@$SSH_HOST:$REMOTE_DIR/src/"
 rm -f src/.deployed-commit
-rsync -a --rsh="sshpass -e ssh -o StrictHostKeyChecking=accept-new" scripts/ package.json package-lock.json Dockerfile "$SSH_USER@$SSH_HOST:$REMOTE_DIR/"
-sshpass -e ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$SSH_HOST" bash -s "$REMOTE_DIR" <<'REMOTE'
+rsync -a --rsh="ssh $SSH_OPTS" scripts/ package.json package-lock.json Dockerfile "$SSH_USER@$SSH_HOST:$REMOTE_DIR/"
+ssh $SSH_OPTS "$SSH_USER@$SSH_HOST" bash -s "$REMOTE_DIR" <<'REMOTE'
 set -euo pipefail; cd "$1"
 sudo docker compose build gateway 2>&1 | tail -1
 sudo docker compose up -d gateway 2>&1 | tail -1
