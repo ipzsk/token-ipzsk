@@ -10,6 +10,7 @@ const fixture = {
       params: { registered: true, fields: [
         { field: 'aspect_ratio', values: ['1:1', '16:9'] }, { field: 'resolution', values: ['1k', '2k'] },
         { field: 'duration', unsupported: '图片没有时长' }, { field: 'size', values: ['1024x1024'] } ] } },
+    { id: 'z-image-turbo', kind: 'image', modalities: ['image'], billing: { type: 'times', unit: 'per_call', usd: 0.003 }, params: { registered: true, fields: [{ field: 'resolution', values: ['1k'] }] } },
     { id: 'seedance-2.0', kind: 'video', modalities: ['video'], billing: { type: 'times', unit: 'per_second', usd: 0.02, tiers: { '480p': 0.02, '720p': 0.04 } },
       params: { registered: true, fields: [{ field: 'resolution', values: ['480p', '720p'] }] } },
     { id: 'not-on-our-keys', kind: 'chat', modalities: ['text'], billing: { type: 'tokens', unit: 'per_1m_tokens', input_usd: 1, output_usd: 1 } },
@@ -19,7 +20,7 @@ const fixture = {
 
 // 桌面端只拿这边密钥挂着的型号；分桶按 kind；图片型号带上旧客户端校验的 sizes。
 test('目录 → 桌面端形状', () => {
-  const out = desktopFromCatalog(fixture, new Set(['deepseek-v4-flash', 'gpt-image-2', 'seedance-2.0', 'claude-opus-5']));
+  const out = desktopFromCatalog(fixture, new Set(['deepseek-v4-flash', 'gpt-image-2', 'seedance-2.0', 'claude-opus-5', 'z-image-turbo']));
   assert.equal(out.default_model, 'deepseek-v4-flash');
   assert.deepEqual(out.models.map((m) => m.id), ['deepseek-v4-flash', 'claude-opus-5']);
   assert.equal(out.models[0].contextWindow, 128000);
@@ -27,7 +28,9 @@ test('目录 → 桌面端形状', () => {
   assert.equal(out.models[1].contextWindow, 32768);
   assert.equal(out.models[1].maxTokens, 4096);
   assert.ok(out.models.every((m) => Number.isSafeInteger(m.contextWindow) && m.contextWindow >= 1 && Number.isSafeInteger(m.maxTokens) && m.maxTokens >= 1));
-  assert.deepEqual(out.image_models.map((m) => m.id), ['gpt-image-2']);
+  assert.deepEqual(out.image_models.map((m) => m.id), ['gpt-image-2', 'z-image-turbo']);
+  // 没有比例枚举的图片模型也必须带 sizes / default_size：已发布客户端把它当硬校验。
+  assert.ok(out.image_models[1].sizes.length > 5 && out.image_models[1].default_size === '1:1');
   assert.deepEqual(out.video_models.map((m) => m.id), ['seedance-2.0']);
   const img = out.image_models[0];
   assert.deepEqual(img.sizes, ['1:1', '16:9'], '图片 sizes 从 aspect_ratio 派生');
@@ -47,9 +50,9 @@ test('失败语义：无目录 503，失败保留旧值', async () => {
   const cat = new LanehubCatalog(lanehub, { log: () => {} });
   assert.throws(() => cat.desktop(new Set()), (e) => e.code === 'catalog_unavailable' && e.statusCode === 503);
   await cat.refresh();
-  assert.equal(cat.data.models.length, 5);
+  assert.equal(cat.data.models.length, 6);
   fail = true;
   await cat.refresh();
-  assert.equal(cat.data.models.length, 5, "拉失败要保留上一份");
+  assert.equal(cat.data.models.length, 6, "拉失败要保留上一份");
   assert.ok(cat.lastError, '失败要记下来，不能和刚刷新过长得一样');
 });

@@ -45,8 +45,10 @@ export class LanehubCatalog {
 
 // lanehub 目录 → 桌面端 bootstrap 的形状。纯函数，测试直接喂 fixture。
 export function desktopFromCatalog(catalog, available) {
+  // 已发布客户端对每个 id 做 /^[a-zA-Z0-9._-]{1,128}$/ 校验，一个不合规（如 Wan-AI/Wan2.6-T2V 带 /）
+  // 就整个登录失败。这种型号这里直接不下发，而不是让客户端炸。
   const entries = catalog.models
-    .filter((m) => available.has(m.id))
+    .filter((m) => available.has(m.id) && /^[a-zA-Z0-9._-]{1,128}$/.test(m.id) && typeof (m.name || m.id) === 'string')
     .map((m) => {
       const params = paramsOf(m);
       const base = { id: m.id, name: m.name || m.id, kind: m.kind, params, unsupported: unsupportedOf(m) };
@@ -60,8 +62,12 @@ export function desktopFromCatalog(catalog, available) {
       // 已发布的桌面端在图片型号上校验 sizes/default_size（ipzsk-auth.ts），缺了会把已装客户端
       // 锁在登录页外。这里从 aspect_ratio 字段派生，与旧 deprecatedSizes 同义。
       if (m.kind === 'image') {
+        // 已发布的客户端把 sizes / default_size 当硬校验（缺了整个登录失败，2026-09-14 实录）。
+        // 契约里有枚举就用契约的；没有枚举（上游按字符串收比例）就下发通用比例表——
+        // 这是客户端的选项，不是上游上限的声明。
         const ratio = params.find((p) => p.field === 'aspect_ratio');
-        if (ratio?.values?.length) Object.assign(media, { sizes: ratio.values, default_size: ratio.default ?? ratio.values[0] });
+        const sizes = ratio?.values?.length ? ratio.values : DEFAULT_ASPECT_RATIOS;
+        Object.assign(media, { sizes, default_size: ratio?.default ?? (sizes.includes('1:1') ? '1:1' : sizes[0]) });
       }
       return media;
     });
@@ -85,6 +91,7 @@ const CANONICAL_PARAMS = {
   enhance_prompt: '是否让上游自动扩写提示词',
 };
 
+const DEFAULT_ASPECT_RATIOS = ['1:1', '16:9', '9:16', '3:2', '2:3', '4:3', '3:4', '5:4', '4:5', '2:1', '1:2', '3:1', '1:3', '21:9', '9:21'];
 const chatDefaults = (id) => (/^gpt-(3\.5|4(?:-|$))/.test(id) ? { contextWindow: 4096, maxTokens: 1024 } : { contextWindow: 32768, maxTokens: 4096 });
 
 function paramsOf(m) {
