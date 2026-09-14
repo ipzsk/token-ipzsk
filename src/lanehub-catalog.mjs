@@ -50,7 +50,11 @@ export function desktopFromCatalog(catalog, available) {
     .map((m) => {
       const params = paramsOf(m);
       const base = { id: m.id, name: m.name || m.id, kind: m.kind, params, unsupported: unsupportedOf(m) };
-      if (m.kind === 'chat') return { ...base, contextWindow: m.context_length || undefined, maxTokens: m.max_tokens || undefined };
+      // 客户端把 contextWindow / maxTokens 当硬校验（不是 ≥1 的整数就整个登录失败）。
+      // lanehub 的 model_info 多数还没有上下文长度，缺省时给保守值：这是客户端的**预算**，
+      // 不是对上游上限的声明（老快照就是这么做的），有真值再覆盖。
+      if (m.kind === 'chat') return { ...base, contextWindow: m.context_length > 0 ? m.context_length : chatDefaults(m.id).contextWindow,
+        maxTokens: m.max_tokens > 0 ? m.max_tokens : chatDefaults(m.id).maxTokens };
       const tiers = m.billing?.tiers ? Object.keys(m.billing.tiers) : undefined;
       const media = { ...base, billing_unit: m.billing?.unit, tiers, require_tier: Boolean(tiers?.length) && !m.billing?.usd, default_tier: tiers ? 'default' : null };
       // 已发布的桌面端在图片型号上校验 sizes/default_size（ipzsk-auth.ts），缺了会把已装客户端
@@ -81,10 +85,12 @@ const CANONICAL_PARAMS = {
   enhance_prompt: '是否让上游自动扩写提示词',
 };
 
+const chatDefaults = (id) => (/^gpt-(3\.5|4(?:-|$))/.test(id) ? { contextWindow: 4096, maxTokens: 1024 } : { contextWindow: 32768, maxTokens: 4096 });
+
 function paramsOf(m) {
   const out = m.kind === 'chat' ? [] : [{ field: 'prompt', type: 'string', required: true }];
   for (const f of m.params?.fields ?? []) {
-    if (!Object.hasOwn(CANONICAL_PARAMS, f.field) || f.unsupported) continue;
+    if (!Object.hasOwn(CANONICAL_PARAMS, f.field) || f.unsupported || out.some((p) => p.field === f.field)) continue;
     out.push({ field: f.field, type: f.values?.length ? 'enum' : 'string', values: f.values, required: false });
   }
   return out;

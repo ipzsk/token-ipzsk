@@ -13,15 +13,20 @@ const fixture = {
     { id: 'seedance-2.0', kind: 'video', modalities: ['video'], billing: { type: 'times', unit: 'per_second', usd: 0.02, tiers: { '480p': 0.02, '720p': 0.04 } },
       params: { registered: true, fields: [{ field: 'resolution', values: ['480p', '720p'] }] } },
     { id: 'not-on-our-keys', kind: 'chat', modalities: ['text'], billing: { type: 'tokens', unit: 'per_1m_tokens', input_usd: 1, output_usd: 1 } },
+    { id: 'claude-opus-5', kind: 'chat', modalities: ['text'], billing: { type: 'tokens', unit: 'per_1m_tokens', input_usd: 2, output_usd: 10 } },
   ],
 };
 
 // 桌面端只拿这边密钥挂着的型号；分桶按 kind；图片型号带上旧客户端校验的 sizes。
 test('目录 → 桌面端形状', () => {
-  const out = desktopFromCatalog(fixture, new Set(['deepseek-v4-flash', 'gpt-image-2', 'seedance-2.0']));
+  const out = desktopFromCatalog(fixture, new Set(['deepseek-v4-flash', 'gpt-image-2', 'seedance-2.0', 'claude-opus-5']));
   assert.equal(out.default_model, 'deepseek-v4-flash');
-  assert.deepEqual(out.models.map((m) => m.id), ['deepseek-v4-flash']);
+  assert.deepEqual(out.models.map((m) => m.id), ['deepseek-v4-flash', 'claude-opus-5']);
   assert.equal(out.models[0].contextWindow, 128000);
+  // 目录没给上下文长度时必须给保守默认值：客户端把它当硬校验，缺了整个登录失败（2026-09-14 实录）。
+  assert.equal(out.models[1].contextWindow, 32768);
+  assert.equal(out.models[1].maxTokens, 4096);
+  assert.ok(out.models.every((m) => Number.isSafeInteger(m.contextWindow) && m.contextWindow >= 1 && Number.isSafeInteger(m.maxTokens) && m.maxTokens >= 1));
   assert.deepEqual(out.image_models.map((m) => m.id), ['gpt-image-2']);
   assert.deepEqual(out.video_models.map((m) => m.id), ['seedance-2.0']);
   const img = out.image_models[0];
