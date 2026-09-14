@@ -106,8 +106,9 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     const image=await fetchResultImage(url);
     return reply.type(image.type).send(image.body);
   });
-  for(const taskPath of ['/v1/tasks/:id','/api/me/tasks/:id'])app.get(taskPath, async (req) => {
-    const id=uuid(req.params.id);
+  // /api/videos/tasks?task_id= 是官网视频页的轮询入口（同一份任务，只是用 query 传 id）。
+  for(const taskPath of ['/v1/tasks/:id','/api/me/tasks/:id','/api/videos/tasks'])app.get(taskPath, async (req) => {
+    const id=uuid(req.params.id ?? req.query?.task_id);
     const task=(await db.query(`SELECT t.*,k.secret_ref FROM media_tasks t
       JOIN requests r ON r.id=t.id JOIN upstream_keys k ON k.id=r.key_id
       WHERE t.id=$1 AND r.user_id=$2 AND ($3::uuid IS NULL OR r.plugin_id=$3)`,[id,req.apiUser.id,req.apiUser.plugin_id??null])).rows[0];
@@ -120,7 +121,7 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     if(!['/v1/audio/transcriptions','/v1/images/edits','/v1/images/generations','/api/me/images/generations'].includes(req.url.split('?')[0]))return done(httpError(415,'unsupported_content_type'));
     done(null,body);
   });
-  for (const routePath of ['/api/me/workspace/chat','/api/me/chat/completions','/api/me/image-prompt','/api/me/images/generations','/v1/chat/completions','/v1/responses','/v1/messages','/v1/images/generations','/v1/images/edits','/v1/videos/generations','/v1/audio/transcriptions']) app.post(routePath, {bodyLimit:routePath==='/v1/audio/transcriptions'?26_000_000:32_000_000}, async (req, reply) => {
+  for (const routePath of ['/api/me/workspace/chat','/api/me/chat/completions','/api/me/image-prompt','/api/me/images/generations','/api/videos/generations','/v1/chat/completions','/v1/responses','/v1/messages','/v1/images/generations','/v1/images/edits','/v1/videos/generations','/v1/audio/transcriptions']) app.post(routePath, {bodyLimit:routePath==='/v1/audio/transcriptions'?26_000_000:32_000_000}, async (req, reply) => {
     // /api/me/* 是官网走 cookie 会话的入口；形状与 /v1/* 相同，只是多了几步网页专属的预处理。
     const webPrompt=routePath==='/api/me/image-prompt';
     if(webPrompt){
@@ -138,7 +139,7 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       if(!Number.isSafeInteger(policy_version)||(budget_cny!==null&&(typeof budget_cny!=='string'||!/^\d{1,10}\.\d{8}$/.test(budget_cny))))throw httpError(400,'workspace_quote_required');
       req.body=workspaceChat(req.body);
     }
-    const path=workspace||webPrompt||routePath==='/api/me/chat/completions'?'/v1/chat/completions':['/v1/images/edits','/api/me/images/generations'].includes(routePath)?'/v1/images/generations':routePath;
+    const path=workspace||webPrompt||routePath==='/api/me/chat/completions'?'/v1/chat/completions':['/v1/images/edits','/api/me/images/generations'].includes(routePath)?'/v1/images/generations':routePath==='/api/videos/generations'?'/v1/videos/generations':routePath;
     const image=path==='/v1/images/generations'&&Buffer.isBuffer(req.body)?await imageUpload(req.body,req.headers['content-type']):null;
     if(routePath==='/v1/images/edits'&&!image)throw httpError(400,'invalid_image_upload');
     const audio=path==='/v1/audio/transcriptions'?await audioRequest(req.body,req.headers['content-type']):null;

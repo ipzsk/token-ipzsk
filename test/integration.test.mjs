@@ -89,7 +89,8 @@ test('gateway integration against an isolated PostgreSQL test schema', async (t)
     await t.test('web (official site) routes stay registered',async()=>{
       for(const [method,url] of [['GET','/api/me/workspace'],['POST','/api/me/workspace'],['GET','/api/me/workspace/models'],['POST','/api/me/workspace/quote'],
         ['POST','/api/me/workspace/chat'],['POST','/api/me/chat/completions'],['POST','/api/me/image-prompt'],['POST','/api/me/images/generations'],
-        ['GET','/api/me/tasks/:id'],['GET','/api/me/tasks/:id/image/:index'],['GET','/api/me/images'],['POST','/api/me/message-billing'],['GET','/api/me/requests/:id'],['GET','/api/me/wallet']]){
+        ['GET','/api/me/tasks/:id'],['GET','/api/me/tasks/:id/image/:index'],['GET','/api/me/images'],['POST','/api/me/message-billing'],['GET','/api/me/requests/:id'],['GET','/api/me/wallet'],
+        ['POST','/api/videos/generations'],['GET','/api/videos/tasks']]){
         assert.ok(app.hasRoute({method,url}),`官网路由不见了: ${method} ${url}`);
       }
     });
