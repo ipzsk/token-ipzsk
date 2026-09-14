@@ -22,6 +22,8 @@ const fixture = {
 test('目录 → 桌面端形状', () => {
   const out = desktopFromCatalog(fixture, new Set(['deepseek-v4-flash', 'gpt-image-2', 'seedance-2.0', 'claude-opus-5', 'z-image-turbo']));
   assert.equal(out.default_model, 'deepseek-v4-flash');
+  assert.equal(desktopFromCatalog(fixture, new Set(['deepseek-v4-flash', 'claude-opus-5']), { defaultChatModel: 'claude-opus-5' }).default_model, 'claude-opus-5');
+  assert.equal(desktopFromCatalog(fixture, new Set(['deepseek-v4-flash']), { defaultChatModel: 'claude-opus-5' }).default_model, 'deepseek-v4-flash', '配置的默认不在清单里就回落到第一个');
   assert.deepEqual(out.models.map((m) => m.id), ['deepseek-v4-flash', 'claude-opus-5']);
   assert.equal(out.models[0].contextWindow, 128000);
   // 目录没给上下文长度时必须给保守默认值：客户端把它当硬校验，缺了整个登录失败（2026-09-14 实录）。

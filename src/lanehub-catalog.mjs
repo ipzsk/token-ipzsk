@@ -44,7 +44,7 @@ export class LanehubCatalog {
 }
 
 // lanehub 目录 → 桌面端 bootstrap 的形状。纯函数，测试直接喂 fixture。
-export function desktopFromCatalog(catalog, available) {
+export function desktopFromCatalog(catalog, available, { defaultChatModel = process.env.DESKTOP_DEFAULT_MODEL } = {}) {
   // 已发布客户端对每个 id 做 /^[a-zA-Z0-9._-]{1,128}$/ 校验，一个不合规（如 Wan-AI/Wan2.6-T2V 带 /）
   // 就整个登录失败。这种型号这里直接不下发，而不是让客户端炸。
   const entries = catalog.models
@@ -73,9 +73,11 @@ export function desktopFromCatalog(catalog, available) {
     });
   const byKind = (kind) => entries.filter((m) => m.kind === kind);
   const models = byKind('chat');
+  // 默认聊天模型由配置指定（DESKTOP_DEFAULT_MODEL）；不在清单里或没配就取第一个，不让客户端拿到空默认。
+  const preferred = models.find((m) => m.id === defaultChatModel);
   return {
     canonical_params: CANONICAL_PARAMS,
-    default_model: models[0]?.id,
+    default_model: (preferred ?? models[0])?.id,
     models,
     image_models: byKind('image'),
     video_models: byKind('video'),
