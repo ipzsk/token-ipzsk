@@ -273,7 +273,15 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
           await c.query('INSERT INTO request_attempts (id,request_id,key_id) VALUES ($1,$2,$3)', [attemptId,id,lease.row.id]);
         });
         // 网页生图带 data:URL 参考图时先传到上游的上传接口换成 URL（标准版只收 URL）。
-        if(payload.model==='gpt-image-2.5-flare' && payload.image_urls?.length)payload.image_urls=await uploadImageReferences(upstream,lease.row,payload.image_urls,controller.signal);
+        if(payload.model==='gpt-image-2.5-flare' && payload.image_urls?.length){
+          // lanehub 模式下 lease.row 是 lanehub 的令牌，而 lanehub 没有 /v1/uploads/images；
+          // 上传这一步直接用网关自己留着的 APIMart key（只传图不计费，计费仍在 lanehub 那一单）。
+          const uploadRow = viaLanehub
+            ? (await upstream.candidates(payload.model)).find((r) => r.provider_type === 'apimart')
+            : lease.row;
+          if (!uploadRow) throw httpError(503, 'reference_upload_unavailable');
+          payload.image_urls=await uploadImageReferences(upstream,uploadRow,payload.image_urls,controller.signal);
+        }
         submitted = true;
         response = await upstream.request(lease.row, path, {
           method:'POST', body:audio?.payload??JSON.stringify(payload), headers:protocolHeaders, signal:controller.signal,
