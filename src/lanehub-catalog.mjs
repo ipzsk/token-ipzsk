@@ -37,9 +37,11 @@ export class LanehubCatalog {
   }
 
   /** 桌面端 bootstrap 用的形状。`available` 是这边 upstream_keys 里挂着的型号集合。 */
-  desktop(available) {
+  // lanehub 模式下目录本身就是真源：哪些能卖由 lanehub 的渠道白名单决定，不再用这边
+  // upstream_keys.models（旧多上游模式的密钥型号表）二次过滤——lanehub 密钥行的 models 是空的。
+  desktop() {
     if (!this.data) throw httpError(503, 'catalog_unavailable');
-    return desktopFromCatalog(this.data, available);
+    return desktopFromCatalog(this.data, new Set(this.data.models.map((m) => m.id)));
   }
 }
 

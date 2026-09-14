@@ -31,7 +31,7 @@ export function desktopRoutes(app,options) {
     const available=new Set(rows.map(row=>row.model));
     // lanehub 模式下目录从 lanehub 派生（真源在那边）；旧模式仍读本地快照。
     const {models,image_models,video_models,canonical_params,default_model}=
-      (options.lanehubCatalog&&await lanehubMode(db))?options.lanehubCatalog.desktop(available):desktopCatalog(available);
+      (options.lanehubCatalog&&await lanehubMode(db))?options.lanehubCatalog.desktop():desktopCatalog(available);
     if(!models.length)throw httpError(503,'desktop_models_unavailable');
     return db.tx(async c=>{
       const user=(await c.query('SELECT enabled FROM users WHERE id=$1 FOR UPDATE',[req.apiUser.id])).rows[0];

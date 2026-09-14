@@ -53,6 +53,8 @@ test('失败语义：无目录 503，失败保留旧值', async () => {
   assert.throws(() => cat.desktop(new Set()), (e) => e.code === 'catalog_unavailable' && e.statusCode === 503);
   await cat.refresh();
   assert.equal(cat.data.models.length, 6);
+  // lanehub 模式下不按这边的密钥型号表过滤：目录里有的全部下发。
+  assert.equal(cat.desktop().models.length + cat.desktop().image_models.length + cat.desktop().video_models.length, 6);
   fail = true;
   await cat.refresh();
   assert.equal(cat.data.models.length, 6, "拉失败要保留上一份");
