@@ -13,20 +13,44 @@ export function publicImageTask(task,origin) {
   return {...task,result:{...task.result,images:imageUrls(task).map((_,i)=>({url:[`${origin}/v1/tasks/${task.id}/image/${i}`]}))}};
 }
 // Only upstream-returned public HTTPS images may be retrieved. Never forward a key.
-export async function fetchResultImage(url,fetcher=fetch) {
+// lanehub puts thumbnails / subtitles / captioned videos under their own keys; still drop obvious image/subtitle links
+// from videos[] so a poster can never be archived or counted as the result.
+const NOT_VIDEO=/\.(?:jpe?g|png|webp|gif|srt|vtt)(?:$|[?#])/i;
+export function videoUrls(task) {
+  const videos=task?.result?.videos;
+  if(!Array.isArray(videos))return [];
+  return videos.flatMap(video=>Array.isArray(video?.url)?video.url:[video?.url]).filter(url=>typeof url==='string'&&!NOT_VIDEO.test(url));
+}
+// lanehub side keys: thumbnails / subtitles (srt) / captioned_videos (burned-in captions).
+export const sideUrls=(task,key)=>{
+  const items=task?.result?.[key];
+  if(!Array.isArray(items))return [];
+  return items.flatMap(item=>Array.isArray(item?.url)?item.url:[item?.url]).filter(url=>typeof url==='string');
+};
+export const thumbnailUrls=(task)=>sideUrls(task,'thumbnails');
+// Subtitles are small text: the signed upstream URL expires, so the archiver keeps the text itself (≤64KB).
+export async function fetchSubtitle(url,fetcher=fetch){
+  const file=await fetchResultMedia(url,fetcher,{types:['application/x-subrip','text/plain','text/srt','text/vtt','application/octet-stream','binary/octet-stream'],maxBytes:65_536});
+  const chunks=[];for await(const chunk of file.body)chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString('utf8');
+}
+export const fetchResultImage=(url,fetcher=fetch)=>fetchResultMedia(url,fetcher);
+// Videos: real type is sniffed after download (CDNs often answer octet-stream). Image types are accepted so the archiver can skip a stray poster.
+export const fetchResultVideo=(url,fetcher=fetch)=>fetchResultMedia(url,fetcher,{types:['video/mp4','application/octet-stream','binary/octet-stream','image/jpeg','image/png','image/webp'],maxBytes:200*1024*1024,timeoutMs:300_000});
+export async function fetchResultMedia(url,fetcher=fetch,{types=['image/png','image/jpeg','image/webp'],maxBytes=32_000_000,timeoutMs=30000}={}) {
   let parsed;try{parsed=new URL(url);}catch{throw httpError(502,'invalid_image_url');}
   if(parsed.protocol!=='https:'||parsed.username||parsed.password||parsed.port&&parsed.port!=='443')throw httpError(502,'invalid_image_url');
   const addresses=await lookup(parsed.hostname,{all:true});
   const publicV4=ip=>{const [a,b]=ip.split('.').map(Number);return isIP(ip)===4&&a!==0&&a!==10&&a!==127&&a<224&&!(a===169&&b===254)&&!(a===172&&b>=16&&b<=31)&&!(a===192&&b===168)&&!(a===100&&b>=64&&b<=127);};
   if(!addresses.length||addresses.some(row=>!publicV4(row.address)))throw httpError(502,'invalid_image_host');
-  const response=await fetcher(url,{redirect:'error',signal:AbortSignal.timeout(30000)});
+  const response=await fetcher(url,{redirect:'error',signal:AbortSignal.timeout(timeoutMs)});
   const type=response.headers.get('content-type')?.split(';')[0];
-  if(!response.ok||!['image/png','image/jpeg','image/webp'].includes(type)){await response.body?.cancel();throw httpError(502,'image_download_failed');}
+  if(!response.ok||!types.includes(type)){await response.body?.cancel();throw httpError(502,'image_download_failed');}
   const body=Readable.from((async function*(){
     let bytes=0;
     for await(const chunk of response.body){
       bytes+=chunk.length;
-      if(bytes>32_000_000)throw httpError(502,'image_too_large');
+      if(bytes>maxBytes)throw httpError(502,'media_too_large');
       yield chunk;
     }
   })());

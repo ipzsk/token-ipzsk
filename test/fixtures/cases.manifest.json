@@ -1,0 +1,134 @@
+[
+ {
+  "id": "20000",
+  "title": "黑白极简概念",
+  "prompt": "# 黑白极简概念\n\n## 视觉风格原子\n\n创作一张黑白灰现代编辑概念海报。风格核心是巨型可读标题、克制留白、锐利网格和一个准确的图像隐喻，整体像高端作品集封面或现代主义展览海报。\n\n## 输入变量\n\n- 主题词 / 主标题：{{主题词}}\n- 副标题：{{副标题，可留空}}\n- 画幅比例：{{画幅比例}}\n- 语言：{{中文 / 英文 / 中英混排}}\n- 用途：{{用途}}\n- 可选补充语境：{",
+  "category": "posters",
+  "categoryZh": "封面与海报",
+  "tags": [
+   "极简",
+   "编辑感",
+   "隐喻",
+   "cover"
+  ],
+  "model": "gpt-image-2",
+  "params": {
+   "aspect_ratio": "21:9"
+  },
+  "image": {
+   "url": "/image-studio/assets/thumbs/20000.webp",
+   "orig": "/image-studio/assets/fixture-a.png",
+   "width": 680,
+   "height": 272
+  },
+  "author": "adrianpunk",
+  "author_url": "https://github.com/adrianpunk",
+  "source_url": "https://github.com/adrianpunk/Punk-Skill/tree/b525dc70e8f1cebf6a120f298d6e5edc77f7a24d/styles/black-white-minimal-concept",
+  "source_repo": "Punk-Skill",
+  "license_note": "Punk-Skill (adrianpunk) · MIT · fetched 2026-09-07"
+ },
+ {
+  "id": "543",
+  "title": "旅行纪念珐琅徽章",
+  "prompt": "将参考照片制作为一枚旅行纪念珐琅胸针徽章。以“场景”来构图，而非单一孤立物体。\n\n主体层级：照片中具有决定性的风景、地形或地标构成徽章的主体，占据其大部分面积。若照片中人物较为显著，将其以小而简化的形象保留在徽章中，并保持其在该风景中的真实相对尺度——人物为点缀，风景为主体。保留人物与环境之间原有的空间关系与比例。\n\n人物绘制方式：使用与照片中真实服装与发色相匹配的扁平珐琅色块。面部为光滑的浅肤色",
+  "category": "ecommerce",
+  "categoryZh": "电商与产品",
+  "tags": [
+   "Realistic",
+   "Product",
+   "Character",
+   "Tech",
+   "Commerce",
+   "Fashion"
+  ],
+  "model": "gpt-image-2",
+  "params": {
+   "aspect_ratio": "2:3"
+  },
+  "image": {
+   "url": "/image-studio/assets/thumbs/543.webp",
+   "orig": "https://img.cases.test/b.jpg",
+   "width": 2336,
+   "height": 3504
+  },
+  "author": "@Emmma__0",
+  "author_url": "https://x.com/Emmma__0",
+  "source_url": "https://x.com/Emmma__0/status/2093194689222705645",
+  "source_repo": "awesome-gpt-image-2",
+  "license_note": "awesome-gpt-image-2 (freestylefly) · https://github.com/freestylefly/awesome-gpt-image-2/blob/main/docs/gallery-part-2.md#case-543 · fetched 2026-09-02T14:41:58.457Z · 第三方内容，版权归原作者",
+  "template": {
+   "items": [
+    {
+     "key": "main",
+     "label": "主图",
+     "description": "干净背景，突出商品主体",
+     "count": 1,
+     "references": [
+      {
+       "slot": "商品图"
+      }
+     ]
+    },
+    {
+     "key": "selling-point",
+     "label": "卖点图",
+     "description": "用画面展示商品核心卖点",
+     "count": 2,
+     "references": [
+      {
+       "slot": "商品图"
+      }
+     ]
+    },
+    {
+     "key": "scene",
+     "label": "场景图",
+     "description": "真实生活或使用场景",
+     "count": 2,
+     "references": [
+      {
+       "slot": "商品图"
+      }
+     ]
+    },
+    {
+     "key": "detail",
+     "label": "细节图",
+     "description": "材质、结构或工艺特写",
+     "count": 1,
+     "references": [
+      {
+       "slot": "商品细节图"
+      }
+     ]
+    }
+   ]
+  }
+ },
+ {
+  "id": "30002",
+  "title": "黑白复古蚀刻版画封面",
+  "prompt": "将用户主题或文章摘要提炼成简洁可读的封面标题，用一个准确的视觉隐喻表现核心观点。只生成一张封面，不把原文铺满画面。\n将以下视觉规则融入完整画面，只使用这一种风格。比例以用户和面板设置为准。不要将说明、变量提示或风格名称印在画面上。\n\n# 黑白复古蚀刻版画封面\n\n## 视觉风格原子\n\n你是一名擅长铜版画、蚀刻版画、木刻、古典科学插图与超现实编辑插画的封面艺术家。请根据标题、主题和核心意思，创作一张具",
+  "category": "posters",
+  "categoryZh": "封面与海报",
+  "tags": [
+   "black-white-etching-editorial-cover",
+   "cover"
+  ],
+  "model": "gpt-image-2",
+  "params": {
+   "aspect_ratio": "21:9"
+  },
+  "image": {
+   "url": "/image-studio/assets/thumbs/30002.webp",
+   "orig": "/image-studio/assets/fixture-c.webp",
+   "width": 1200,
+   "height": 480
+  },
+  "author": "adrianpunk",
+  "author_url": "https://github.com/adrianpunk",
+  "source_url": "https://github.com/adrianpunk/Punk-Skill/tree/b525dc70e8f1cebf6a120f298d6e5edc77f7a24d/styles/black-white-etching-editorial-cover",
+  "source_repo": "Punk-Skill",
+  "license_note": "Punk-Skill (adrianpunk) · MIT · fetched 2026-09-07"
+ }
+]
