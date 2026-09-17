@@ -8,8 +8,9 @@
   },
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node --test test/captcha.test.mjs test/core.test.mjs test/agent-protocols.test.mjs test/audio.test.mjs test/image-upload.test.mjs test/text-pricing.test.mjs test/model-catalog.test.mjs test/multi-upstream.test.mjs test/media-billing.test.mjs test/lanehub.test.mjs test/lanehub-charges.test.mjs test/lanehub-catalog.test.mjs",
-    "test:integration": "node --test test/integration.test.mjs test/vouchers.test.mjs test/customer-auth.test.mjs test/accounts-billing.test.mjs test/plugins.test.mjs test/developers.test.mjs test/lanehub-chain.test.mjs test/image-captcha.test.mjs"
+    "contracts": "node scripts/export-contracts.mjs",
+    "test": "node --test test/captcha.test.mjs test/core.test.mjs test/agent-protocols.test.mjs test/audio.test.mjs test/image-upload.test.mjs test/text-pricing.test.mjs test/model-catalog.test.mjs test/multi-upstream.test.mjs test/media-billing.test.mjs test/lanehub.test.mjs test/lanehub-charges.test.mjs test/lanehub-catalog.test.mjs test/media.test.mjs test/media-thumbs.test.mjs test/studio.test.mjs test/cases.test.mjs test/contracts.test.mjs test/avatar.test.mjs test/check-compose.test.mjs",
+    "test:integration": "node --test test/integration.test.mjs test/vouchers.test.mjs test/customer-auth.test.mjs test/accounts-billing.test.mjs test/plugins.test.mjs test/developers.test.mjs test/lanehub-chain.test.mjs test/image-captcha.test.mjs test/uploads.test.mjs test/studio-integration.test.mjs test/canvas-cases-integration.test.mjs test/admin-integration.test.mjs test/avatar-integration.test.mjs test/ops-integration.test.mjs"
   },
   "dependencies": {
     "better-auth": "1.7.2",

@@ -458,3 +458,249 @@ DO $$ BEGIN
 END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS wallet_entries_signup_bonus ON wallet_entries(user_id) WHERE source='signup_bonus';
 INSERT INTO schema_version(version) VALUES(17) ON CONFLICT DO NOTHING;
+
+-- v18: unified roles on customer (better-auth) accounts. No row = ordinary user;
+-- developer is still derived from developer_profiles.state='approved'.
+CREATE TABLE IF NOT EXISTS user_roles (
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role text NOT NULL CHECK (role IN ('admin','operator','viewer')),
+  granted_by uuid REFERENCES users(id),
+  granted_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, role)
+);
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS actor_user_id uuid REFERENCES users(id);
+INSERT INTO schema_version(version) VALUES(18) ON CONFLICT DO NOTHING;
+
+-- v19: media assets (private R2, keys u/{user_id}/{asset_id}/orig.{ext}), folders.
+CREATE TABLE IF NOT EXISTS media_assets (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid REFERENCES users(id) ON DELETE CASCADE,
+  kind text NOT NULL CHECK (kind IN ('image','video')),
+  source text NOT NULL CHECK (source IN ('upload','generation','case','poster')),
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','ready','failed','deleted')),
+  object_key text NOT NULL UNIQUE,
+  content_type text NOT NULL CHECK (content_type IN ('image/png','image/jpeg','image/webp','video/mp4')),
+  bytes bigint CHECK (bytes > 0 AND bytes <= 209715200),
+  sha256 text,
+  width int, height int, duration_ms int,
+  variants jsonb,
+  poster_id uuid REFERENCES media_assets(id),
+  task_id uuid REFERENCES media_tasks(id),
+  result_index int,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  deleted_at timestamptz,
+  thumb_state text NOT NULL DEFAULT 'none' CHECK (thumb_state IN ('none','queued','running','done','skipped','failed')),
+  thumb_attempts int NOT NULL DEFAULT 0,
+  thumb_next_at timestamptz,
+  thumb_error text
+);
+CREATE INDEX IF NOT EXISTS media_assets_user_recent ON media_assets (user_id, created_at DESC) WHERE status <> 'deleted';
+CREATE INDEX IF NOT EXISTS media_assets_pending ON media_assets (created_at) WHERE status = 'pending';
+-- running is included so a job lost to a crash/OOM is reclaimed once its lease (thumb_next_at) passes.
+CREATE INDEX IF NOT EXISTS media_assets_thumb_due ON media_assets (thumb_next_at) WHERE thumb_state IN ('queued','failed','running');
+CREATE TABLE IF NOT EXISTS asset_folders (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 60),
+  position double precision NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (user_id, name)
+);
+CREATE TABLE IF NOT EXISTS asset_folder_items (
+  folder_id uuid NOT NULL REFERENCES asset_folders(id) ON DELETE CASCADE,
+  asset_id uuid NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
+  position double precision NOT NULL DEFAULT 0,
+  PRIMARY KEY (folder_id, asset_id)
+);
+INSERT INTO schema_version(version) VALUES(19) ON CONFLICT DO NOTHING;
+
+-- v20: studio records, threads, queue, templates, subjects, favorites. Threads before records (FK).
+CREATE TABLE IF NOT EXISTS generation_threads (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title text NOT NULL DEFAULT '' CHECK (char_length(title) <= 80),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  deleted_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS generation_threads_user ON generation_threads (user_id, updated_at DESC) WHERE deleted_at IS NULL;
+-- requests has no body column, so prompt/params live here (user-facing), billing stays in requests/request_billing.
+CREATE TABLE IF NOT EXISTS generation_records (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  request_id uuid UNIQUE REFERENCES requests(id),
+  task_id uuid UNIQUE REFERENCES media_tasks(id),
+  batch_id uuid,
+  batch_position int CHECK (batch_position BETWEEN 0 AND 11),
+  anchor_record_id uuid REFERENCES generation_records(id),
+  parent_record_id uuid REFERENCES generation_records(id),
+  kind text NOT NULL CHECK (kind IN ('image','video')),
+  model text NOT NULL,
+  prompt text NOT NULL,
+  params jsonb NOT NULL DEFAULT '{}',
+  status text NOT NULL CHECK (status IN ('queued','running','succeeded','failed','cancelled')),
+  failure_code text,
+  charged_points numeric(20,8),
+  thread_id uuid REFERENCES generation_threads(id) ON DELETE SET NULL,
+  source text NOT NULL DEFAULT 'studio' CHECK (source IN ('studio','template','canvas')),
+  mentions jsonb NOT NULL DEFAULT '[]' CHECK (jsonb_typeof(mentions) = 'array' AND jsonb_array_length(mentions) <= 20),
+  prompt_doc jsonb CHECK (octet_length(prompt_doc::text) <= 100000), -- app caps JSON at 50KB; jsonb::text adds spaces
+  source_case_id text,
+  canvas_node jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  deleted_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS generation_records_user_recent ON generation_records (user_id, created_at DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS generation_records_thread ON generation_records (thread_id, created_at) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS generation_records_active ON generation_records (user_id) WHERE status IN ('queued','running');
+CREATE INDEX IF NOT EXISTS generation_records_batch ON generation_records (user_id, batch_id, batch_position);
+CREATE TABLE IF NOT EXISTS generation_references (
+  record_id uuid NOT NULL REFERENCES generation_records(id) ON DELETE CASCADE,
+  asset_id uuid NOT NULL REFERENCES media_assets(id),
+  position int NOT NULL,
+  PRIMARY KEY (record_id, position)
+);
+-- Results are media_assets rows found by task_id + result_index.
+CREATE UNIQUE INDEX IF NOT EXISTS media_assets_task_result ON media_assets (task_id, result_index) WHERE task_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS favorites (
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  target_type text NOT NULL CHECK (target_type IN ('case','asset')),
+  target_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, target_type, target_id)
+);
+CREATE TABLE IF NOT EXISTS composer_queues (
+  user_id uuid PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  items jsonb NOT NULL DEFAULT '[]',
+  revision int NOT NULL DEFAULT 1,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (jsonb_array_length(items) <= 12),
+  CHECK (octet_length(items::text) <= 200000)
+);
+CREATE TABLE IF NOT EXISTS user_templates (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 60),
+  cover_id uuid REFERENCES media_assets(id),
+  items jsonb NOT NULL,
+  variables jsonb NOT NULL DEFAULT '[]',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  deleted_at timestamptz,
+  CHECK (jsonb_array_length(items) BETWEEN 1 AND 12)
+);
+CREATE INDEX IF NOT EXISTS user_templates_user ON user_templates (user_id, updated_at DESC) WHERE deleted_at IS NULL;
+CREATE TABLE IF NOT EXISTS subjects (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 30),
+  kind text NOT NULL DEFAULT 'person' CHECK (kind IN ('person','character','product','object','scene')),
+  cover_id uuid REFERENCES media_assets(id),
+  note text CHECK (char_length(note) <= 500),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  deleted_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS subjects_user_name ON subjects (user_id, lower(name)) WHERE deleted_at IS NULL;
+CREATE TABLE IF NOT EXISTS subject_assets (
+  subject_id uuid NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
+  asset_id uuid NOT NULL REFERENCES media_assets(id),
+  position int NOT NULL,
+  PRIMARY KEY (subject_id, asset_id)
+);
+INSERT INTO schema_version(version) VALUES(20) ON CONFLICT DO NOTHING;
+
+-- v21: canvas projects, inspiration cases (case library).
+CREATE TABLE IF NOT EXISTS canvas_projects (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title text NOT NULL DEFAULT '未命名画布' CHECK (char_length(title) <= 80),
+  document jsonb NOT NULL, -- {version,nodes,edges,groups,viewport}; media only as media_assets ids
+  revision int NOT NULL DEFAULT 1,
+  thumb_id uuid REFERENCES media_assets(id),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  deleted_at timestamptz,
+  CHECK (octet_length(document::text) <= 2500000)
+);
+CREATE INDEX IF NOT EXISTS canvas_projects_user_recent ON canvas_projects (user_id, updated_at DESC) WHERE deleted_at IS NULL;
+-- Search is ILIKE over title/prompt/tags plus category filter: fine at ~1k rows. Add pg_trgm GIN indexes when it grows.
+CREATE TABLE IF NOT EXISTS inspiration_cases (
+  id text PRIMARY KEY CHECK (id ~ '^[A-Za-z0-9_-]{1,100}$'),
+  title text NOT NULL,
+  prompt text NOT NULL,
+  category text NOT NULL,
+  category_zh text,
+  tags text[] NOT NULL DEFAULT '{}',
+  model text,
+  params jsonb NOT NULL DEFAULT '{}',
+  template jsonb CHECK (template IS NULL OR (jsonb_typeof(template->'items') = 'array' AND jsonb_array_length(template->'items') BETWEEN 1 AND 12)),
+  cover_id uuid NOT NULL REFERENCES media_assets(id),
+  cover_source text, -- import source URL/path; re-import skips the fetch when unchanged
+  author text, author_url text, source_url text, source_repo text, license_note text,
+  status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','published','hidden')),
+  position double precision NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS inspiration_cases_feed ON inspiration_cases (status, category, position);
+CREATE INDEX IF NOT EXISTS inspiration_cases_all ON inspiration_cases (status, position, id);
+CREATE TABLE IF NOT EXISTS inspiration_case_references (
+  case_id text NOT NULL REFERENCES inspiration_cases(id) ON DELETE CASCADE,
+  asset_id uuid NOT NULL REFERENCES media_assets(id),
+  position int NOT NULL,
+  PRIMARY KEY (case_id, position)
+);
+CREATE INDEX IF NOT EXISTS asset_folder_items_asset ON asset_folder_items (asset_id);
+INSERT INTO schema_version(version) VALUES(21) ON CONFLICT DO NOTHING;
+
+-- v22: admin console (B5, docs/admin-api.md): list indexes for /api/admin/generations and /api/admin/audit,
+-- Idempotency-Key replay for POST /api/admin/cases (24h; a stale row is overwritten by the next use of the key).
+CREATE INDEX IF NOT EXISTS generation_records_recent ON generation_records (created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS generation_records_model_recent ON generation_records (model, created_at DESC);
+CREATE INDEX IF NOT EXISTS generation_records_status_recent ON generation_records (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS audit_events_actor ON audit_events (actor_user_id, id DESC) WHERE actor_user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS audit_events_target ON audit_events (target_id, id DESC);
+CREATE TABLE IF NOT EXISTS admin_idempotency (
+  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  key text NOT NULL,
+  fingerprint text NOT NULL,
+  case_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, key)
+);
+INSERT INTO schema_version(version) VALUES(22) ON CONFLICT DO NOTHING;
+
+-- v23: 数字人（HeyGen via lanehub）. Audio assets (mp3/wav, duration_ms measured server-side by ffprobe) and
+-- avatar subjects (HeyGen library reference in external_ref, or photo assets). CHECKs are replaced only while they lack
+-- the new values, so re-running does not rescan media_assets.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='media_assets'::regclass AND conname='media_assets_kind_check' AND pg_get_constraintdef(oid) LIKE '%audio%') THEN
+    ALTER TABLE media_assets DROP CONSTRAINT IF EXISTS media_assets_kind_check;
+    ALTER TABLE media_assets ADD CONSTRAINT media_assets_kind_check CHECK (kind IN ('image','video','audio'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='media_assets'::regclass AND conname='media_assets_content_type_check' AND pg_get_constraintdef(oid) LIKE '%audio/mpeg%') THEN
+    ALTER TABLE media_assets DROP CONSTRAINT IF EXISTS media_assets_content_type_check;
+    ALTER TABLE media_assets ADD CONSTRAINT media_assets_content_type_check
+      CHECK (content_type IN ('image/png','image/jpeg','image/webp','video/mp4','audio/mpeg','audio/wav','audio/x-wav'));
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='subjects'::regclass AND conname='subjects_kind_check' AND pg_get_constraintdef(oid) LIKE '%avatar%') THEN
+    ALTER TABLE subjects DROP CONSTRAINT IF EXISTS subjects_kind_check;
+    ALTER TABLE subjects ADD CONSTRAINT subjects_kind_check CHECK (kind IN ('person','character','product','object','scene','avatar'));
+  END IF;
+END $$;
+-- {provider:'heygen', avatar_id, name, preview_image_url, preview_video_url}; only for kind='avatar'.
+ALTER TABLE subjects ADD COLUMN IF NOT EXISTS external_ref jsonb
+  CHECK (external_ref IS NULL OR (jsonb_typeof(external_ref)='object' AND octet_length(external_ref::text) <= 8000));
+INSERT INTO schema_version(version) VALUES(23) ON CONFLICT DO NOTHING;
+
+-- v24: image archives give up permanently (state 'failed', last_error upstream_expired / attempts_exhausted) instead of retrying
+-- expired upstream result URLs forever. The CHECK is replaced only while it lacks 'failed'.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='image_archives'::regclass AND conname='image_archives_state_check' AND pg_get_constraintdef(oid) LIKE '%failed%') THEN
+    ALTER TABLE image_archives DROP CONSTRAINT IF EXISTS image_archives_state_check;
+    ALTER TABLE image_archives ADD CONSTRAINT image_archives_state_check CHECK (state IN ('pending','completed','failed'));
+  END IF;
+END $$;
+INSERT INTO schema_version(version) VALUES(24) ON CONFLICT DO NOTHING;
