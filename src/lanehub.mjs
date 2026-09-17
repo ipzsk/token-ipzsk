@@ -236,6 +236,16 @@ export async function creditAccount(db, lanehub, { userId, lanehubUserId, amount
   return { applied: true, quota };
 }
 
+/**
+ * 生成与报价共用的备号入口：保证用户有自己的 lanehub 令牌（报价按令牌档位算，必须先有）。
+ * 参数与生成入口原先内联的 provisionCustomer 调用逐字一致，汇率用配置值。
+ */
+export function ensureLanehubKey(db, options, user) {
+  const { lanehub, upstream, lanehubAccountId = null, lanehubSignupCny = 0, lanehubUsdCny = 0, lanehubQuotaPerUnit = 500_000 } = options;
+  return provisionCustomer(db, lanehub, upstream, { userId: user.id, name: user.name,
+    accountId: lanehubAccountId, signupCny: lanehubSignupCny, usdCnyRate: lanehubUsdCny, quotaPerUnit: lanehubQuotaPerUnit });
+}
+
 /** lanehub 模式开关。存在 settings 表里，切换脚本改它，网关每次请求读一次（带缓存）。 */
 export async function lanehubMode(db) {
   const row = (await db.query("SELECT value FROM app_settings WHERE key='lanehub_mode'")).rows[0];

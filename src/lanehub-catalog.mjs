@@ -1,4 +1,6 @@
 import { httpError } from './security.mjs';
+import { referencesFor } from './media-references.mjs';
+import { avatarCatalogSpec, AVATAR_MODES } from './avatar-contract.mjs';
 
 // 型号目录的真源在 lanehub（GET /api/catalog）：哪些型号能卖、什么价、收什么参数。
 // 这边不再维护 model-catalog.json 那份手抄快照——快照是第二份真源，上线当天就靠它把
@@ -7,8 +9,10 @@ import { httpError } from './security.mjs';
 // 失败语义照 lanehub 抓取脚本那套：拉不到 → 保留上一份（记时间），从没拉到过 → 明确 503，
 // 不回落到任何快照——回落的那份一定是旧的，而「旧目录」和「没目录」在客户端上长得一样。
 export class LanehubCatalog {
-  constructor(lanehub, { refreshMs = 600_000, log = () => {} } = {}) {
+  // onRefresh(data)：每次**成功**刷新后触发、不等待（server.mjs 用它预热数字人形象列表）；它失败只记日志。
+  constructor(lanehub, { refreshMs = 600_000, log = () => {}, onRefresh = null } = {}) {
     this.lanehub = lanehub;
+    this.onRefresh = onRefresh;
     this.refreshMs = refreshMs;
     this.log = log;
     this.data = null;
@@ -23,6 +27,7 @@ export class LanehubCatalog {
       this.data = data;
       this.fetchedAt = new Date();
       this.lastError = null;
+      Promise.resolve().then(() => this.onRefresh?.(data)).catch((e) => this.log({ err: e?.message }, 'lanehub_catalog_on_refresh_failed'));
     } catch (e) {
       this.lastError = e;
       this.log({ err: e?.message, stale_since: this.fetchedAt }, 'lanehub_catalog_refresh_failed');
@@ -43,6 +48,45 @@ export class LanehubCatalog {
     if (!this.data) throw httpError(503, 'catalog_unavailable');
     return desktopFromCatalog(this.data, new Set(this.data.models.map((m) => m.id)));
   }
+
+  /** 网页型号目录（ModelSpec[]）。按目录对象缓存：每次刷新换一份 data，缓存随之失效。 */
+  media() {
+    if (!this.data) throw httpError(503, 'catalog_unavailable');
+    if (this.mediaFor !== this.data) { this.mediaCache = mediaModelsFromCatalog(this.data); this.mediaFor = this.data; }
+    return this.mediaCache;
+  }
+}
+
+// 网页输入框可调的参数（canonical 字段 + flare 的 n）。参考图类字段不在这里，走 references。
+const STUDIO_PARAMS = { aspect_ratio: 'enum', resolution: 'enum', quality: 'enum', mode: 'enum', n: 'integer', duration: 'integer',
+  seed: 'integer', scale_by: 'integer', sound: 'boolean', enhance_prompt: 'boolean', negative_prompt: 'string' };
+
+// lanehub 目录 → 网页 ModelSpec。取值原样保留（flare 的 "1K" 不转小写）；目录不给默认值，
+// 比例优先 1:1，其余取第一个取值。
+export function mediaModelsFromCatalog(catalog) {
+  return catalog.models.filter((m) => ['image', 'video'].includes(m.kind) && typeof m.id === 'string').map((m) => {
+    const fields = m.params?.fields ?? [];
+    const supported = (name) => fields.some((f) => f.field === name && !f.unsupported);
+    const params = [];
+    for (const f of fields) {
+      const kind = STUDIO_PARAMS[f.field];
+      if (!kind || f.unsupported || params.some((p) => p.field === f.field)) continue;
+      const values = f.values?.length ? [...f.values] : undefined;
+      params.push({ field: f.field, type: values ? 'enum' : kind, ...(values ? { values } : {}),
+        default: values ? (f.field === 'aspect_ratio' && values.includes('1:1') ? '1:1' : values[0]) : null,
+        ...(f.field === 'duration' ? { unit: 's' } : {}) });
+    }
+    const references = referencesFor(m.id);
+    // 白名单已录入却不收 image_urls，或明确标了不支持：这个型号实际收不了参考图。
+    if (fields.some((f) => f.field === 'image_urls' && f.unsupported) || (m.params?.registered && !supported('image_urls'))) references.maxImages = 0;
+    if (supported('first_frame_image')) references.firstFrame = true;
+    if (supported('last_frame_image')) references.lastFrame = true;
+    const unsupported = {};
+    for (const f of fields) if (f.unsupported) unsupported[f.field] = f.unsupported;
+    const tiers = m.billing?.tiers ? Object.keys(m.billing.tiers) : undefined;
+    return { id: m.id, name: m.name || m.id, kind: m.kind, billing: { unit: m.billing?.unit ?? null, ...(tiers ? { tiers } : {}) },
+      params, references, unsupported, ...avatarCatalogSpec(m) }; // HeyGen: mode (+ avatar block for avatar / talking_photo)
+  });
 }
 
 // lanehub 目录 → 桌面端 bootstrap 的形状。纯函数，测试直接喂 fixture。
@@ -51,6 +95,9 @@ export function desktopFromCatalog(catalog, available, { defaultChatModel = proc
   // 就整个登录失败。这种型号这里直接不下发，而不是让客户端炸。
   const entries = catalog.models
     .filter((m) => available.has(m.id) && /^[a-zA-Z0-9._-]{1,128}$/.test(m.id) && typeof (m.name || m.id) === 'string')
+    // 数字人（avatar / talking_photo）不下发：它们不收 prompt（发了就是 avatar_prompt_not_supported），要的是 avatar_id /
+    // 照片 / script，而已发布的桌面端只会拿 params 里的 canonical 字段拼 prompt 请求。客户端支持这类输入前不进桌面目录。
+    .filter((m) => m.kind === 'chat' || !AVATAR_MODES.includes(avatarCatalogSpec(m).mode))
     .map((m) => {
       const params = paramsOf(m);
       const base = { id: m.id, name: m.name || m.id, kind: m.kind, params, unsupported: unsupportedOf(m) };

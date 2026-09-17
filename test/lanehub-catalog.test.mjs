@@ -60,3 +60,25 @@ test('失败语义：无目录 503，失败保留旧值', async () => {
   assert.equal(cat.data.models.length, 6, "拉失败要保留上一份");
   assert.ok(cat.lastError, '失败要记下来，不能和刚刷新过长得一样');
 });
+
+// 数字人型号不进桌面目录：客户端只拿 canonical params 拼 prompt 请求，数字人不收 prompt。
+test('桌面目录排除 avatar / talking_photo 型号', () => {
+  const heygen = { models: [...fixture.models,
+    { id: 'heygen-avatar', kind: 'video', mode: 'avatar', inputs: { required: ['avatar_id'] }, params: { registered: true, passthrough: ['avatar_id', 'script'], fields: [] } },
+    { id: 'heygen-image', kind: 'video', params: { registered: true, passthrough: ['script'], fields: [{ field: 'image_urls' }] } },
+  ] };
+  const out = desktopFromCatalog(heygen, new Set(heygen.models.map((m) => m.id)));
+  assert.deepEqual(out.video_models.map((m) => m.id), ['seedance-2.0']);
+  assert.ok(out.video_models.every((m) => m.params[0].field === 'prompt' && m.params[0].required));
+});
+
+test('onRefresh：成功刷新后触发且不阻塞，失败只记日志；拉取失败不触发', async () => {
+  let fail = false; const seen = [], logs = [];
+  const lanehub = { call: async () => { if (fail) throw new Error('down'); return fixture; } };
+  const cat = new LanehubCatalog(lanehub, { log: (o, msg) => logs.push(msg), onRefresh: async (data) => { seen.push(data); throw new Error('warm failed'); } });
+  await cat.refresh();
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual([seen.length, logs], [1, ['lanehub_catalog_on_refresh_failed']]);
+  fail = true; await cat.refresh(); await new Promise((r) => setImmediate(r));
+  assert.equal(seen.length, 1);
+});

@@ -28,7 +28,19 @@ export function quotaToCny(quota, usdCnyRate, quotaPerUnit) {
  * 查不到日志有两种情况，必须分开：请求失败根本没扣过钱（写 released，终止重试），
  * 和日志还没落库（什么都不做，下一轮再来）。不分开的话，前者会被永远重查。
  */
-export async function recordLanehubCharge(db, lanehub, row, { usdCnyRate, quotaPerUnit, staleAfterMs = 600_000 }) {
+// 账单行落定后同步到生成记录（点 = 元 × 100，numeric 精确运算）。没有记录的请求是 no-op。
+export async function syncChargedPoints(db, requestId) {
+  await db.query(`UPDATE generation_records g SET charged_points=b.charged_cny*100,updated_at=now() FROM request_billing b
+    WHERE b.request_id=$1 AND g.request_id=$1 AND g.charged_points IS NULL AND b.charged_cny IS NOT NULL`, [requestId]);
+}
+
+export async function recordLanehubCharge(db, lanehub, row, options) {
+  const outcome = await recordLanehubBilling(db, lanehub, row, options);
+  if (outcome !== 'pending') await syncChargedPoints(db, row.id);
+  return outcome;
+}
+
+async function recordLanehubBilling(db, lanehub, row, { usdCnyRate, quotaPerUnit, staleAfterMs = 600_000 }) {
   // 任务失败/取消时 lanehub 已经把钱退给用户了，但它退款写的是一条**系统日志**，
   // 原来那条消费日志还在、quota 还是全额。照着日志记账会把一笔已退款的失败任务
   // 算成正常收入，还据此给插件作者计提分成——用户的钱退了，账面却还在。

@@ -1,13 +1,15 @@
 import { bool, chat, integer, text } from './validation.mjs';
 import { httpError } from './security.mjs';
+import { avatarLaneRequest } from './avatar-contract.mjs';
 
-export function agentRequest(path, body) {
+// avatarSpec：目录里 mode 为 avatar / talking_photo 的型号（{mode, avatar}）。只有它不收 prompt，改按 lanehub 字段名校验。
+export function agentRequest(path, body, avatarSpec = null) {
   if (path === '/v1/chat/completions') return chat(body);
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw httpError(400,'invalid_request');
   text(body.model,128);
   if (body.stream !== undefined) bool(body.stream);
   if (['/v1/images/generations','/v1/videos/generations'].includes(path)) {
-    text(body.prompt,32000);
+    if(avatarSpec&&path==='/v1/videos/generations')avatarLaneRequest(body,avatarSpec);else text(body.prompt,32000);
     if(body.stream)throw httpError(400,'media_uses_task_polling');
     if(body.n!==undefined)integer(body.n,1,4);
     if(body.image_urls!==undefined&&(!Array.isArray(body.image_urls)||body.image_urls.length>15||body.image_urls.some(url=>typeof url!=='string')))throw httpError(400,'invalid_reference_images');

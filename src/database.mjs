@@ -32,6 +32,9 @@ export function database(config) {
     async recover() {
       await pool.query(`UPDATE requests SET status='uncertain',usage_state='unknown',
         error_code='process_restarted',completed_at=now() WHERE status IN ('queued','running')`);
+      // 提交途中重启的记录永远拿不到任务，不收口会一直占着「进行中 ≤24」的名额。
+      await pool.query(`UPDATE generation_records SET status='failed',failure_code='process_restarted',updated_at=now()
+        WHERE status IN ('queued','running') AND task_id IS NULL`);
       // 视频的冻结要持续到上游任务终态（几分钟），不是一次 HTTP 请求（几秒）。
       // 还在跑的媒体任务保持 reserved，由 syncMediaTasks 到终态时结算；
       // 无条件转 pending 会让每次部署都把在途视频打成待人工核销，且之后永不自动结算。

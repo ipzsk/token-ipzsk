@@ -1,7 +1,8 @@
 import { refreshMediaTask } from './media-task-sync.mjs';
 import { publicImageTask, imageUrls, fetchResultImage } from './image-results.mjs';
 import { adaptModelRequest } from './model-catalog.mjs';
-import { lanehubMode, provisionCustomer } from './lanehub.mjs';
+import { lanehubMode, ensureLanehubKey } from './lanehub.mjs';
+import { prepareStudioGeneration, insertGenerationRecord } from './studio.mjs';
 import { reserveRequest, settleRequest, requestCharge, points, units, decimal } from './billing.mjs';
 import { uploadImageReferences } from './image-references.mjs';
 import { workspaceChat } from './workspace.mjs';
@@ -15,10 +16,11 @@ import { hash, httpError, RateLimiter } from './security.mjs';
 import { UsageReader, extractUsage, extractBillingUsage } from './usage.mjs';
 import { estimateTextCost, prices } from './text-pricing.mjs';
 import { agentRequest, agentResponse, agentHeaders } from './agent-protocols.mjs';
-import { uuid } from './validation.mjs';
+import { uuid, stable } from './validation.mjs';
 import { listRequests } from './admin.mjs';
 import { audioRequest } from './audio.mjs';
 import { imageUpload } from './image-upload.mjs';
+import { avatarSubmitError } from './avatar-contract.mjs';
 
 async function boundedJson(response, max = 8_000_000) {
   const chunks = []; let size = 0;
@@ -29,21 +31,25 @@ async function boundedJson(response, max = 8_000_000) {
   }
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
-function stable(value) {
-  if (Array.isArray(value)) return value.map(stable);
-  if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map((k) => [k, stable(value[k])]));
-  return value;
-}
 // 只有上游明确拒绝执行才换渠道：429 限流、401/403 鉴权、402 余额。
 // 5xx 说明请求已经到过上游，可能已经建了媒体任务只是回包失败，重发就是第二笔计费。
 const retryableStatus = (status) => [401,402,403,429].includes(status);
 // 连接阶段就失败，说明请求没有到达上游。ECONNRESET 等中途错误不在其列。
 const connectFailed = (error) => ['ECONNREFUSED','ENOTFOUND','EAI_AGAIN'].includes(error?.cause?.code);
-export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, origin, imageStorage = null, lanehub = null, lanehubAccountId = null,
+export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, origin, imageStorage = null, lanehub = null, lanehubCatalog = null, lanehubAccountId = null,
   lanehubSignupCny = 0, lanehubUsdCny = 0, lanehubQuotaPerUnit = 500_000, requestTimeoutMs = 180_000, maxAttempts = 3 }) {
   const limiter = new RateLimiter();
+  const lanehubOptions = { lanehub, upstream, lanehubAccountId, lanehubSignupCny, lanehubUsdCny, lanehubQuotaPerUnit };
   app.decorateRequest('apiUser', null);
   app.addHook('onRequest', async (req) => {
+    // 管理中台（docs/admin-api.md §0）：只认 cookie 会话，不接受 Bearer；角色与 12 小时时效由各路由的 requireRole 判定。
+    if (req.url.startsWith('/api/admin/')) {
+      if(!['GET','HEAD'].includes(req.method)&&![origin,customerOrigin].includes(req.headers.origin))throw httpError(403,'origin_not_allowed');
+      if(!customerAuth)throw httpError(401,'customer_login_required');
+      req.apiUser=await customerAuth.identify(req.headers);
+      limiter.take('all:'+req.apiUser.id,120);
+      return;
+    }
     // /api/videos/* 是官网视频页的入口（Bearer 令牌），鉴权与 /v1/* 同一套。
     if (!req.url.startsWith('/v1/') && !req.url.startsWith('/api/me/') && !req.url.startsWith('/api/videos/')) return;
     if(req.url.startsWith('/api/me/')&&!req.headers.authorization&&customerAuth){
@@ -122,7 +128,7 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     if(!['/v1/audio/transcriptions','/v1/images/edits','/v1/images/generations','/api/me/images/generations'].includes(req.url.split('?')[0]))return done(httpError(415,'unsupported_content_type'));
     done(null,body);
   });
-  for (const routePath of ['/api/me/workspace/chat','/api/me/chat/completions','/api/me/image-prompt','/api/me/images/generations','/api/videos/generations','/v1/chat/completions','/v1/responses','/v1/messages','/v1/images/generations','/v1/images/edits','/v1/videos/generations','/v1/audio/transcriptions']) app.post(routePath, {bodyLimit:routePath==='/v1/audio/transcriptions'?26_000_000:32_000_000}, async (req, reply) => {
+  for (const routePath of ['/api/me/workspace/chat','/api/me/chat/completions','/api/me/image-prompt','/api/me/images/generations','/api/me/videos/generations','/api/videos/generations','/v1/chat/completions','/v1/responses','/v1/messages','/v1/images/generations','/v1/images/edits','/v1/videos/generations','/v1/audio/transcriptions']) app.post(routePath, {bodyLimit:routePath==='/v1/audio/transcriptions'?26_000_000:32_000_000}, async (req, reply) => {
     // /api/me/* 是官网走 cookie 会话的入口；形状与 /v1/* 相同，只是多了几步网页专属的预处理。
     const webPrompt=routePath==='/api/me/image-prompt';
     if(webPrompt){
@@ -140,14 +146,27 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       if(!Number.isSafeInteger(policy_version)||(budget_cny!==null&&(typeof budget_cny!=='string'||!/^\d{1,10}\.\d{8}$/.test(budget_cny))))throw httpError(400,'workspace_quote_required');
       req.body=workspaceChat(req.body);
     }
-    const path=workspace||webPrompt||routePath==='/api/me/chat/completions'?'/v1/chat/completions':['/v1/images/edits','/api/me/images/generations'].includes(routePath)?'/v1/images/generations':routePath==='/api/videos/generations'?'/v1/videos/generations':routePath;
+    const path=workspace||webPrompt||routePath==='/api/me/chat/completions'?'/v1/chat/completions':['/v1/images/edits','/api/me/images/generations'].includes(routePath)?'/v1/images/generations':['/api/videos/generations','/api/me/videos/generations'].includes(routePath)?'/v1/videos/generations':routePath;
+    // 网页（cookie 会话）的生图/生视频：限流、studio 字段校验、参考素材 id → 预签名 URL。全部在建 requests 之前，4xx 不留记录。
+    let studio=null;
+    // 幂等指纹用客户端原样的 body（素材 id），不用解析后带每次都变的预签名 URL 的上游 body。
+    const clientBody=req.body;
+    if(['/api/me/images/generations','/api/me/videos/generations'].includes(routePath)&&req.apiUser.session_id){
+      limiter.take('generate:'+req.apiUser.id,30);
+      studio=await prepareStudioGeneration(db,{imageStorage,lanehubCatalog},req.apiUser,path==='/v1/images/generations'?'image':'video',req.body);
+      if(studio)req.body=studio.body;
+    }
     const image=path==='/v1/images/generations'&&Buffer.isBuffer(req.body)?await imageUpload(req.body,req.headers['content-type']):null;
     if(routePath==='/v1/images/edits'&&!image)throw httpError(400,'invalid_image_upload');
     const audio=path==='/v1/audio/transcriptions'?await audioRequest(req.body,req.headers['content-type']):null;
     // requested 是归一后、尚未按上游参数名改写的 body。计价档位只能从它解析：
     // adaptModelRequest 之后键名已经是上游的，resolveTier 认的是内部名，
     // 拿上游 body 去解析档位会在第一个真正改名的型号上静默回落到最便宜档。
-    const requested = audio?.metadata??agentRequest(path,image??req.body);
+    // 数字人 body 已由 prepareStudioGeneration 整形（script/audio_url，没有 prompt），不走 prompt 必填那道校验。
+    // Bearer 客户端调数字人型号：不要 prompt，直接用 lanehub 字段名（avatar_id / script / audio_url / image_urls …）。
+    const catalogSpec=!studio&&path==='/v1/videos/generations'&&typeof req.body?.model==='string'&&lanehubCatalog?.data?lanehubCatalog.media().find((m)=>m.id===req.body.model):undefined;
+    const avatarSpec=catalogSpec?.avatar?catalogSpec:null;
+    const requested = audio?.metadata??(studio?.avatar?{...req.body,stream:false}:agentRequest(path,image??req.body,avatarSpec));
     // lanehub 模式下**不做字段适配**：canonical 契约本来就是干这件事的，
     // 两层都改名等于改两次，而第二次改的是它不认识的键。
     const viaLanehub = Boolean(lanehub) && await lanehubMode(db);
@@ -191,10 +210,14 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     if (idempotency !== null && (typeof idempotency !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(idempotency))) {
       throw httpError(400,'invalid_idempotency_key');
     }
-    const fingerprint = hash(JSON.stringify(stable({path,body,...(plugin?{plugin_id:plugin.id}:{})})));
-    const inserted = await db.query(`INSERT INTO requests (id,user_id,model,idempotency_key,fingerprint,stream,access_token_id,plugin_id,plugin_publisher_ref,plugin_owner_user_id,plugin_share_bps)
+    const fingerprint = hash(JSON.stringify(stable({path,body:studio?clientBody:body,...(plugin?{plugin_id:plugin.id}:{})})));
+    const insertRequest = (c) => c.query(`INSERT INTO requests (id,user_id,model,idempotency_key,fingerprint,stream,access_token_id,plugin_id,plugin_publisher_ref,plugin_owner_user_id,plugin_share_bps)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(user_id,idempotency_key) DO NOTHING RETURNING id`,
     [id,req.apiUser.id,body.model,idempotency,fingerprint,body.stream,req.apiUser.token_id,plugin?.id??null,plugin?.publisher_ref??null,plugin?.owner_user_id??null,plugin?.revenue_share_bps??null]);
+    // 生成记录与 requests 同一事务：进行中超限（429）会连同 requests 一起回滚。
+    const inserted = studio
+      ? await db.tx(async (c) => { const r = await insertRequest(c); if (r.rowCount) await insertGenerationRecord(c,id,req.apiUser.id,studio.record); return r; })
+      : await insertRequest(db);
     if (!inserted.rowCount) {
       const old = (await db.query('SELECT id,fingerprint,status FROM requests WHERE user_id=$1 AND idempotency_key=$2',
         [req.apiUser.id,idempotency])).rows[0];
@@ -226,6 +249,8 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
         // skill 计提只认**真正跑成**的请求：没发出去的（参数错、余额不足）和中途断流的
         // 都不算一次调用——断流那次用户什么都没拿到，不该给作者记一笔。
         if(status==='succeeded')await recordSkillInvocations(c,id,skillRefs);
+        else if(studio)await c.query(`UPDATE generation_records SET status='failed',failure_code=$2,updated_at=now()
+          WHERE request_id=$1 AND status IN ('queued','running')`,[id,errorCode??status]);
         if (attemptId) await c.query(`UPDATE request_attempts SET upstream_id=$2,http_status=$3,error_code=$4,
           usage=$5,completed_at=now() WHERE id=$1`, [attemptId,upstreamId ?? null,httpStatus ?? null,errorCode,usage ? JSON.stringify(usage) : null]);
       });
@@ -243,11 +268,10 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       // lanehub 模式：这个客户自己的令牌就是唯一的候选，且**只打一次**。
       // 不换线是对面的硬约束（换线会改变这一单的价钱），这边再换一层等于把它破掉。
       const lanehubRow = viaLanehub
-        ? (await provisionCustomer(db, lanehub, upstream, { userId: req.apiUser.id, name: req.apiUser.name,
-            accountId: lanehubAccountId, signupCny: lanehubSignupCny, usdCnyRate: lanehubUsdCny, quotaPerUnit: lanehubQuotaPerUnit }))
+        ? await ensureLanehubKey(db, lanehubOptions, req.apiUser)
         : null;
       const attempts = viaLanehub ? 1 : maxAttempts;
-      const skip = []; let response = null, failure = null;
+      const skip = []; let response = null, failure = null, avatarError = null;
       for (let attempt = 0; attempt < attempts; attempt++) {
         // 只有第一次没渠道才是 503；换渠道时拿不到别的 key 就沿用上一次的失败结果。
         const next = lanehubRow
@@ -303,10 +327,14 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
         const keepUpstreamId = viaLanehub;
         if (response?.ok) { failure = null; break; }
         if (response) {
-          await response.body?.cancel();
+          // 数字人：lanehub 的用户侧业务码（无人脸 / 需授权 / 审核不过…）翻成明确的用户码，而不是 upstream_http_400。
+          const upstreamError = (studio?.avatar || avatarSpec) && response.status >= 400 && response.status < 500 && ![401,402,403,429].includes(response.status)
+            ? await response.json().catch(() => null) : null;
+          avatarError = avatarSubmitError(upstreamError);
+          if (!upstreamError) await response.body?.cancel();
           await upstream.markFailure(lease.row,response.status,response.headers.get('retry-after'));
         }
-        failure = response ? `upstream_http_${response.status}` : 'upstream_connect_failed';
+        failure = avatarError?.code ?? (response ? `upstream_http_${response.status}` : 'upstream_connect_failed');
         // lanehub 那条线一律不换（上面 attempts=1 已经保证，这里是第二道闸）
         if (viaLanehub || (response && !retryableStatus(response.status))) break;
         skip.push(lease.row.id);
@@ -316,6 +344,7 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       if (failure) {
         await finalize('failed',null,failure);
         cleanup();
+        if (avatarError) return reply.code(400).send({ error: { code:failure,message:avatarError.message,...(avatarError.field?{field:avatarError.field}:{}),request_id:id } });
         return reply.code(httpStatus === 429 ? 429 : 502).send({ error: { code:failure,message:'Upstream request failed.',request_id:id } });
       }
       if (body.stream) {
@@ -370,7 +399,10 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
         const taskId=value.data[0].task_id;
         // 任务 id 另有 media_tasks.upstream_task_id 存着，这里不会丢。
         if(!viaLanehub)upstreamId=taskId;
-        await db.query('INSERT INTO media_tasks(id,upstream_task_id,kind) VALUES($1,$2,$3)',[id,taskId,path.includes('/images/')?'image':'video']);
+        await db.tx(async (c) => {
+          await c.query('INSERT INTO media_tasks(id,upstream_task_id,kind) VALUES($1,$2,$3)',[id,taskId,path.includes('/images/')?'image':'video']);
+          if(studio)await c.query('UPDATE generation_records SET task_id=$1,updated_at=now() WHERE request_id=$1',[id]);
+        });
         await finalize('succeeded',null);
         cleanup();
         return reply.send({code:200,data:[{status:'submitted',task_id:id}]});
