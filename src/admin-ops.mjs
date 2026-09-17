@@ -34,16 +34,21 @@ function strParam(q, name, max = 200) {
 
 // ── 纯变换 ────────────────────────────────────────────────────────────────
 export const usdToCny = (usd, rate) => Math.round(num(usd) * num(rate) * 1e6) / 1e6;
+// 上游余额口径（lanehub balance_unit）：USD 换算、CNY 原样、raw（各家点数，未核实）不猜，balance_cny 为 null。
+const UNITS = ['USD', 'CNY', 'raw'];
+export const unitOf = (u) => (UNITS.includes(u) ? u : 'raw');
+export const balanceCny = (raw, unit, rate) => (raw === null ? null : unit === 'USD' ? usdToCny(raw, rate) : unit === 'CNY' ? raw : null);
 export const quotaCny = (quota, rate, perUnit) => Number(quotaToCny(Math.trunc(num(quota)), rate, perUnit));
 
 function laneChannel(c, rate) {
   const checked = num(c.balance_updated_time) || null;
   const supported = c.balance_supported ?? true;
+  const unit = unitOf(c.balance_unit), raw = supported && checked ? num(c.balance) : null;
   return {
     id: c.id, name: String(c.name ?? ''), type: num(c.type), status: num(c.status), priority: num(c.priority), weight: num(c.weight, 1),
     lanes: Array.isArray(c.lanes) ? c.lanes.map(String) : [], vendor: String(c.vendor ?? ''),
-    // 余额是 lanehub channels.balance 的缓存（美元口径），从没查过就是 null，不是 0。
-    balance_cny: supported && checked ? usdToCny(c.balance, rate) : null, balance_checked_at: checked, balance_supported: supported,
+    // 余额是 lanehub channels.balance 的缓存，从没查过就是 null，不是 0。
+    balance_cny: balanceCny(raw, unit, rate), balance_checked_at: checked, balance_raw: raw, balance_unit: unit, balance_supported: supported,
   };
 }
 const priceOf = (p) => (p ? { unit: String(p.unit ?? ''), cny: num(p.cny), source: PRICE_SOURCES.includes(p.source) ? p.source : 'fallback' } : null);
@@ -77,7 +82,7 @@ export function channelSummary(c, meta, rate, perUnit) {
   return {
     ...laneChannel({ id: c.id, name: c.name, type: c.type, status: c.status, priority: c.priority, weight: c.weight,
       lanes: group.split(',').map((g) => g.trim()).filter((g) => meta.lanes.has(g)), vendor: type?.vendor,
-      balance: c.balance, balance_updated_time: c.balance_updated_time, balance_supported: type?.balance_supported }, rate),
+      balance: c.balance, balance_updated_time: c.balance_updated_time, balance_supported: type?.balance_supported, balance_unit: type?.balance_unit }, rate),
     group, tag: String(c.tag ?? ''), models_count: models.length, used_cny: quotaCny(c.used_quota, rate, perUnit), created_at: num(c.created_time),
   };
 }
@@ -131,14 +136,15 @@ export function adminOpsRoutes(app, options) {
     }
   };
 
-  // 渠道列表没有 vendor / balance_supported / 档位集合：从最近一次线路矩阵里按渠道类型取，进程内缓存 10 分钟。
+  // 渠道列表 / 探测没有 vendor / balance_supported / balance_unit / 档位集合：从最近一次线路矩阵里按渠道类型取，进程内缓存 10 分钟。
   let meta = null;
   const remember = (d) => {
-    const types = new Map();
+    const types = new Map(), channelTypes = new Map();
     for (const r of d.rows ?? []) for (const c of [...(r.channels ?? []), ...Object.values(r.cells ?? {}).flatMap((x) => x?.channels ?? [])]) {
-      if (!types.has(num(c.type))) types.set(num(c.type), { vendor: c.vendor, balance_supported: c.balance_supported });
+      channelTypes.set(c.id, num(c.type));
+      if (!types.has(num(c.type))) types.set(num(c.type), { vendor: c.vendor, balance_supported: c.balance_supported, balance_unit: c.balance_unit });
     }
-    meta = { at: Date.now(), lanes: new Set((d.lanes ?? []).map((l) => l.symbol)), types };
+    meta = { at: Date.now(), lanes: new Set((d.lanes ?? []).map((l) => l.symbol)), types, channelTypes };
   };
   const channelMeta = async () => {
     if (!meta || Date.now() - meta.at > META_TTL_MS) remember(await call('/api/lane_matrix'));
@@ -197,9 +203,13 @@ export function adminOpsRoutes(app, options) {
       out = { state: NO_BALANCE_API.test(message) ? 'unsupported' : 'failed', balance: null, message };
     }
     const latency_ms = Date.now() - started;
-    const probe = { channel_id: id, state: out.state, balance_cny: out.state === 'ok' ? usdToCny(out.balance, await rate()) : null,
+    // 渠道不在线路矩阵里（没挂任何档位）就不知道类型，按 raw 处理。
+    const m = await channelMeta();
+    const unit = unitOf(m.types.get(m.channelTypes.get(id))?.balance_unit);
+    const raw = out.state === 'ok' ? num(out.balance) : null;
+    const probe = { channel_id: id, state: out.state, balance_cny: balanceCny(raw, unit, await rate()), balance_raw: raw, balance_unit: unit,
       latency_ms, message: out.message, checked_at: unix() };
-    await audit(req, 'ops.channel.probe', String(id), { state: probe.state, latency_ms, balance_cny: probe.balance_cny, message: probe.message || undefined });
+    await audit(req, 'ops.channel.probe', String(id), { state: probe.state, latency_ms, balance_raw: raw, balance_unit: unit, balance_cny: probe.balance_cny, message: probe.message || undefined });
     return probe;
   });
 
@@ -247,7 +257,8 @@ export function adminOpsRoutes(app, options) {
 const { string, number, boolean, int, lit, array, object, nullable, record, ref, opt } = t;
 const laneChannelProps = {
   id: int(1), name: string, type: int(0), status: lit(1, 2, 3), priority: number, weight: number, lanes: array(string), vendor: string,
-  balance_cny: nullable(number), balance_checked_at: nullable(int(0)), balance_supported: boolean,
+  balance_cny: nullable(number), balance_checked_at: nullable(int(0)),
+  balance_raw: nullable(number), balance_unit: lit('USD', 'CNY', 'raw'), balance_supported: boolean,
 };
 const logQuery = { start: opt(int(0)), end: opt(int(0)), model: opt(string), username: opt(string), channel_id: opt(int(1)), request_id: opt(string),
   upstream_request_id: opt(string), type: opt(lit(1, 2, 3, 4)) };
@@ -271,7 +282,8 @@ Object.assign(schemas, {
   ChannelSummary: object({ ...laneChannelProps, group: string, tag: string, models_count: int(0), used_cny: number, created_at: int(0) }),
   OpsChannelQuery: object({ page: opt(int(1)), size: opt(int(1, 100)), status: opt(int(1, 3)), type: opt(int(0)), group: opt(string), keyword: opt(string) }),
   OpsChannelPage: object({ items: array(ref('ChannelSummary')), page: int(1), size: int(1), total: int(0) }),
-  Probe: object({ channel_id: int(1), state: lit('ok', 'unsupported', 'failed'), balance_cny: nullable(number), latency_ms: int(0), message: string, checked_at: int(0) }),
+  Probe: object({ channel_id: int(1), state: lit('ok', 'unsupported', 'failed'), balance_cny: nullable(number),
+    balance_raw: nullable(number), balance_unit: lit('USD', 'CNY', 'raw'), latency_ms: int(0), message: string, checked_at: int(0) }),
   OpsRealtime: object({ rpm: number, tpm: number, cost_per_min_cny: number }),
   OpsPeriodQuery: object({ start: int(0), end: int(0), group_by: opt(lit('model', 'channel')), channel_id: opt(int(1)), model: opt(string) }),
   OpsPeriod: object({ rows: array(object({ date: string, key: string, requests: int(0), amount_cny: number, cost_cny: number, prompt_tokens: int(0),

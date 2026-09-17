@@ -12,16 +12,17 @@ const leaks = (v) => JSON.stringify(v).match(new RegExp(`"(${SECRET_KEYS.join('|
 const secrets = { key: 'sk-secret', proxy: 'socks5://x', header_override: '{"a":1}', model_headers: 'h', custom_parameter: '{}', plugin: {}, other: 'o',
   base_url: 'https://up.example', metadata: { m: 1 }, source_ip: '1.2.3.4' };
 const ch = (id, extra = {}) => ({ id, name: 'ch' + id, priority: 10, weight: 1, status: 1, type: 63, lanes: ['official'], vendor: 'APIMart',
-  vendor_icon: 'data:image/png;base64,AAA', tested_at: 0, latency_ms: 0, disabled: false, balance: 2, balance_updated_time: 1700000000, balance_supported: true,
+  vendor_icon: 'data:image/png;base64,AAA', tested_at: 0, latency_ms: 0, disabled: false, balance: 2, balance_updated_time: 1700000000, balance_supported: true, balance_unit: 'USD',
   price: { type: 'times', source: 'row', usd: 0.03, cny: 0.2, unit: 'per_call', tier: '', tiers: [] }, ...secrets, ...extra });
 const MATRIX = {
   lanes: [{ symbol: 'cheap', name: '低价', ratio: 0.8 }, { symbol: 'official', name: '官方', ratio: 1 }], auto_chain: ['official', 'cheap'],
   scenario: { resolution: '1080p', duration: 5 }, usd_rate: 7,
   rows: [
     { model: 'seedream', vendors: ['APIMart'], vendor_icons: { APIMart: 'data:image/png;base64,AAA', Fal: 'data:fal' }, modalities: ['image'],
-      channels: [ch(1), ch(2, { type: 99, vendor: 'Fal', balance_supported: false, lanes: ['cheap'], price: null })],
-      cells: { official: { channels: [ch(1)] }, cheap: { channels: [ch(2, { type: 99, vendor: 'Fal', balance_supported: false, lanes: ['cheap'] })] } } },
-    { model: 'kling', vendors: ['APIMart'], modalities: ['video'], channels: [ch(1, { price: { source: 'borrowed', cny: 1.5, unit: 'per_second' } })],
+      channels: [ch(1), ch(2, { type: 99, vendor: 'Fal', balance_supported: false, balance_unit: 'raw', lanes: ['cheap'], price: null })],
+      cells: { official: { channels: [ch(1)] }, cheap: { channels: [ch(2, { type: 99, vendor: 'Fal', balance_supported: false, balance_unit: 'raw', lanes: ['cheap'] })] } } },
+    { model: 'kling', vendors: ['APIMart'], modalities: ['video'], channels: [ch(1, { price: { source: 'borrowed', cny: 1.5, unit: 'per_second' } }), ch(3, { type: 28, balance: 50, balance_unit: 'CNY' }),
+        ch(4, { type: 64, balance: 123.4, balance_unit: 'raw' }), ch(5, { type: 77, balance: 9, balance_unit: undefined })],
       cells: { official: { channels: [ch(1)] } } },
   ],
 };
@@ -67,11 +68,14 @@ test('lane matrix: channels deduped, cells keep order, prices per row, icons top
   shape('LaneMatrix', m);
   assert.deepEqual(calls.find((c) => c.key === 'GET /api/lane_matrix').query, { resolution: '1080p', duration: '5' });
   assert.deepEqual(m.lanes.map((l) => l.symbol), ['official', 'cheap'], 'auto chain order');
-  assert.deepEqual(Object.keys(m.channels), ['1', '2']);
+  assert.deepEqual(Object.keys(m.channels), ['1', '2', '3', '4', '5']);
+  const bal = (id) => [m.channels[id].balance_cny, m.channels[id].balance_raw, m.channels[id].balance_unit];
+  assert.deepEqual([bal(1), bal(2), bal(3), bal(4), bal(5)],
+    [[14, 2, 'USD'], [null, null, 'raw'], [50, 50, 'CNY'], [null, 123.4, 'raw'], [null, 9, 'raw']], 'USD×rate, CNY as is, raw/missing never guessed');
   assert.deepEqual(m.rows[0].cells, { official: { channel_ids: [1] }, cheap: { channel_ids: [2] } });
   assert.deepEqual(m.rows[0].channel_ids, [1, 2]);
   assert.deepEqual(m.rows[0].prices, { 1: { unit: 'per_call', cny: 0.2, source: 'row' }, 2: null });
-  assert.deepEqual(m.rows[1].prices, { 1: { unit: 'per_second', cny: 1.5, source: 'borrowed' } });
+  assert.deepEqual(m.rows[1].prices[1], { unit: 'per_second', cny: 1.5, source: 'borrowed' });
   assert.deepEqual(m.vendor_icons, { APIMart: 'data:image/png;base64,AAA', Fal: 'data:fal' });
   assert.equal(m.channels[1].balance_cny, 14);
   assert.equal(m.channels[1].balance_checked_at, 1700000000);
@@ -91,8 +95,8 @@ test('channels: explicit allowlist, lanes/vendor/balance_supported from matrix c
   assert.deepEqual(calls.find((c) => c.key === 'GET /api/channel/').query, { page: '1', size: '20', status: '1', name: 'fal' });
   assert.deepEqual(leaks(body), []);
   assert.deepEqual(body.items[0], { id: 2, name: 'fal-1', type: 99, status: 1, priority: 5, weight: 3, lanes: ['cheap'], vendor: 'Fal', balance_cny: null,
-    balance_checked_at: null, balance_supported: false, group: 'default,cheap', tag: 't', models_count: 3, used_cny: 14, created_at: 1690000000 });
-  assert.equal(body.items[1].balance_supported, true, 'unknown type → true');
+    balance_checked_at: null, balance_raw: null, balance_unit: 'raw', balance_supported: false, group: 'default,cheap', tag: 't', models_count: 3, used_cny: 14, created_at: 1690000000 });
+  assert.deepEqual([body.items[1].balance_supported, body.items[1].balance_unit], [true, 'raw'], 'unknown type → supported, raw');
   assert.equal(body.total, 2);
 });
 
@@ -111,7 +115,7 @@ test('probe: ok / unsupported / failed mapping, audited', async () => {
     4: { success: false, message: 'invalid api key', balance_state: 'available' },
   };
   const { app, audits } = setup({ handlers: { 'GET /api/channel/update_balance/1': () => replies[1], 'GET /api/channel/update_balance/2': () => replies[2],
-    'GET /api/channel/update_balance/3': () => replies[3], 'GET /api/channel/update_balance/4': () => replies[4] } });
+    'GET /api/channel/update_balance/3': () => replies[3], 'GET /api/channel/update_balance/4': () => replies[4], } });
   const probe = async (id) => { const r = await app.inject({ method: 'POST', url: `/api/admin/ops/channels/${id}/probe` }); assert.equal(r.statusCode, 200, r.body); shape('Probe', r.json()); return r.json(); };
   const ok = await probe(1);
   assert.equal(ok.state, 'ok'); assert.equal(ok.balance_cny, 21); assert.equal(ok.message, ''); assert.ok(ok.latency_ms >= 0);
@@ -121,6 +125,17 @@ test('probe: ok / unsupported / failed mapping, audited', async () => {
   assert.deepEqual([bad.state, bad.balance_cny, bad.message], ['failed', null, 'invalid api key']);
   assert.deepEqual(audits.map((a) => [a.action, a.target, a.details.state]), [['ops.channel.probe', '1', 'ok'], ['ops.channel.probe', '2', 'unsupported'],
     ['ops.channel.probe', '3', 'unsupported'], ['ops.channel.probe', '4', 'failed']]);
+});
+
+test('probe: balance unit from the matrix type map (USD×rate, CNY as is, raw/unknown → null)', async () => {
+  const { app } = setup({ handlers: Object.fromEntries([1, 3, 4, 99].map((n) => [`GET /api/channel/update_balance/${n}`, () => ({ success: true, balance: 10 })])) });
+  const got = [];
+  for (const id of [1, 3, 4, 99]) {
+    const p = (await app.inject({ method: 'POST', url: `/api/admin/ops/channels/${id}/probe` })).json();
+    shape('Probe', p);
+    got.push([p.balance_cny, p.balance_raw, p.balance_unit]);
+  }
+  assert.deepEqual(got, [[70, 10, 'USD'], [10, 10, 'CNY'], [null, 10, 'raw'], [null, 10, 'raw']]);
 });
 
 test('lane matrix save: validates, forwards, audits success and failure', async () => {
