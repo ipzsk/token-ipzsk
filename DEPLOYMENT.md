@@ -69,3 +69,28 @@ schema 11 与开发者权限接口已部署。82 项隔离数据库测试通过�
 Vercel 正式版本 `dpl_8ANJgTtvgk249ymY3vAPj4MjYAwB` 提供 `https://www.ipzsk.com/developer`；账户页新增开发者链接与分页调用记录。后台源文件备份 `/tmp/ipzsk-before-three-roles.tgz`。收费开关、密码、实际充值码和资金未修改，也未为现有插件猜测开发者账号或分成比例。
 
 线上管理员页面已确认开发者申请、插件归属与分成、全局费用字段。开发者完整工作区使用隔离界面数据验证；跨账号、跨角色接口在 gateway_test 验证。主站 /developer、/account 与 API healthz 发布后返回正常。误触发的未绑定域名博客部署已删除，没有切换博客正式域名。
+
+## 运维环境变量（网关）
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `THUMB_CONCURRENCY` | `1` | 同时跑的 ffmpeg 缩略图进程数，取值 1–2（越界按边界取）。每 5 秒一轮，一轮内连续取任务直到队列空或 4.5 秒用完。ffmpeg 与 node 共用 `mem_limit: 768m`，8192² 最坏单进程 ~390MB，2GB 单机保持 1；只有确认内存余量后才开 2。 |
+| `THUMB_PRIORITY` | 开（`0` 关） | 开：用户上传/生成的缩略图任务先于 `source='case'` 案例回填任务。关：按到期时间先进先出。 |
+| `HEALTH_DETAILS_TOKEN` | 空 | `/healthz/details` 默认只给容器内本机（`docker compose exec -T gateway node -e 'fetch("http://127.0.0.1:3000/healthz/details").then(r=>r.text()).then(console.log)'`）。配了之后带 `Authorization: Bearer <token>` 也能读（例如宿主机 `127.0.0.1:3000`）。 |
+
+固定值（不是环境变量）：图片归档失败 8 次，或任务创建超过 7 天后再失败，`image_archives.state` 置为 `failed`（`last_error` 为 `attempts_exhausted` / `upstream_expired`），日志 `image_archive_gave_up` 只记一次，不改计费。数字人形象列表在 lanehub 目录每次刷新成功后（10 分钟一次）后台预热，失败记 `avatar_list_warm_failed`。
+
+`/healthz/details` 返回：`thumb_queue{queued,running,failed}`、`archive_queue{pending,failed}`、`lanehub_catalog{age_seconds,last_refresh_failed}`、`avatar_list_cache_age_seconds`、`r2_configured`。只有计数与年龄，不含密钥。
+
+## 部署前 compose 核对
+
+`scripts/ops/deploy-prod.sh` 不同步 `compose.yaml`：服务器那份有 lanehub 服务与 R2 配置，本仓库的会把它们抹掉。脚本改为先拉回服务器 compose，用 `scripts/ops/check-compose.mjs` 核对 gateway 服务块，缺任一项即中止：
+
+- `mem_limit` ≥ 768m
+- `R2_CONFIG_FILE`
+- `LANEHUB_BASE_URL`、`LANEHUB_ADMIN_TOKEN_FILE`（或 `LANEHUB_ADMIN_TOKEN`）、`LANEHUB_ACCOUNT_ID`、`LANEHUB_USD_CNY`
+- `build: .`（用本仓库 Dockerfile 构建，镜像内有静态 ffmpeg/ffprobe）
+
+缺项在服务器上手工补齐后再部署。键放在 `env_file` 里脚本看不到，人工确认后 `FORCE_COMPOSE=1`。`DRY_RUN=1` 只做只读核对并打印 rsync 计划，不构建不重启。
+
+`scripts` 目录此前以 `scripts/`（带尾斜杠）同步，内容被摊到服务器项目根，镜像里的 `scripts/` 是旧的。已改为同步目录本身。按旧脚本部署过的话，服务器项目根下可能遗留 `grant-role.mjs`、`import-cases.mjs` 等散文件，需人工核对清理。

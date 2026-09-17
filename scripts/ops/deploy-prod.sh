@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # 把网关源码推到生产并重建。**先部署新版 lanehub 再跑这个**：网关启动时要拉 /api/catalog。
 #   secretctl secret run ipzsk-prod-server --map password=SSHPASS --map username=SSH_USER -- scripts/ops/deploy-prod.sh
+# DRY_RUN=1：照常做只读核对（现网 src 漂移、服务器 compose 键），再用 rsync --dry-run 打印将要传的文件，不构建不重启。
+# FORCE_COMPOSE=1：服务器 compose 核对不过也继续（例如键放在 env_file 里，脚本看不到）——先人工确认。
 set -euo pipefail
 : "${SSHPASS:?需要 SSHPASS（用 secretctl secret run 注入）}"
 SSH_USER="${SSH_USER:-ubuntu}"; SSH_HOST="${SSH_HOST:-43.135.34.238}"; REMOTE_DIR="${REMOTE_DIR:-/home/ubuntu/api-gateway}"
@@ -25,11 +27,20 @@ if [[ -n "$DEPLOYED" ]] && git cat-file -e "$DEPLOYED^{commit}" 2>/dev/null; the
 elif [[ -z "${FORCE:-}" ]]; then
   echo "服务器上没有 .deployed-commit（从没用本脚本部署过），无法判断现网是否有未进 git 的改动。人工核对后 FORCE=1。服务器副本在 $TMP/src"; exit 1
 fi
+# compose.yaml 不同步（服务器那份有 lanehub 服务与 R2 配置，本仓库的会把它们抹掉）：只核对网关需要的键，缺了就停。
+rsync -a --rsh="ssh $SSH_OPTS" "$SSH_USER@$SSH_HOST:$REMOTE_DIR/compose.yaml" "$TMP/compose.yaml"
+if ! node scripts/ops/check-compose.mjs "$TMP/compose.yaml"; then
+  if [[ -z "${FORCE_COMPOSE:-}" ]]; then echo "服务器 compose 副本在 $TMP/compose.yaml"; exit 1; fi
+  echo "FORCE_COMPOSE=1：忽略 compose 核对结果继续。"
+fi
 rm -rf "$TMP"
+RSYNC_DRY=(); [[ -n "${DRY_RUN:-}" ]] && RSYNC_DRY=(--dry-run --itemize-changes)
 git rev-parse HEAD > src/.deployed-commit
-rsync -a --delete --exclude "._*" --rsh="ssh $SSH_OPTS" src/ "$SSH_USER@$SSH_HOST:$REMOTE_DIR/src/"
+rsync -a ${RSYNC_DRY[@]+"${RSYNC_DRY[@]}"} --delete --exclude "._*" --rsh="ssh $SSH_OPTS" src/ "$SSH_USER@$SSH_HOST:$REMOTE_DIR/src/"
 rm -f src/.deployed-commit
-rsync -a --rsh="ssh $SSH_OPTS" scripts/ package.json package-lock.json Dockerfile "$SSH_USER@$SSH_HOST:$REMOTE_DIR/"
+# scripts 不带尾斜杠：落成 $REMOTE_DIR/scripts/（带斜杠会把里面的文件摊到项目根，镜像里就没有 scripts/*.mjs）。
+rsync -a ${RSYNC_DRY[@]+"${RSYNC_DRY[@]}"} --exclude "._*" --rsh="ssh $SSH_OPTS" scripts package.json package-lock.json Dockerfile "$SSH_USER@$SSH_HOST:$REMOTE_DIR/"
+if [[ -n "${DRY_RUN:-}" ]]; then echo "DRY_RUN：以上为将要传输的文件，未构建、未重启。"; exit 0; fi
 ssh $SSH_OPTS "$SSH_USER@$SSH_HOST" bash -s "$REMOTE_DIR" <<'REMOTE'
 set -euo pipefail; cd "$1"
 sudo docker compose build gateway 2>&1 | tail -1

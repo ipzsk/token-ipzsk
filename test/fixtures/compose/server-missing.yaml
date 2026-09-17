@@ -1,0 +1,97 @@
+name: ipzsk-gateway
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+services:
+  db:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    entrypoint: ["/bin/bash", "/opt/start-postgres.sh"]
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "work_mem=2MB", "-c", "max_connections=30", "-c", "log_statement=none"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/db-admin-password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./ops/start-postgres.sh:/opt/start-postgres.sh:ro
+      - ./ops/init-postgres.sh:/docker-entrypoint-initdb.d/10-gateway.sh:ro
+      - ./secrets/db-password:/run/secrets/db-password:ro
+      - ./secrets/db-admin-password:/run/secrets/db-admin-password:ro
+    networks: [database]
+    mem_limit: 384m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d gateway"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+  gateway:
+    image: ipzsk-gateway:local
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 200s
+    environment:
+      PUBLIC_ORIGIN: https://api.ipzsk.com
+      PGHOST: db
+      PGPASSWORD_FILE: /run/secrets/db-password
+      ADMIN_PASSWORD_FILE: /run/secrets/admin-password
+      UPSTREAM_SECRET_DIR: /run/upstream
+      INITIAL_MODELS: gpt-4o-mini
+      # R2_CONFIG_FILE: /run/r2/config.json
+      LANEHUB_BASE_URL: http://lanehub:3000
+      NODE_OPTIONS: --max-old-space-size=320
+    volumes:
+      - ./secrets/upstream:/run/upstream
+      - ./secrets/db-password:/run/secrets/db-password:ro
+      - ./secrets/admin-password:/run/secrets/admin-password:ro
+      - ./secrets/voucher-encryption-key:/run/secrets/voucher-encryption-key:ro
+      - ./secrets/customer-auth-secret:/run/secrets/customer-auth-secret:ro
+      - ./secrets/mail:/run/mail:ro
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    ports: ["127.0.0.1:3000:3000"]
+    networks: [web, database]
+    # 缩略图 ffmpeg 与 node 同一 cgroup，串行一次一个进程。实测峰值 RSS：4096² PNG 135MB、
+    # 8192² PNG 389MB（守卫上限内的最坏情况）。512m 留给 node 不够，放到 768m；
+    # 超限时 OOM killer 先挑 ffmpeg（更大），任务按退避重试，5 次后永久失败。
+    # ffmpeg 全程走 pipe，不写 /tmp，tmpfs 保持 16m。
+    mem_limit: 512m
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging: *logging
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./downloads:/srv/downloads:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [web]
+    mem_limit: 128m
+    depends_on:
+      gateway:
+        condition: service_healthy
+    logging: *logging
+networks:
+  web:
+  database:
+    internal: true
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
