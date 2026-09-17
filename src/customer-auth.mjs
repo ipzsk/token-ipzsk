@@ -78,11 +78,13 @@ export function createCustomerAuth({db,secret,origin,mailer,captcha=unavailableC
       const session=await auth.api.getSession({headers:fromNodeHeaders(headers)});
       if(!session)throw httpError(401,'customer_login_required');
       const row=await ensureCustomer(session.user);
-      return {...row,token_id:null,session_id:session.session.id};
+      return {...row,token_id:null,session_id:session.session.id,session_created_at:session.session.createdAt};
     },
   };
 }
 
+// better-auth 在 /api/auth/* 下开放的端点（其余 404）。契约导出也读这份清单。
+export const AUTH_ENDPOINTS=['GET /get-session','POST /sign-out','POST /sign-in/email','POST /sign-up/email','POST /email-otp/send-verification-otp','POST /email-otp/verify-email','POST /email-otp/request-password-reset','POST /email-otp/reset-password'];
 export function customerAuthRoutes(app,options) {
   const {db,customerAuth,origin}=options;
   const limiter=new RateLimiter();
@@ -100,7 +102,7 @@ export function customerAuthRoutes(app,options) {
   app.route({method:['GET','POST'],url:'/api/auth/*',async handler(req,reply){
     if(!customerAuth)throw httpError(503,'email_service_unavailable');
     const path=req.url.split('?')[0].slice('/api/auth'.length);
-    if(!['GET /get-session','POST /sign-out','POST /sign-in/email','POST /sign-up/email','POST /email-otp/send-verification-otp','POST /email-otp/verify-email','POST /email-otp/request-password-reset','POST /email-otp/reset-password'].includes(req.method+' '+path))throw httpError(404,'not_found');
+    if(!AUTH_ENDPOINTS.includes(req.method+' '+path))throw httpError(404,'not_found');
     if(req.method==='POST'&&![origin,customerOrigin].includes(req.headers.origin))throw httpError(403,'origin_denied');
     if(req.method==='POST'&&typeof req.body?.email==='string')req.body.email=req.body.email.trim().toLowerCase();
     if(path==='/sign-in/email'){

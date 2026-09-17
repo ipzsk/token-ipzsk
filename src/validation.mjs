@@ -82,3 +82,9 @@ export function onlyKnownKeys(body, allowed) {
   // The API error body echoes only the code; the offending key rides along for the server log.
   if (extra !== undefined) throw Object.assign(httpError(400, 'unsupported_parameter'), { message: `unsupported_parameter: ${extra.slice(0, 64)}` });
 }
+// Canonical JSON: sorted object keys, for fingerprints.
+export function stable(value) {
+  if (Array.isArray(value)) return value.map(stable);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map((k) => [k, stable(value[k])]));
+  return value;
+}

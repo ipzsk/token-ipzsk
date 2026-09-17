@@ -4,9 +4,46 @@ import { readFile } from 'node:fs/promises';
 const digest = value => createHash('sha256').update(value).digest('hex');
 const hmac = (key, value) => createHmac('sha256', key).update(value).digest();
 const encode = value => encodeURIComponent(value).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+const amzDate = date => date.toISOString().replace(/[:-]|\.\d{3}/g, '');
+const GRACE_SEC = 1800;
 
-// A deliberately small S3 surface: private PutObject and short-lived GetObject.
-// Same native-crypto SigV4 approach as the existing image plugin; no new dependency.
+// Query-string SigV4 (presigned URL). Pure, so it can be checked against AWS's documented example.
+// `headers` are extra signed headers the caller must send verbatim (host is always signed).
+export function presignUrl({ method, host, path, region, service = 's3', accessKeyId, secretAccessKey, date, expiresSec, headers = {} }) {
+  const stamp = amzDate(date), scope = `${stamp.slice(0, 8)}/${region}/${service}/aws4_request`;
+  const all = { ...Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), String(v).trim()])), host };
+  const names = Object.keys(all).sort();
+  const values = { 'X-Amz-Algorithm': 'AWS4-HMAC-SHA256', 'X-Amz-Credential': `${accessKeyId}/${scope}`,
+    'X-Amz-Date': stamp, 'X-Amz-Expires': String(expiresSec), 'X-Amz-SignedHeaders': names.join(';') };
+  const query = Object.keys(values).sort().map(k => `${encode(k)}=${encode(values[k])}`).join('&');
+  const canonical = `${method}\n${path}\n${query}\n${names.map(n => `${n}:${all[n]}\n`).join('')}\n${names.join(';')}\nUNSIGNED-PAYLOAD`;
+  const key = hmac(hmac(hmac(hmac('AWS4' + secretAccessKey, stamp.slice(0, 8)), region), service), 'aws4_request');
+  const signature = hmac(key, `AWS4-HMAC-SHA256\n${stamp}\n${scope}\n${digest(canonical)}`).toString('hex');
+  return `https://${host}${path}?${query}&X-Amz-Signature=${signature}`;
+}
+
+// Header SigV4 signature for a direct request. Returns the Authorization header value.
+export function authorization({ method, host, path, query = '', region, service = 's3', accessKeyId, secretAccessKey, date, headers, payloadHash }) {
+  const stamp = amzDate(date), scope = `${stamp.slice(0, 8)}/${region}/${service}/aws4_request`;
+  const all = { ...Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), String(v).trim()])), host };
+  const names = Object.keys(all).sort();
+  const canonical = `${method}\n${path}\n${query}\n${names.map(n => `${n}:${all[n]}\n`).join('')}\n${names.join(';')}\n${payloadHash}`;
+  const key = hmac(hmac(hmac(hmac('AWS4' + secretAccessKey, stamp.slice(0, 8)), region), service), 'aws4_request');
+  const signature = hmac(key, `AWS4-HMAC-SHA256\n${stamp}\n${scope}\n${digest(canonical)}`).toString('hex');
+  return `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${scope}, SignedHeaders=${names.join(';')}, Signature=${signature}`;
+}
+
+// Fixed UTC time slices so the same key signs to the same URL for hours (browser cache hits).
+// Near the end of a slice (< grace left) the URL keeps the current X-Amz-Date but covers the next slice too:
+// signing with a future X-Amz-Date would be "not yet valid" at the provider until that slice starts.
+export function slicedWindow(now, sliceHours = 6) {
+  const sliceMs = sliceHours * 3600_000, start = Math.floor(now.getTime() / sliceMs) * sliceMs;
+  const late = start + sliceMs - now.getTime() < GRACE_SEC * 1000;
+  const expiresSec = (late ? 2 : 1) * sliceHours * 3600 + GRACE_SEC;
+  return { date: new Date(start), expiresSec, expiresAt: new Date(start + expiresSec * 1000) };
+}
+
+// A deliberately small S3 surface over native crypto; no new dependency.
 export function createR2Storage(config, fetcher = fetch, clock = () => new Date()) {
   if (!/^[a-f0-9]{32}$/.test(config.accountId ?? '') ||
       !/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(config.bucket ?? '') ||
@@ -15,38 +52,65 @@ export function createR2Storage(config, fetcher = fetch, clock = () => new Date(
       typeof config.archiveFrom !== 'string' || !Number.isFinite(Date.parse(config.archiveFrom))) {
     throw new Error('invalid_r2_config');
   }
-  const endpoint = `https://${config.accountId}.r2.cloudflarestorage.com`;
-  function signing(key) {
+  const host = `${config.accountId}.r2.cloudflarestorage.com`;
+  const creds = { host, region: 'auto', accessKeyId: config.accessKeyId, secretAccessKey: config.secretAccessKey };
+  function objectPath(key) {
     // Object names are server-generated, never taken from a client request.
     if (typeof key !== 'string' || key.split('/').some(p => !p || p === '.' || p === '..')) throw new Error('invalid_object_key');
-    const url = new URL(`${endpoint}/${config.bucket}/${key.split('/').map(encode).join('/')}`);
-    const date = clock().toISOString().replace(/[:-]|\.\d{3}/g, '');
-    const scope = `${date.slice(0, 8)}/auto/s3/aws4_request`;
-    const signingKey = hmac(hmac(hmac(hmac('AWS4' + config.secretAccessKey, date.slice(0, 8)), 'auto'), 's3'), 'aws4_request');
-    const signature = canonical => hmac(signingKey, `AWS4-HMAC-SHA256\n${date}\n${scope}\n${digest(canonical)}`).toString('hex');
-    return { url, date, scope, signature };
+    return `/${config.bucket}/${key.split('/').map(encode).join('/')}`;
   }
+  async function send(method, key, { headers = {}, body, timeout = 30000 } = {}) {
+    const path = objectPath(key), date = clock(), payloadHash = digest(body ?? '');
+    const signed = { ...headers, 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzDate(date) };
+    return fetcher(new URL(`https://${host}${path}`), { method, redirect: 'error', signal: AbortSignal.timeout(timeout), body,
+      headers: { ...signed, authorization: authorization({ ...creds, method, path, date, headers: signed, payloadHash }) } });
+  }
+  const presign = (method, key, date, expiresSec, headers) => presignUrl({ ...creds, method, path: objectPath(key), date, expiresSec, headers });
   return {
     archiveFrom: new Date(config.archiveFrom).toISOString(),
-    async put(key, body, type) {
-      const { url, date, scope, signature } = signing(key);
-      const hash = digest(body);
-      const names = 'content-type;host;x-amz-content-sha256;x-amz-date';
-      const headers = `content-type:${type}\nhost:${url.host}\nx-amz-content-sha256:${hash}\nx-amz-date:${date}\n`;
-      const canonical = `PUT\n${url.pathname}\n\n${headers}\n${names}\n${hash}`;
-      const response = await fetcher(url, { method: 'PUT', redirect: 'error', signal: AbortSignal.timeout(30000), body,
-        headers: { 'content-type': type, 'x-amz-content-sha256': hash, 'x-amz-date': date,
-          authorization: `AWS4-HMAC-SHA256 Credential=${config.accessKeyId}/${scope}, SignedHeaders=${names}, Signature=${signature(canonical)}` } });
+    async put(key, body, type, { cacheControl } = {}) {
+      const response = await send('PUT', key, { body, headers: { 'content-type': type, ...(cacheControl ? { 'cache-control': cacheControl } : {}) } });
       await response.body?.cancel();
       if (!response.ok) throw new Error('r2_upload_failed'); // Never include signed URLs or provider error bodies.
     },
-    getUrl(key) {
-      const { url, date, scope, signature } = signing(key);
-      const values = { 'X-Amz-Algorithm': 'AWS4-HMAC-SHA256', 'X-Amz-Credential': `${config.accessKeyId}/${scope}`,
-        'X-Amz-Date': date, 'X-Amz-Expires': '300', 'X-Amz-SignedHeaders': 'host' };
-      const query = Object.keys(values).sort().map(k => `${encode(k)}=${encode(values[k])}`).join('&');
-      const canonical = `GET\n${url.pathname}\n${query}\nhost:${url.host}\n\nhost\nUNSIGNED-PAYLOAD`;
-      return `${url}?${query}&X-Amz-Signature=${signature(canonical)}`;
+    getUrl(key, expiresSec = 300) { return presign('GET', key, clock(), expiresSec); },
+    presignGetSliced(key, { sliceHours = 6 } = {}) {
+      const { date, expiresSec } = slicedWindow(clock(), sliceHours);
+      return presign('GET', key, date, expiresSec);
+    },
+    // content-length/content-type (and cache-control) are signed, so R2 rejects any other size or type.
+    presignPut(key, { contentType, contentLength, cacheControl, expiresSec = 600 }) {
+      return presign('PUT', key, clock(), expiresSec, { 'content-length': contentLength, 'content-type': contentType,
+        ...(cacheControl ? { 'cache-control': cacheControl } : {}) });
+    },
+    async head(key) {
+      const response = await send('HEAD', key);
+      await response.body?.cancel();
+      if (response.status === 404) return null;
+      if (!response.ok) throw new Error('r2_head_failed');
+      return { bytes: Number(response.headers.get('content-length')), contentType: response.headers.get('content-type') };
+    },
+    async getRange(key, start, end) {
+      const response = await send('GET', key, { headers: { range: `bytes=${start}-${end}` } });
+      if (!response.ok) { await response.body?.cancel(); throw new Error('r2_get_failed'); }
+      const max = end - start + 1, chunks = []; let size = 0;
+      for await (const chunk of response.body) {
+        chunks.push(Buffer.from(chunk)); size += chunk.length;
+        if (size >= max) { await response.body.cancel?.().catch(() => {}); break; }
+      }
+      return Buffer.concat(chunks).subarray(0, max);
+    },
+    async delete(key) {
+      const response = await send('DELETE', key);
+      await response.body?.cancel();
+      if (!response.ok && response.status !== 404) throw new Error('r2_delete_failed');
+    },
+    async copy(srcKey, dstKey, { cacheControl, contentType } = {}) {
+      const response = await send('PUT', dstKey, { headers: { 'x-amz-copy-source': objectPath(srcKey),
+        ...(cacheControl || contentType ? { 'x-amz-metadata-directive': 'REPLACE' } : {}),
+        ...(cacheControl ? { 'cache-control': cacheControl } : {}), ...(contentType ? { 'content-type': contentType } : {}) } });
+      await response.body?.cancel();
+      if (!response.ok) throw new Error('r2_copy_failed');
     },
   };
 }
