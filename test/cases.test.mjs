@@ -37,12 +37,22 @@ test('case list query: category, escaped search, cursor, limit', () => {
   let q = caseListQuery({});
   assert.equal(q.limit, 60); assert.deepEqual(q.args, [61]); assert.match(q.sql, /status='published'/); assert.match(q.sql, /ORDER BY c.position,c.id/);
   q = caseListQuery({ cat: 'posters', q: ' 50%_off ', cursor: encodeCaseCursor(3.5, '543'), limit: '10' });
-  assert.deepEqual(q.args, ['posters', '%50\\%\\_off%', 3.5, '543', 11]);
-  assert.match(q.sql, /c.category=\$1/); assert.match(q.sql, /c.title ILIKE \$2 OR c.prompt ILIKE \$2 OR array_to_string\(c.tags,' '\) ILIKE \$2/);
+  assert.deepEqual(q.args, [['posters'], '%50\\%\\_off%', 3.5, '543', 11]);
+  assert.match(q.sql, /c.category=ANY\(\$1::text\[\]\)/); assert.match(q.sql, /c.title ILIKE \$2 OR c.prompt ILIKE \$2 OR array_to_string\(c.tags,' '\) ILIKE \$2/);
   assert.match(q.sql, /\(c.position,c.id\)>\(\$3::double precision,\$4\)/);
   for (const bad of [{ cursor: 'zzz' }, { limit: '0' }, { limit: '61' }, { q: 'x'.repeat(101) }, { cursor: encodeCaseCursor(1, '../x') }]) {
     assert.equal(code(() => caseListQuery(bad)) !== null, true, JSON.stringify(bad));
   }
+});
+
+test('case list multi-category: comma or repeated, deduped, validated, placeholders aligned', () => {
+  const q = caseListQuery({ cat: 'a,b', q: 'x', cursor: encodeCaseCursor(2, 'id'), limit: '5' });
+  assert.deepEqual(q.args, [['a', 'b'], '%x%', 2, 'id', 6]);
+  assert.match(q.sql, /c.category=ANY\(\$1::text\[\]\) AND \(c.title ILIKE \$2/);
+  assert.deepEqual(caseListQuery({ cat: 'a,b,,a' }).args, [['a', 'b'], 61]);
+  assert.deepEqual(caseListQuery({ cat: ['a', 'b,c'] }).args, [['a', 'b', 'c'], 61]);
+  assert.deepEqual(caseListQuery({ cat: ',' }).args, [61]);
+  for (const cat of [Array.from({ length: 21 }, (_, i) => 'x' + i).join(','), 'x'.repeat(61), [{}]]) assert.equal(code(() => caseListQuery({ cat })), 'invalid_category');
 });
 
 test('similar ranking: same category first, then tag overlap, then feed order; excludes self; max 12', () => {

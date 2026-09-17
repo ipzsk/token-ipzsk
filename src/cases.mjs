@@ -17,9 +17,11 @@ export const encodeCaseCursor = (position, id) => Buffer.from(JSON.stringify([po
 // Published feed, ordered (position,id). q is ILIKE over title/prompt/tags with LIKE metacharacters escaped.
 export function caseListQuery({ cat, q, cursor, limit } = {}) {
   const args = [], where = ["c.status='published'"];
-  if (cat !== undefined && cat !== '') {
-    if (typeof cat !== 'string' || cat.length > 60) throw httpError(400, 'invalid_category');
-    args.push(cat); where.push(`c.category=$${args.length}`);
+  // cat: one category or several, comma-separated (cat=a,b) or repeated (cat=a&cat=b); OR within, AND with q.
+  const cats = [cat ?? []].flat().flatMap((c) => typeof c === 'string' ? c.split(',') : [c]).filter((c) => c !== '');
+  if (cats.length) {
+    if (cats.length > 20 || cats.some((c) => typeof c !== 'string' || c.length > 60)) throw httpError(400, 'invalid_category');
+    args.push([...new Set(cats)]); where.push(`c.category=ANY($${args.length}::text[])`);
   }
   if (q !== undefined && q !== '') {
     if (typeof q !== 'string' || q.length > 100) throw httpError(400, 'invalid_query');

@@ -228,6 +228,7 @@ export const schemas = {
   CaseTemplate: object({ items: array(ref('CaseTemplateItem'), 12) }),
   InspirationCase: object(caseFields),
   InspirationCaseDetail: object({ ...caseFields, references: array(ref('CaseImage')), similar: array(ref('InspirationCase'), 12) }),
+  // cat: comma-separated categories (OR); repeated cat= is accepted too.
   CaseListQuery: object({ cat: opt(string), q: opt(string), cursor: opt(string), limit: opt(int(1, 60)) }),
   CaseCategory: object({ category: string, category_zh: nullable(string), count: int(0) }),
   CaseCategories: object({ items: array(ref('CaseCategory')) }),

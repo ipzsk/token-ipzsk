@@ -198,6 +198,15 @@ test('B4: canvas, folders, case import, public cases, favorites, backfill, video
       assert.deepEqual((await pub('/api/public/cases?q=' + encodeURIComponent(manifest[0].tags[0]))).json().items.map((x) => x.id).includes('20000'), true);
       assert.equal((await pub('/api/public/cases?q=%25%25nomatch')).json().items.length, 0);
       assert.equal((await pub('/api/public/cases?cursor=bad')).statusCode, 400);
+      // multi-category: OR within cat, AND with q; cursor keeps the filter.
+      assert.deepEqual((await pub('/api/public/cases?cat=posters,ecommerce')).json().items.map((x) => x.id), items.map((x) => x.id));
+      assert.deepEqual((await pub('/api/public/cases?cat=posters&cat=ecommerce')).json().items.map((x) => x.id), items.map((x) => x.id));
+      const mc = (await pub('/api/public/cases?cat=ecommerce,posters&limit=2')).json();
+      assert.deepEqual(mc.items.map((x) => x.id), items.slice(0, 2).map((x) => x.id));
+      assert.deepEqual((await pub('/api/public/cases?cat=ecommerce,posters&limit=2&cursor=' + mc.next_cursor)).json().items.map((x) => x.id), [items[2].id]);
+      assert.deepEqual((await pub('/api/public/cases?cat=posters,nope&limit=1&cursor=' + encodeURIComponent((await pub('/api/public/cases?cat=posters,nope&limit=1')).json().next_cursor))).json().items.map((x) => x.id), ['30002']);
+      assert.equal((await pub('/api/public/cases?cat=posters,ecommerce&q=%25%25nomatch')).json().items.length, 0);
+      assert.deepEqual((await pub('/api/public/cases?cat=ecommerce&q=' + encodeURIComponent(manifest[1].title.slice(0, 2)))).json().items.map((x) => x.id), ['543']);
       const detail = (await pub('/api/public/cases/20000')).json();
       assert.equal(detail.id, '20000'); assert.deepEqual(detail.similar.map((x) => x.id)[0], '30002'); assert.deepEqual(detail.references, []);
       assert.deepEqual((await pub('/api/public/case-categories')).json().items, [
