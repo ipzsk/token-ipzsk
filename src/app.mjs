@@ -22,6 +22,7 @@ import { studioRoutes, avatarListCacheAge } from './studio.mjs';
 import { libraryRoutes } from './library.mjs';
 import { caseRoutes } from './cases.mjs';
 import { adminStudioRoutes } from './admin-studio.mjs';
+import { adminOpsRoutes } from './admin-ops.mjs';
 
 export async function createApp(options) {
   const app = Fastify({ logger: options.logger ?? false, logController:new LogController({ disableRequestLogging:true }),
@@ -102,5 +103,6 @@ export async function createApp(options) {
   libraryRoutes(app,options);
   caseRoutes(app,options);
   adminStudioRoutes(app,options);
+  adminOpsRoutes(app,options);
   return app;
 }
