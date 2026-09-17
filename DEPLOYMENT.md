@@ -94,3 +94,9 @@ Vercel 正式版本 `dpl_8ANJgTtvgk249ymY3vAPj4MjYAwB` 提供 `https://www.ipzsk
 缺项在服务器上手工补齐后再部署。键放在 `env_file` 里脚本看不到，人工确认后 `FORCE_COMPOSE=1`。`DRY_RUN=1` 只做只读核对并打印 rsync 计划，不构建不重启。
 
 `scripts` 目录此前以 `scripts/`（带尾斜杠）同步，内容被摊到服务器项目根，镜像里的 `scripts/` 是旧的。已改为同步目录本身。按旧脚本部署过的话，服务器项目根下可能遗留 `grant-role.mjs`、`import-cases.mjs` 等散文件，需人工核对清理。
+
+## 2026-09-17 21:26 运维后台代理（admin-ops）
+
+lanehub 先部署：新增 `PUT /api/lane_matrix/batch`，矩阵渠道增加 `balance` / `balance_updated_time` / `balance_supported` / `balance_unit`。部署前备份 `backups/lanehub-20260917T132605Z.db`，verify-prod 全部通过。
+
+网关随后部署 `b89cc03`：新增 `/api/admin/ops/*` 8 条路由（线路矩阵读写、渠道、探测=余额接口、仪表盘、日志），无数据库迁移。DRY_RUN 核对只传 admin-ops 相关 4 个文件；134 项测试通过。线上验证：lanehub 新字段已返回、批量接口空请求不写库、网关未登录返回 `customer_login_required`、healthz 200。网站 `/admin` 运维页未部署，方案见网站仓库 `docs/admin-ops.md`。
