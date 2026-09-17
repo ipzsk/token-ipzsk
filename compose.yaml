@@ -56,7 +56,11 @@ services:
     tmpfs: ["/tmp:size=16m,mode=1777"]
     ports: ["127.0.0.1:3000:3000"]
     networks: [web, database]
-    mem_limit: 512m
+    # 缩略图 ffmpeg 与 node 同一 cgroup，串行一次一个进程。实测峰值 RSS：4096² PNG 135MB、
+    # 8192² PNG 389MB（守卫上限内的最坏情况）。512m 留给 node 不够，放到 768m；
+    # 超限时 OOM killer 先挑 ffmpeg（更大），任务按退避重试，5 次后永久失败。
+    # ffmpeg 全程走 pipe，不写 /tmp，tmpfs 保持 16m。
+    mem_limit: 768m
     depends_on:
       db:
         condition: service_healthy
