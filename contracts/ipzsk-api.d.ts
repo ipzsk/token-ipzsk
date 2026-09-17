@@ -207,6 +207,7 @@ export interface ApiError {
   status?: string
   fields?: PublishIssue[]
   reason?: string
+  detail?: string
 }
 export interface ApiErrorBody {
   error: ApiError
@@ -409,6 +410,26 @@ export interface CaseTemplateItem {
     slot: string
   }[]
 }
+export interface ChannelSummary {
+  id: number // integer 1..
+  name: string
+  type: number // integer 0..
+  status: 1 | 2 | 3
+  priority: number
+  weight: number
+  lanes: string[]
+  vendor: string
+  balance_cny: number | null
+  balance_checked_at: number | null // integer 0..
+  balance_raw: number | null
+  balance_unit: "USD" | "CNY" | "raw"
+  balance_supported: boolean
+  group: string
+  tag: string
+  models_count: number // integer 0..
+  used_cny: number
+  created_at: number // integer 0..
+}
 export interface DeletedCount {
   deleted: number // integer 0..
 }
@@ -542,6 +563,99 @@ export interface InspirationCaseDetail {
   references: CaseImage[]
   similar: InspirationCase[] // max 12 items
 }
+export interface LaneChange {
+  channel_id: number // integer 1..
+  priority?: number
+  status?: 1 | 2
+  lanes?: string[] // max 50 items
+}
+export interface LaneChannel {
+  id: number // integer 1..
+  name: string
+  type: number // integer 0..
+  status: 1 | 2 | 3
+  priority: number
+  weight: number
+  lanes: string[]
+  vendor: string
+  balance_cny: number | null
+  balance_checked_at: number | null // integer 0..
+  balance_raw: number | null
+  balance_unit: "USD" | "CNY" | "raw"
+  balance_supported: boolean
+}
+export interface LaneMatrix {
+  lanes: {
+    symbol: string
+    name: string
+    ratio: number
+  }[]
+  scenario: {
+    resolution: string
+    duration: number
+  }
+  rows: {
+    model: string
+    vendors: string[]
+    modalities: string[]
+    cells: Record<string, {
+      channel_ids: number[] // integer 1..
+    }>
+    channel_ids: number[] // integer 1..
+    prices: Record<string, {
+      unit: string
+      cny: number
+      source: "row" | "borrowed" | "overridden" | "fallback"
+    } | null>
+  }[]
+  channels: Record<string, LaneChannel>
+  vendor_icons: Record<string, string>
+}
+export interface LaneMatrixQuery {
+  resolution?: string
+  duration?: number // integer 1..3600
+}
+export interface LaneMatrixSave {
+  changes: LaneChange[] // max 200 items
+}
+export interface LaneMatrixSaveResult {
+  results: {
+    channel_id: number // integer 1..
+    name: string
+    before: {
+      group: string
+      priority: number
+      status: number // integer 0..
+    }
+    after: {
+      group: string
+      priority: number
+      status: number // integer 0..
+    }
+  }[]
+}
+export interface LogEntry {
+  id: number // integer 1..
+  created_at: number // integer 0..
+  type: 1 | 2 | 3 | 4
+  username: string
+  token_name: string
+  model: string
+  channel: {
+    id: number // integer 1..
+    name: string
+  } | null
+  amount_cny: number
+  cost_cny: number
+  cost_source: "real" | "estimated" | ""
+  prompt_tokens: number // integer 0..
+  completion_tokens: number // integer 0..
+  latency_ms: number // integer 0..
+  is_stream: boolean
+  request_id: string
+  upstream_request_id: string
+  content: string
+}
 export interface MediaAsset {
   id: Uuid
   kind: AssetKind
@@ -588,12 +702,91 @@ export interface ModelSpec {
   mode?: ModelMode
   avatar?: AvatarCapability
 }
+export interface OpsChannelPage {
+  items: ChannelSummary[]
+  page: number // integer 1..
+  size: number // integer 1..
+  total: number // integer 0..
+}
+export interface OpsChannelQuery {
+  page?: number // integer 1..
+  size?: number // integer 1..100
+  status?: number // integer 1..3
+  type?: number // integer 0..
+  group?: string
+  keyword?: string
+}
+export interface OpsLogPage {
+  items: LogEntry[]
+  page: number // integer 1..
+  size: number // integer 1..
+  total: number // integer 0..
+}
+export interface OpsLogQuery {
+  page?: number // integer 1..
+  size?: number // integer 1..100
+  start?: number // integer 0..
+  end?: number // integer 0..
+  model?: string
+  username?: string
+  channel_id?: number // integer 1..
+  request_id?: string
+  upstream_request_id?: string
+  type?: 1 | 2 | 3 | 4
+}
+export interface OpsLogStat {
+  amount_cny: number
+}
+export interface OpsLogStatQuery {
+  start?: number // integer 0..
+  end?: number // integer 0..
+  model?: string
+  username?: string
+  channel_id?: number // integer 1..
+  request_id?: string
+  upstream_request_id?: string
+  type?: 1 | 2 | 3 | 4
+}
+export interface OpsPeriod {
+  rows: {
+    date: string
+    key: string
+    requests: number // integer 0..
+    amount_cny: number
+    cost_cny: number
+    prompt_tokens: number // integer 0..
+    completion_tokens: number // integer 0..
+    avg_latency_ms: number // integer 0..
+  }[]
+}
+export interface OpsPeriodQuery {
+  start: number // integer 0..
+  end: number // integer 0..
+  group_by?: "model" | "channel"
+  channel_id?: number // integer 1..
+  model?: string
+}
+export interface OpsRealtime {
+  rpm: number
+  tpm: number
+  cost_per_min_cny: number
+}
 export interface ParamSpec {
   field: string
   type: "enum" | "integer" | "boolean" | "string"
   values?: (string | number)[]
   default: (string | number) | null
   unit?: "s"
+}
+export interface Probe {
+  channel_id: number // integer 1..
+  state: "ok" | "unsupported" | "failed"
+  balance_cny: number | null
+  balance_raw: number | null
+  balance_unit: "USD" | "CNY" | "raw"
+  latency_ms: number // integer 0..
+  message: string
+  checked_at: number // integer 0..
 }
 export interface PublishIssue {
   field: string
@@ -825,6 +1018,14 @@ export interface Endpoints {
   "POST /api/admin/generations/:id/cancel": { body: GenerationCancel; response: AdminGenerationDetail }
   "POST /api/admin/generations/:id/resync": { body: never; response: AdminGenerationDetail }
   "GET /api/admin/me": { body: never; response: AdminMe }
+  "GET /api/admin/ops/channels": { body: never; response: OpsChannelPage }
+  "POST /api/admin/ops/channels/:id/probe": { body: never; response: Probe }
+  "GET /api/admin/ops/dashboard/period": { body: never; response: OpsPeriod }
+  "GET /api/admin/ops/dashboard/realtime": { body: never; response: OpsRealtime }
+  "GET /api/admin/ops/lane-matrix": { body: never; response: LaneMatrix }
+  "PUT /api/admin/ops/lane-matrix": { body: LaneMatrixSave; response: LaneMatrixSaveResult }
+  "GET /api/admin/ops/logs": { body: never; response: OpsLogPage }
+  "GET /api/admin/ops/logs/stat": { body: never; response: OpsLogStat }
   "GET /api/admin/roles": { body: never; response: AdminStaff }
   "GET /api/admin/users": { body: never; response: Page<AdminUserSummary> }
   "GET /api/admin/users/:id": { body: never; response: AdminUserDetail }

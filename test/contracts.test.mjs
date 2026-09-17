@@ -13,8 +13,8 @@ test('contracts/ artifacts are up to date (run npm run contracts)', async () => 
   assert.deepEqual(await buildContracts(), { json, dts }, 'exporter is deterministic');
 });
 
-test('every route in studio/uploads/library/cases/roles/admin-studio has a routeMeta entry', async () => {
-  for (const file of ['studio', 'uploads', 'library', 'cases', 'roles', 'admin-studio']) {
+test('every route in studio/uploads/library/cases/roles/admin-studio/admin-ops has a routeMeta entry', async () => {
+  for (const file of ['studio', 'uploads', 'library', 'cases', 'roles', 'admin-studio', 'admin-ops']) {
     const text = await readFile(new URL(`../src/${file}.mjs`, import.meta.url), 'utf8');
     for (const m of text.matchAll(/\bapp\.(get|post|put|patch|delete)\(\s*'([^']+)'/g)) {
       assert.ok(ROUTE_META[`${m[1].toUpperCase()} ${m[2]}`], `${file}.mjs: ${m[1].toUpperCase()} ${m[2]} missing from routeMeta`);
@@ -199,6 +199,38 @@ test('admin (B5) GET responses match contracts-schema', async () => {
     assert.doesNotMatch(detail.failure_message, /r2\.test/);
     await check('GET /api/admin/audit', '/api/admin/audit?action=case.*');
     await check('GET /api/admin/cases', '/api/admin/cases?limit=101', { status: 400, shape: 'ApiErrorBody' });
+  } finally { await app.close(); }
+});
+
+test('ops (lanehub proxy) GET responses match contracts-schema', async () => {
+  const ch = { id: 1, name: 'c', priority: 1, weight: 1, status: 1, type: 63, lanes: ['official'], vendor: 'V', vendor_icon: 'data:x', balance: 1, balance_updated_time: 1, balance_supported: true, balance_unit: 'USD',
+    price: { source: 'row', cny: 0.2, unit: 'per_call' }, key: 'sk' };
+  const replies = {
+    '/api/lane_matrix': { lanes: [{ symbol: 'official', name: '官方', ratio: 1 }], auto_chain: ['official'], scenario: { resolution: '1080p', duration: 5 },
+      rows: [{ model: 'm', vendors: ['V'], modalities: ['image'], channels: [ch], cells: { official: { channels: [ch] } } }] },
+    '/api/channel/': { data: [{ ...ch, group: 'official', tag: '', models: 'm', used_quota: 1, created_time: 1 }], page: 1, size: 20, total_count: 1 },
+    '/api/analytics/rpm': { rpm: 1, tpm: 2, cpm: 0.1, ppm: 0 },
+    '/api/analytics/period': { channel_statistics: [{ Date: '2026-09-17', RequestCount: 1, Quota: 1, CostQuota: 1, PromptTokens: 1, CompletionTokens: 1, RequestTime: 5, Channel: 'm' }] },
+    '/api/log/': { data: [{ id: 1, created_at: 1, type: 2, model_name: 'm', quota: 1, request_time: 1, channel: { id: 1, name: 'c' } }], page: 1, size: 20, total_count: 1 },
+    '/api/log/stat': { quota: 1 },
+  };
+  const lanehub = { usdRate: async () => 7, call: async (path) => {
+    const hit = replies[path.split('?')[0]];
+    if (!hit) throw Object.assign(new Error('lanehub_api_failed'), { statusCode: 502, code: 'lanehub_api_failed', detail: 'boom' });
+    return hit;
+  } };
+  const app = await createApp({ db: adminDb, upstream: {}, lanehub, lanehubUsdCny: 7, lanehubQuotaPerUnit: 500000, scheduler: { keys: new Map(), accounts: new Map() }, origin: 'https://api.ipzsk.com',
+    customerAuth: { identify: async () => ({ id: USER, name: '小猫', email: 'a@x.com', token_id: null, session_id: 's1', session_created_at: new Date().toISOString() }) } });
+  const check = await checker(app);
+  try {
+    await check('GET /api/admin/ops/lane-matrix', '/api/admin/ops/lane-matrix');
+    await check('GET /api/admin/ops/channels', '/api/admin/ops/channels');
+    await check('GET /api/admin/ops/dashboard/realtime', '/api/admin/ops/dashboard/realtime');
+    await check('GET /api/admin/ops/dashboard/period', '/api/admin/ops/dashboard/period?start=1&end=2');
+    await check('GET /api/admin/ops/logs', '/api/admin/ops/logs');
+    await check('GET /api/admin/ops/logs/stat', '/api/admin/ops/logs/stat');
+    const failed = await check('PUT /api/admin/ops/lane-matrix', '/api/admin/ops/lane-matrix', { body: { changes: [{ channel_id: 1, status: 2 }] }, status: 502, shape: 'ApiErrorBody' });
+    assert.equal(failed.json().error.detail, 'boom');
   } finally { await app.close(); }
 });
 

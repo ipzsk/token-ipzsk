@@ -419,6 +419,163 @@
       "errors": [
         "admin_session_expired",
         "customer_login_required",
+        "forbidden_role",
+        "invalid_query",
+        "lanehub_api_failed",
+        "lanehub_unavailable"
+      ],
+      "method": "GET",
+      "path": "/api/admin/ops/channels",
+      "query": "OpsChannelQuery",
+      "response": "OpsChannelPage",
+      "roles": [
+        "admin",
+        "operator",
+        "viewer"
+      ]
+    },
+    {
+      "auth": "cookie",
+      "errors": [
+        "admin_session_expired",
+        "customer_login_required",
+        "forbidden_role",
+        "invalid_channel_id",
+        "lanehub_api_failed",
+        "lanehub_unavailable"
+      ],
+      "method": "POST",
+      "path": "/api/admin/ops/channels/:id/probe",
+      "response": "Probe",
+      "roles": [
+        "admin",
+        "operator"
+      ]
+    },
+    {
+      "auth": "cookie",
+      "errors": [
+        "admin_session_expired",
+        "customer_login_required",
+        "forbidden_role",
+        "invalid_date_range",
+        "invalid_query",
+        "lanehub_api_failed",
+        "lanehub_unavailable"
+      ],
+      "method": "GET",
+      "path": "/api/admin/ops/dashboard/period",
+      "query": "OpsPeriodQuery",
+      "response": "OpsPeriod",
+      "roles": [
+        "admin",
+        "operator",
+        "viewer"
+      ]
+    },
+    {
+      "auth": "cookie",
+      "errors": [
+        "admin_session_expired",
+        "customer_login_required",
+        "forbidden_role",
+        "lanehub_api_failed",
+        "lanehub_unavailable"
+      ],
+      "method": "GET",
+      "path": "/api/admin/ops/dashboard/realtime",
+      "response": "OpsRealtime",
+      "roles": [
+        "admin",
+        "operator",
+        "viewer"
+      ]
+    },
+    {
+      "auth": "cookie",
+      "errors": [
+        "admin_session_expired",
+        "customer_login_required",
+        "forbidden_role",
+        "invalid_query",
+        "lanehub_api_failed",
+        "lanehub_unavailable"
+      ],
+      "method": "GET",
+      "path": "/api/admin/ops/lane-matrix",
+      "query": "LaneMatrixQuery",
+      "response": "LaneMatrix",
+      "roles": [
+        "admin",
+        "operator",
+        "viewer"
+      ]
+    },
+    {
+      "auth": "cookie",
+      "body": "LaneMatrixSave",
+      "body_shape": "{ changes: LaneChange[] }",
+      "errors": [
+        "admin_session_expired",
+        "customer_login_required",
+        "forbidden_role",
+        "invalid_lane_changes",
+        "lanehub_api_failed",
+        "lanehub_unavailable"
+      ],
+      "method": "PUT",
+      "path": "/api/admin/ops/lane-matrix",
+      "response": "LaneMatrixSaveResult",
+      "roles": [
+        "admin",
+        "operator"
+      ]
+    },
+    {
+      "auth": "cookie",
+      "errors": [
+        "admin_session_expired",
+        "customer_login_required",
+        "forbidden_role",
+        "invalid_query",
+        "lanehub_api_failed",
+        "lanehub_unavailable"
+      ],
+      "method": "GET",
+      "path": "/api/admin/ops/logs",
+      "query": "OpsLogQuery",
+      "response": "OpsLogPage",
+      "roles": [
+        "admin",
+        "operator",
+        "viewer"
+      ]
+    },
+    {
+      "auth": "cookie",
+      "errors": [
+        "admin_session_expired",
+        "customer_login_required",
+        "forbidden_role",
+        "invalid_query",
+        "lanehub_api_failed",
+        "lanehub_unavailable"
+      ],
+      "method": "GET",
+      "path": "/api/admin/ops/logs/stat",
+      "query": "OpsLogStatQuery",
+      "response": "OpsLogStat",
+      "roles": [
+        "admin",
+        "operator",
+        "viewer"
+      ]
+    },
+    {
+      "auth": "cookie",
+      "errors": [
+        "admin_session_expired",
+        "customer_login_required",
         "forbidden_role"
       ],
       "method": "GET",
@@ -3870,6 +4027,12 @@
       ]
     },
     {
+      "code": "invalid_channel_id",
+      "status": [
+        400
+      ]
+    },
+    {
       "code": "invalid_charge",
       "status": [
         400
@@ -4051,6 +4214,12 @@
     },
     {
       "code": "invalid_kind",
+      "status": [
+        400
+      ]
+    },
+    {
+      "code": "invalid_lane_changes",
       "status": [
         400
       ]
@@ -4441,6 +4610,12 @@
       "code": "lanehub_token_create_failed",
       "status": [
         502
+      ]
+    },
+    {
+      "code": "lanehub_unavailable",
+      "status": [
+        503
       ]
     },
     {
