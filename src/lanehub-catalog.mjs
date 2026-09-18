@@ -70,8 +70,10 @@ const STUDIO_PARAMS = { aspect_ratio: 'enum', resolution: 'enum', quality: 'enum
 // mode=avatar、heygen-image/studio/cinematic-avatar 也各有 mode，都照常下发。
 const composableModel = (m) => !/^heygen-/.test(m.id) || Boolean(avatarCatalogSpec(m).mode);
 
-// lanehub 目录 → 网页 ModelSpec。取值原样保留（flare 的 "1K" 不转小写）；目录不给默认值，
-// 比例优先 1:1，其余取第一个取值。
+// lanehub 目录 → 网页 ModelSpec。取值原样保留（flare 的 "1K" 不转小写）。默认值以 lanehub 的
+// field.default 为准（它就是计价用的兜底值，自己另猜一个会让报价和实扣对不上，例如 flare 的
+// quality 猜成 low、z-image 的 enhance_prompt 猜成 true 直接翻倍）；目录没给才回落到
+// 比例优先 1:1、其余取第一个取值。
 export function mediaModelsFromCatalog(catalog) {
   return catalog.models.filter((m) => ['image', 'video'].includes(m.kind) && typeof m.id === 'string' && composableModel(m)).map((m) => {
     const fields = m.params?.fields ?? [];
@@ -82,7 +84,11 @@ export function mediaModelsFromCatalog(catalog) {
       if (!kind || f.unsupported || params.some((p) => p.field === f.field)) continue;
       const values = f.values?.length ? [...f.values] : undefined;
       params.push({ field: f.field, type: values ? 'enum' : kind, ...(values ? { values } : {}),
-        default: values ? (f.field === 'aspect_ratio' && values.includes('1:1') ? '1:1' : values[0]) : null,
+        // 布尔开关回落到 false：取第一个取值会默认开着，而开关往往是加价项（z-image 的扩写是 2 倍）。
+        default: f.default != null ? String(f.default)
+          : !values ? null
+          : values.length === 2 && values.includes('true') && values.includes('false') ? 'false'
+          : f.field === 'aspect_ratio' && values.includes('1:1') ? '1:1' : values[0],
         ...(f.field === 'duration' ? { unit: 's' } : {}) });
     }
     const references = referencesFor(m.id);

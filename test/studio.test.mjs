@@ -31,6 +31,15 @@ test('catalog → ModelSpec: kinds, case-preserved values, defaults, unsupported
   assert.equal(models[2].references.maxImages, 0, 'unknown model defaults to 0');
   assert.deepEqual(models[3].references, { maxImages: 0, firstFrame: true });
   assert.deepEqual(models[3].params, [{ field: 'duration', type: 'enum', values: ['5', '10'], default: '5', unit: 's' }]);
+  // lanehub 的 default 就是它计价用的兜底值：网关必须原样用，猜出来的默认值会让报价和实扣不是同一档。
+  const withDefaults = mediaModelsFromCatalog({ models: [{ id: 'z-image-turbo', kind: 'image', billing: { unit: 'per_call' },
+    params: { registered: true, fields: [
+      { field: 'enhance_prompt', values: ['true', 'false'] },
+      { field: 'resolution', values: ['1K', '2K'], default: '1K' },
+      { field: 'aspect_ratio', values: ['16:9', '1:1'] },
+    ] } }] })[0];
+  assert.deepEqual(withDefaults.params.find((p) => p.field === 'resolution').default, '1K', 'lanehub 给的默认值优先');
+  assert.deepEqual(withDefaults.params.find((p) => p.field === 'enhance_prompt').default, 'false', '开关没给默认值时默认关闭，不替用户选加价项');
   assert.equal(referencesFor('gpt-image-2.5-sunburst').maxImages, 15);
   assert.equal(referencesFor('gpt-image-20').maxImages, 0);
 });
