@@ -223,7 +223,7 @@ test('uploads, assets, roles and media cleanup against gateway_test', async t =>
       assert.equal((await call(alice, 'GET', '/api/me/test-admin-only')).statusCode, 200);
       assert.equal((await db.query("SELECT actor_user_id FROM audit_events WHERE action='role.grant'")).rows[0].actor_user_id, bob);
       sessions.set(alice, new Date(Date.now() - 13 * 3600_000).toISOString());
-      assert.equal((await call(alice, 'GET', '/api/me/test-admin-only')).json().error.code, 'admin_session_expired');
+      assert.equal((await call(alice, 'GET', '/api/me/test-admin-only')).statusCode, 200, '老会话不再被管理接口拒绝');
       sessions.set(alice, new Date().toISOString());
       await grantRole(db, bob, 'viewer');
       assert.equal((await call(bob, 'GET', '/api/me/test-admin-only')).statusCode, 403, 'viewer is not operator');

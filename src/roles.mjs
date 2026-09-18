@@ -1,7 +1,6 @@
 import { httpError } from './security.mjs';
 
 export const ROLES = ['admin', 'operator', 'viewer'];
-const ADMIN_SESSION_MAX_MS = 12 * 3600_000;
 // ponytail: per-process 30s cache; a grant/revoke in another process (none today, single gateway) waits up to 30s.
 const cache = new Map();
 
@@ -14,15 +13,16 @@ export async function loadRoles(db, userId) {
   return roles;
 }
 
-// Server-side role gate for customer (better-auth) sessions. Every role here is an admin role,
-// so the session must also be younger than 12h even though customer sessions last 7 days.
+// Server-side role gate for customer (better-auth) sessions. The admin console rides the site's own
+// login cookie: same 7-day session, same auto-renewal. It used to also require a sign-in from the last
+// 12h; that only bought a shorter window against a borrowed browser, while forcing a captcha login every
+// day, so the product decision (2026-09-18) was to drop it. `admin_session_expired` stays in the contract
+// for old clients — nothing raises it now.
 export async function requireRole(req, ...roles) {
   const user = req.apiUser;
   if (!user?.session_id) throw httpError(401, 'customer_login_required');
   const granted = await loadRoles(req.server.roleDb, user.id);
   if (!roles.some(role => granted.includes(role))) throw httpError(403, 'forbidden_role');
-  const created = Date.parse(user.session_created_at);
-  if (!Number.isFinite(created) || Date.now() - created > ADMIN_SESSION_MAX_MS) throw httpError(401, 'admin_session_expired');
   return granted;
 }
 

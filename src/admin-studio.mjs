@@ -17,7 +17,6 @@ import { wallet, points } from './billing.mjs';
 const STATUSES = ['draft', 'published', 'hidden'];
 const GEN_STATUSES = ['queued', 'running', 'succeeded', 'failed', 'cancelled'];
 const TERMINAL = ['completed', 'failed', 'cancelled'];
-const SESSION_MS = 12 * 3600_000;
 const TEXT = { title: [100, false], prompt: [20000, false], category: [60, false], category_zh: [60, true], model: [100, true], author: [200, true],
   author_url: [2000, true], source_repo: [200, true], source_url: [2000, true], license_note: [2000, true] };
 const FIELDS = [...Object.keys(TEXT), 'tags', 'params', 'template'];
@@ -171,8 +170,10 @@ export function adminStudioRoutes(app, options) {
   app.get('/api/admin/me', async (req) => {
     const roles = await requireRole(req, 'viewer', 'operator', 'admin');
     const u = req.apiUser, created = new Date(u.session_created_at);
+    // 过期时间用登录会话自己的（7 天、访问即续期），管理中台不再额外缩短。
+    const expires = u.session_expires_at ? new Date(u.session_expires_at) : new Date(created.getTime() + 7 * 86400_000);
     return { user: { id: u.id, email: u.email ?? null, name: u.name ?? null }, roles,
-      session: { created_at: created.toISOString(), expires_at: new Date(created.getTime() + SESSION_MS).toISOString() } };
+      session: { created_at: created.toISOString(), expires_at: expires.toISOString() } };
   });
 
   app.get('/api/admin/cases', async (req) => {

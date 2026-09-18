@@ -134,9 +134,10 @@ test('B5 admin API: permission matrix and behaviour', async (t) => {
         ['A', 'PUT', () => `/api/admin/users/${U.target}/roles/viewer`],
         ['A', 'DELETE', () => `/api/admin/users/${U.target}/roles/viewer`],
       ];
-      const expected = { R: { anon: 401, plain: 403, viewer: 200, operator: 200, admin: 200, expired: 401 },
-        W: { anon: 401, plain: 403, viewer: 403, operator: 'ok', admin: 'ok', expired: 401 },
-        A: { anon: 401, plain: 403, viewer: 403, operator: 403, admin: 'ok', expired: 401 } };
+      // 「expired」= 13 小时前登录的管理员：会话时长与官网一致后，它和普通管理员没有区别（2026-09-18）。
+      const expected = { R: { anon: 401, plain: 403, viewer: 200, operator: 200, admin: 200, expired: 200 },
+        W: { anon: 401, plain: 403, viewer: 403, operator: 'ok', admin: 'ok', expired: 'ok' },
+        A: { anon: 401, plain: 403, viewer: 403, operator: 403, admin: 'ok', expired: 'ok' } };
       const failures = [];
       for (const [group, method, url, payload] of routes) {
         for (const who of ['anon', 'plain', 'viewer', 'operator', 'admin', 'expired']) {
@@ -146,20 +147,20 @@ test('B5 admin API: permission matrix and behaviour', async (t) => {
           const want = expected[group][who];
           const ok = want === 'ok' ? res.statusCode >= 200 && res.statusCode < 300 : res.statusCode === want;
           const code = res.statusCode >= 400 ? res.json().error.code : null;
-          const codeOk = { 401: who === 'expired' ? 'admin_session_expired' : 'customer_login_required', 403: 'forbidden_role' }[res.statusCode] ?? code;
+          const codeOk = { 401: 'customer_login_required', 403: 'forbidden_role' }[res.statusCode] ?? code;
           if (!ok || code !== codeOk) failures.push(`${who} ${method} ${path} → ${res.statusCode} ${res.body.slice(0, 200)}`);
         }
       }
       assert.deepEqual(failures, []);
     });
 
-    await t.test('session: 12h admin expiry, Origin on writes, no bearer, me shape', async () => {
+    await t.test('session: 与官网同寿命、写操作校验 Origin、拒绝 bearer、me 形状', async () => {
       const call = await makeApp();
       const me = (await call('admin', 'GET', '/api/admin/me')).json();
       assert.deepEqual(me.roles, ['admin']); assert.equal(me.user.email, 'admin@example.com');
-      assert.equal(Date.parse(me.session.expires_at) - Date.parse(me.session.created_at), 12 * 3600_000);
-      const expired = await call('expired', 'GET', '/api/admin/me');
-      assert.equal(expired.statusCode, 401); assert.equal(expired.json().error.code, 'admin_session_expired');
+      assert.ok(Date.parse(me.session.expires_at) > Date.now(), 'expires_at 用登录会话自己的过期时间');
+      // 13 小时前登录的管理员照样可用：管理中台不再额外要求「最近 12 小时登录过」。
+      assert.equal((await call('expired', 'GET', '/api/admin/me')).statusCode, 200);
       const evil = await call('admin', 'POST', '/api/admin/cases/bulk-status', { ids: ['x'], status: 'draft' }, { origin: 'https://evil.test' });
       assert.equal(evil.statusCode, 403); assert.equal(evil.json().error.code, 'origin_not_allowed');
       assert.equal((await call('admin', 'GET', '/api/admin/me', undefined, { origin: 'https://evil.test' })).statusCode, 200, 'GET is not origin-checked');

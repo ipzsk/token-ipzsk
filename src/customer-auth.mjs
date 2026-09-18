@@ -78,7 +78,7 @@ export function createCustomerAuth({db,secret,origin,mailer,captcha=unavailableC
       const session=await auth.api.getSession({headers:fromNodeHeaders(headers)});
       if(!session)throw httpError(401,'customer_login_required');
       const row=await ensureCustomer(session.user);
-      return {...row,token_id:null,session_id:session.session.id,session_created_at:session.session.createdAt};
+      return {...row,token_id:null,session_id:session.session.id,session_created_at:session.session.createdAt,session_expires_at:session.session.expiresAt};
     },
   };
 }
