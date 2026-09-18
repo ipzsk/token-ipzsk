@@ -40,6 +40,10 @@ test('catalog → ModelSpec: kinds, case-preserved values, defaults, unsupported
     ] } }] })[0];
   assert.deepEqual(withDefaults.params.find((p) => p.field === 'resolution').default, '1K', 'lanehub 给的默认值优先');
   assert.deepEqual(withDefaults.params.find((p) => p.field === 'enhance_prompt').default, 'false', '开关没给默认值时默认关闭，不替用户选加价项');
+  // lanehub 的 image_urls.counts 是上游实际接受的张数，比这边的手抄表新。
+  const byCounts = mediaModelsFromCatalog({ models: [{ id: 'seedance-2.0-mini', kind: 'video', billing: { unit: 'per_second' },
+    params: { registered: true, fields: [{ field: 'image_urls', counts: [1, 2, 3, 9] }, { field: 'prompt' }] } }] })[0];
+  assert.equal(byCounts.references.maxImages, 9, 'counts 覆盖手抄表');
   assert.equal(referencesFor('gpt-image-2.5-sunburst').maxImages, 15);
   assert.equal(referencesFor('gpt-image-20').maxImages, 0);
 });

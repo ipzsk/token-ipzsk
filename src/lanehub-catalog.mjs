@@ -94,6 +94,11 @@ export function mediaModelsFromCatalog(catalog) {
     const references = referencesFor(m.id);
     // 白名单已录入却不收 image_urls，或明确标了不支持：这个型号实际收不了参考图。
     if (fields.some((f) => f.field === 'image_urls' && f.unsupported) || (m.params?.registered && !supported('image_urls'))) references.maxImages = 0;
+    // lanehub 现在按型号下发 image_urls.counts（上游实际接受的张数）：它比这边的手抄表新，优先用。
+    else {
+      const counts = fields.find((f) => f.field === 'image_urls')?.counts;
+      if (counts?.length) references.maxImages = Math.max(...counts.map(Number).filter(Number.isFinite));
+    }
     if (supported('first_frame_image')) references.firstFrame = true;
     if (supported('last_frame_image')) references.lastFrame = true;
     const unsupported = {};
