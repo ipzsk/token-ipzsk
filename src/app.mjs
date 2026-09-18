@@ -1,6 +1,6 @@
 import { workspaceRoutes } from './workspace.mjs';
 import { imageArchiveRoutes } from './image-archive.mjs';
-import {desktopReleaseRoutes} from './desktop-releases.mjs';
+import {desktopReleaseRoutes, desktopDownloadRoutes} from './desktop-releases.mjs';
 import {developerRoutes} from './developers.mjs';
 import { pluginRoutes } from './plugins.mjs';
 import { adminAccountRoutes } from './admin-accounts.mjs';
@@ -84,6 +84,7 @@ export async function createApp(options) {
     app.get(path, async (_req, reply) => reply.type(type + '; charset=utf-8').send(content));
   }
   desktopReleaseRoutes(app,options);
+  desktopDownloadRoutes(app,options);
   adminRoutes(app,options);
   gatewayRoutes(app,options);
   imageArchiveRoutes(app,options);

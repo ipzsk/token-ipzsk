@@ -233,6 +233,13 @@ export const schemas = {
   CaseCategory: object({ category: string, category_zh: nullable(string), count: int(0) }),
   CaseCategories: object({ items: array(ref('CaseCategory')) }),
 
+  // ── 桌面端安装包（公开）──
+  // 安装包存私有 R2 的 desktop/<version>/，url 是时间切片签名 GET（同案例图，几小时内稳定可缓存）。
+  DesktopReleaseFile: object({ platform: lit('mac', 'mac-intel', 'windows'), name: string, bytes: int(1), sha256: string, url: string }),
+  DesktopRelease: object({ version: string, released_at: datetime, files: array(ref('DesktopReleaseFile'), 10) }),
+  // version 省略取 desktop/latest.json；给了就取 desktop/<version>/manifest.json。
+  DesktopReleaseQuery: object({ version: opt(string) }),
+
   // ── 角色 ──
   Role: lit('admin', 'operator', 'viewer'),
   RolesResponse: object({ roles: array(ref('Role')) }),

@@ -225,6 +225,24 @@ test('B4: canvas, folders, case import, public cases, favorites, backfill, video
       assert.equal((await app.inject({ url: '/api/public/case-categories', remoteAddress: '198.51.100.7' })).statusCode, 429);
     });
 
+    await t.test('public desktop-release: signed installer URLs from R2, CORS, 503 when the bucket has nothing', async () => {
+      assert.equal((await pub('/api/public/desktop-release')).statusCode, 503, 'empty bucket');
+      const release = { version: '2.0.7', released_at: '2026-09-01T00:00:00.000Z',
+        files: [{ platform: 'mac', name: 'IPZSK.Desktop-2.0.7-arm64.dmg', bytes: 187_000_000, sha256: 'b'.repeat(64) }] };
+      await r2.storage.put('desktop/2.0.7/manifest.json', Buffer.from(JSON.stringify(release)), 'application/json');
+      await r2.storage.put('desktop/latest.json', Buffer.from(JSON.stringify(release)), 'application/json');
+      const r = await pub('/api/public/desktop-release', { origin: 'https://www.ipzsk.com' });
+      assert.equal(r.statusCode, 200, r.body);
+      assert.equal(r.headers['cache-control'], 'private, max-age=300');
+      assert.equal(r.headers['access-control-allow-origin'], 'https://www.ipzsk.com');
+      const [file] = r.json().files;
+      assert.deepEqual({ ...r.json(), files: [{ ...file, url: undefined }] }, { ...release, files: [{ ...release.files[0], url: undefined }] });
+      assert.match(file.url, /^https:\/\/\w+\.r2\.cloudflarestorage\.com\/ipzsk-media\/desktop\/2\.0\.7\/IPZSK\.Desktop-2\.0\.7-arm64\.dmg\?.*X-Amz-Signature=/);
+      assert.equal((await pub('/api/public/desktop-release?version=2.0.7')).json().version, '2.0.7');
+      assert.equal((await pub('/api/public/desktop-release?version=9.9.9')).statusCode, 503);
+      assert.equal((await pub('/api/public/desktop-release?version=latest')).statusCode, 400);
+    });
+
     await t.test('favorites: case must exist and be published', async () => {
       assert.equal((await call(alice, 'PUT', '/api/me/favorites/case/20000')).statusCode, 204);
       assert.equal((await call(alice, 'PUT', '/api/me/favorites/case/30002')).statusCode, 404, 'draft');

@@ -2373,6 +2373,17 @@
       "response": "InspirationCaseDetail"
     },
     {
+      "auth": "public",
+      "errors": [
+        "desktop_release_unavailable",
+        "invalid_version"
+      ],
+      "method": "GET",
+      "path": "/api/public/desktop-release",
+      "query": "DesktopReleaseQuery",
+      "response": "DesktopRelease"
+    },
+    {
       "auth": "bearer",
       "errors": [
         "anchor_not_succeeded",
@@ -3689,6 +3700,12 @@
       ]
     },
     {
+      "code": "desktop_release_unavailable",
+      "status": [
+        503
+      ]
+    },
+    {
       "code": "developer_application_exists",
       "status": [
         409
@@ -4542,6 +4559,12 @@
     },
     {
       "code": "invalid_variables",
+      "status": [
+        400
+      ]
+    },
+    {
+      "code": "invalid_version",
       "status": [
         400
       ]

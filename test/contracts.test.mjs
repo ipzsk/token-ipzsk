@@ -73,7 +73,10 @@ const db = {
   },
   async tx(fn) { return fn(db); },
 };
-const storage = { presignGetSliced: (k) => 'https://r2.test/' + k, presignPut: () => 'https://r2.test/put', getUrl: (k) => 'https://r2.test/' + k };
+const desktopLatest = { version: '2.0.7', released_at: '2026-09-01T00:00:00.000Z',
+  files: [{ platform: 'mac', name: 'IPZSK.Desktop-2.0.7-arm64.dmg', bytes: 187_000_000, sha256: 'b'.repeat(64) }] };
+const storage = { presignGetSliced: (k) => 'https://r2.test/' + k, presignPut: () => 'https://r2.test/put', getUrl: (k) => 'https://r2.test/' + k,
+  getRange: async () => Buffer.from(JSON.stringify(desktopLatest)) };
 const catalog = { models: [{ id: 'gpt-image-2.5-flare', name: 'Flare', kind: 'image', billing: { unit: 'per_call', tiers: { '1K': 1 } },
   params: { registered: true, fields: [{ field: 'resolution', values: ['1K', '2K'] }, { field: 'image_urls' }, { field: 'duration', unsupported: '图片没有时长' }] } },
   { id: 'heygen-avatar-iii', name: 'Avatar III', kind: 'video', mode: 'avatar', inputs: { required: ['avatar_id'], one_of: ['script', 'audio_url'], max_length: { script: 5000 } },
@@ -124,6 +127,7 @@ test('real handler responses match contracts-schema', async () => {
     const tpl = (await check('GET /api/me/templates', '/api/me/templates?limit=10')).json().items[0];
     assert.deepEqual(tpl.cover, { id: A2, status: 'deleted', missing: true }, 'template cover MissingAsset exercised');
     assert.equal(tpl.reference_assets[A1].urls.orig, `https://r2.test/u/${USER}/${A1}/orig.png`, 'template reference MediaAsset exercised');
+    await check('GET /api/public/desktop-release', '/api/public/desktop-release');
     await check('GET /api/me/subjects', '/api/me/subjects');
     await check('GET /api/me/favorites', '/api/me/favorites');
     await check('PUT /api/me/favorites/:type/:id', `/api/me/favorites/asset/${A1}`, { status: 204 });

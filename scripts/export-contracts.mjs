@@ -17,10 +17,11 @@ import { routeMeta as caseMeta } from '../src/cases.mjs';
 import { routeMeta as roleMeta } from '../src/roles.mjs';
 import { routeMeta as adminMeta } from '../src/admin-studio.mjs';
 import { routeMeta as opsMeta } from '../src/admin-ops.mjs';
+import { routeMeta as desktopMeta } from '../src/desktop-releases.mjs';
 
 const ROOT = new URL('../', import.meta.url);
 export const PREFIXES = ['/api/me/', '/api/public/', '/api/admin/', '/api/auth/', '/api/account/', '/api/videos/', '/api/desktop/', '/v1/'];
-export const ROUTE_META = { ...studioMeta, ...uploadMeta, ...libraryMeta, ...caseMeta, ...roleMeta, ...adminMeta, ...opsMeta };
+export const ROUTE_META = { ...studioMeta, ...uploadMeta, ...libraryMeta, ...caseMeta, ...roleMeta, ...adminMeta, ...opsMeta, ...desktopMeta };
 // app.mjs 错误处理器里生成的码（不是字面 httpError 调用）。
 const HANDLER_CODES = [['already_exists', 409], ['invalid_request', 400], ['internal_error', 500]];
 

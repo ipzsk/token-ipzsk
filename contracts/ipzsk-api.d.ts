@@ -433,6 +433,21 @@ export interface ChannelSummary {
 export interface DeletedCount {
   deleted: number // integer 0..
 }
+export interface DesktopRelease {
+  version: string
+  released_at: IsoTime
+  files: DesktopReleaseFile[] // max 10 items
+}
+export interface DesktopReleaseFile {
+  platform: "mac" | "mac-intel" | "windows"
+  name: string
+  bytes: number // integer 1..
+  sha256: string
+  url: string
+}
+export interface DesktopReleaseQuery {
+  version?: string
+}
 export type Empty = void
 export interface Favorite {
   target_type: FavoriteType
@@ -1080,5 +1095,6 @@ export interface Endpoints {
   "GET /api/public/case-categories": { body: never; response: CaseCategories }
   "GET /api/public/cases": { body: never; response: Page<InspirationCase> }
   "GET /api/public/cases/:id": { body: never; response: InspirationCaseDetail }
+  "GET /api/public/desktop-release": { body: never; response: DesktopRelease }
   "POST /v1/quote": { body: BearerQuoteBody; response: UpstreamPassthrough }
 }
