@@ -59,8 +59,9 @@ export function createR2Storage(config, fetcher = fetch, clock = () => new Date(
     if (typeof key !== 'string' || key.split('/').some(p => !p || p === '.' || p === '..')) throw new Error('invalid_object_key');
     return `/${config.bucket}/${key.split('/').map(encode).join('/')}`;
   }
-  async function send(method, key, { headers = {}, body, timeout = 30000 } = {}) {
-    const path = objectPath(key), date = clock(), payloadHash = digest(body ?? '');
+  // hash: 调用方已经算好的 payload sha256。流式上传（Blob/文件）靠它签名，不必把整个文件读进内存再 digest。
+  async function send(method, key, { headers = {}, body, timeout = 30000, hash } = {}) {
+    const path = objectPath(key), date = clock(), payloadHash = hash ?? digest(body ?? '');
     const signed = { ...headers, 'x-amz-content-sha256': payloadHash, 'x-amz-date': amzDate(date) };
     return fetcher(new URL(`https://${host}${path}`), { method, redirect: 'error', signal: AbortSignal.timeout(timeout), body,
       headers: { ...signed, authorization: authorization({ ...creds, method, path, date, headers: signed, payloadHash }) } });
@@ -68,8 +69,12 @@ export function createR2Storage(config, fetcher = fetch, clock = () => new Date(
   const presign = (method, key, date, expiresSec, headers) => presignUrl({ ...creds, method, path: objectPath(key), date, expiresSec, headers });
   return {
     archiveFrom: new Date(config.archiveFrom).toISOString(),
-    async put(key, body, type, { cacheControl } = {}) {
-      const response = await send('PUT', key, { body, headers: { 'content-type': type, ...(cacheControl ? { 'cache-control': cacheControl } : {}) } });
+    // timeout/hash/metadata 只有大文件上传用得上（scripts/upload-desktop-release.mjs）；日常小对象仍是默认 30s。
+    // ponytail: 单次 PUT，R2 上限 5GB。这个客户端没有 multipart，安装包真超过 5GB 或需要断点续传再加。
+    async put(key, body, type, { cacheControl, timeout, hash, metadata } = {}) {
+      const response = await send('PUT', key, { body, hash, ...(timeout ? { timeout } : {}),
+        headers: { 'content-type': type, ...(cacheControl ? { 'cache-control': cacheControl } : {}),
+          ...Object.fromEntries(Object.entries(metadata ?? {}).map(([k, v]) => ['x-amz-meta-' + k, String(v)])) } });
       await response.body?.cancel();
       if (!response.ok) throw new Error('r2_upload_failed'); // Never include signed URLs or provider error bodies.
     },
@@ -88,7 +93,9 @@ export function createR2Storage(config, fetcher = fetch, clock = () => new Date(
       await response.body?.cancel();
       if (response.status === 404) return null;
       if (!response.ok) throw new Error('r2_head_failed');
-      return { bytes: Number(response.headers.get('content-length')), contentType: response.headers.get('content-type') };
+      // sha256: 上传时写进去的 x-amz-meta-sha256（没有就是 null，比如 CI 传的对象）。
+      return { bytes: Number(response.headers.get('content-length')), contentType: response.headers.get('content-type'),
+        sha256: response.headers.get('x-amz-meta-sha256') };
     },
     async getRange(key, start, end) {
       const response = await send('GET', key, { headers: { range: `bytes=${start}-${end}` } });

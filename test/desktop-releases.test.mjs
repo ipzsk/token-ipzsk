@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';import { uploadDesktopRelease } from '../scripts/upload-desktop-release.mjs';
+import { createHash } from 'node:crypto';import { uploadDesktopRelease, uploadTimeoutMs } from '../scripts/upload-desktop-release.mjs';
 import test from 'node:test';import assert from 'node:assert/strict';import Fastify from 'fastify';import {desktopReleaseRoutes,desktopDownloadRoutes,parseDesktopManifest} from '../src/desktop-releases.mjs';
 test('desktop updates use the IPZSK release channel and exact-version downloads',async()=>{
  const app=Fastify();let calls=0;desktopReleaseRoutes(app,{readDesktopReleases:async()=>({stable:{version:'2.0.6',assets:{'darwin-arm64':'IPZSK-Desktop-2.0.6-arm64.dmg'}}}),desktopReleaseFetch:async(url,init)=>{calls++;assert.match(url,/github.com\/JayceHuang\/ipzsk-dsh-desktop\/releases\/download\/v2.0.6\//);assert.equal(init.headers,undefined);return new Response('fixture-image')}});
@@ -71,24 +71,56 @@ test('desktop-release without R2 configured is 503, never a raw storage error', 
   } finally { await app.close() }
 });
 
-test('upload-desktop-release: sha256 + manifest + latest, skips an object already the right size', async () => {
-  const { mkdtemp, writeFile } = await import('node:fs/promises');
-  const dir = await mkdtemp((await import('node:path')).join((await import('node:os')).tmpdir(), 'dsh-'));
-  await writeFile(dir + '/IPZSK.Desktop-2.0.7-arm64.dmg', 'mac-arm');
-  await writeFile(dir + '/DSH-Desktop-2.0.7-x64-Setup.exe', 'win');
-  await writeFile(dir + '/latest.yml', 'ignored'); // 不是安装包
-  const objects = new Map([['desktop/2.0.7/IPZSK.Desktop-2.0.7-arm64.dmg', 7]]);
+test('upload-desktop-release: scales the timeout with size instead of the 30s default', () => {
+  // 180MB 在默认 30 秒里必然超时（线上就是这么挂的）；按 50 KB/s 下限给时间。
+  assert.equal(uploadTimeoutMs(0), 60_000);
+  assert.ok(uploadTimeoutMs(180_070_247) > 55 * 60_000, '180MB 至少给到 55 分钟');
+  assert.ok(uploadTimeoutMs(180_070_247) < 90 * 60_000, '也不能无限等');
+});
+
+test('upload-desktop-release: streams the file, records sha256, skips an object already identical', async () => {
+  const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-'));
+  await writeFile(join(dir, 'IPZSK.Desktop-2.0.7-arm64.dmg'), 'mac-arm');
+  await writeFile(join(dir, 'DSH-Desktop-2.0.7-x64-Setup.exe'), 'win');
+  await writeFile(join(dir, 'latest.yml'), 'ignored'); // 不是安装包
+  const macSha = createHash('sha256').update('mac-arm').digest('hex');
+  const winSha = createHash('sha256').update('win').digest('hex');
+
+  // 安装包用「像 Blob」的对象上传（只有 size，没有内容进内存）；两份 JSON 仍是 Buffer。
+  const openBlob = async (path) => ({ size: (await (await import('node:fs/promises')).stat(path)).size, isBlob: true });
+  const heads = new Map([['desktop/2.0.7/IPZSK.Desktop-2.0.7-arm64.dmg', { bytes: 7, sha256: macSha }]]);
   const puts = [];
-  const storage = { head: async (k) => (objects.has(k) ? { bytes: objects.get(k) } : null),
-    put: async (k, body) => { puts.push(k); objects.set(k, body.length); } };
-  const manifest = await uploadDesktopRelease(storage, '2.0.7', dir, { releasedAt: '2026-09-01T00:00:00Z', log: () => {} });
+  const storage = { head: async (k) => heads.get(k) ?? null, put: async (k, body, type, opts = {}) => { puts.push({ k, body, type, opts }); } };
+  const run = () => uploadDesktopRelease(storage, '2.0.7', dir, { releasedAt: '2026-09-01T00:00:00Z', log: () => {}, openBlob });
+
+  const manifest = await run();
   assert.deepEqual(manifest.files.map((f) => [f.platform, f.name, f.bytes]),
     [['windows', 'DSH-Desktop-2.0.7-x64-Setup.exe', 3], ['mac', 'IPZSK.Desktop-2.0.7-arm64.dmg', 7]]);
-  assert.equal(manifest.files[1].sha256, createHash('sha256').update('mac-arm').digest('hex'));
-  assert.deepEqual(puts, ['desktop/2.0.7/DSH-Desktop-2.0.7-x64-Setup.exe', 'desktop/2.0.7/manifest.json', 'desktop/latest.json'], 'arm64 dmg already uploaded');
-  // 幂等：再跑一次不再传安装包，两份 JSON 内容不变。
+  assert.equal(manifest.files[1].sha256, macSha);
+  assert.deepEqual(puts.map((p) => p.k), ['desktop/2.0.7/DSH-Desktop-2.0.7-x64-Setup.exe', 'desktop/2.0.7/manifest.json', 'desktop/latest.json'],
+    'sha256 与大小都对得上的 arm64 dmg 不重传');
+
+  const exe = puts[0];
+  assert.deepEqual(exe.body, { size: 3, isBlob: true }, '安装包是流式 Blob，不是 Buffer');
+  assert.equal(exe.opts.hash, winSha, '签名直接用算好的 sha256，不再把文件读进内存 digest');
+  assert.deepEqual(exe.opts.metadata, { sha256: winSha }, '写进 x-amz-meta-sha256，下次好校验');
+  assert.equal(exe.opts.timeout, uploadTimeoutMs(3));
+  assert.match(exe.opts.cacheControl, /immutable/);
+  assert.equal(puts[1].opts.timeout, undefined, '小 JSON 仍走默认 30s');
+
+  // 大小一样但 sha256 对不上 ⇒ 必须重传；对象上没记 sha256（CI 传的）⇒ 只按大小判断，不白传几百 MB。
   puts.length = 0;
-  assert.deepEqual(await uploadDesktopRelease(storage, '2.0.7', dir, { releasedAt: '2026-09-01T00:00:00Z', log: () => {} }), manifest);
-  assert.deepEqual(puts, ['desktop/2.0.7/manifest.json', 'desktop/latest.json']);
-  await (await import('node:fs/promises')).rm(dir, { recursive: true });
+  heads.set('desktop/2.0.7/IPZSK.Desktop-2.0.7-arm64.dmg', { bytes: 7, sha256: 'c'.repeat(64) });
+  await run();
+  assert.ok(puts.some((p) => p.k.endsWith('arm64.dmg')), 'sha256 不一致要重传');
+
+  puts.length = 0;
+  heads.set('desktop/2.0.7/IPZSK.Desktop-2.0.7-arm64.dmg', { bytes: 7, sha256: null });
+  assert.deepEqual(await run(), manifest);
+  assert.ok(!puts.some((p) => p.k.endsWith('arm64.dmg')), '没有 sha256 元数据时按大小认定已存在');
+
+  await rm(dir, { recursive: true });
 });

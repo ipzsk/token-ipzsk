@@ -59,6 +59,28 @@ test('presigned PUT signs content-length and content-type into the canonical req
   assert.equal(url.searchParams.get('X-Amz-Signature'), h(key, sts).toString('hex'));
 });
 
+test('put streams a large body: caller-supplied sha256 signs it, metadata and timeout ride along', async () => {
+  const seen = [];
+  const fetcher = async (url, init) => { seen.push({ url: String(url), init }); return new Response(null, { status: 200 }); };
+  const r2 = createR2Storage(config, fetcher, () => new Date('2026-09-17T01:02:03Z'));
+  const sha = 'd'.repeat(64);
+  const blob = { size: 180_070_247 }; // 站位：真实调用传的是 openAsBlob 的文件 Blob，不进内存
+  await r2.put('desktop/2.0.7/a.dmg', blob, 'application/octet-stream',
+    { cacheControl: 'public, max-age=31536000, immutable', hash: sha, metadata: { sha256: sha }, timeout: 3_600_000 });
+  const { init } = seen[0];
+  assert.equal(init.body, blob, 'body 原样交给 fetch，没有被读成 Buffer');
+  assert.equal(init.headers['x-amz-content-sha256'], sha, '签名用调用方算好的 hash');
+  assert.equal(init.headers['x-amz-meta-sha256'], sha);
+  assert.match(init.headers.authorization, /SignedHeaders=cache-control;content-type;host;x-amz-content-sha256;x-amz-date;x-amz-meta-sha256,/);
+  assert.ok(init.signal instanceof AbortSignal);
+
+  // 默认路径没被削弱：不传 timeout/hash 时仍是 30 秒、仍对 body 本身求 digest。
+  seen.length = 0;
+  await r2.put('u/x/y/orig.png', 'hi', 'image/png');
+  assert.equal(seen[0].init.headers['x-amz-content-sha256'], createHash('sha256').update('hi').digest('hex'));
+  assert.equal(seen[0].init.headers['x-amz-meta-sha256'], undefined);
+});
+
 test('time-sliced GET URLs are stable inside a slice and never near expiry', () => {
   let now = new Date('2026-09-17T06:00:00Z');
   const r2 = createR2Storage(config, fetch, () => now);
