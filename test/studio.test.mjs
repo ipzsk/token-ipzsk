@@ -35,6 +35,23 @@ test('catalog → ModelSpec: kinds, case-preserved values, defaults, unsupported
   assert.equal(referencesFor('gpt-image-20').maxImages, 0);
 });
 
+// lanehub 只给入参契约登记过的 HeyGen 型号 mode；没 mode 的那几条（heygen-video-agent /
+// heygen-video-translate）在 lanehub 里没有提交路径，工作台点了必失败，不进目录。
+test('目录过滤：没有 mode 的 heygen 型号不下发', () => {
+  const ids = (models) => mediaModelsFromCatalog({ models }).map((m) => m.id);
+  assert.deepEqual(ids([
+    { id: 'heygen-video-agent', kind: 'video', billing: { unit: 'per_minute_output' } },
+    { id: 'heygen-video-translate', kind: 'video', billing: { unit: 'per_minute_output' } },
+    { id: 'heygen-avatar', kind: 'video', mode: 'avatar', inputs: { required: ['avatar_id'] }, billing: { unit: 'per_minute_output' } },
+    { id: 'heygen-avatar-iii', kind: 'video', mode: 'avatar', inputs: { required: ['avatar_id'] }, billing: { unit: 'per_minute_output' } },
+    { id: 'heygen-image', kind: 'video', billing: { unit: 'per_minute_output' }, params: { registered: true, passthrough: ['script'], fields: [{ field: 'image_urls' }] } },
+    { id: 'seedance-2.0-mini', kind: 'video', billing: { unit: 'per_second' } },
+  ]), ['heygen-avatar', 'heygen-avatar-iii', 'heygen-image', 'seedance-2.0-mini']);
+  // mode 是 HeyGen 专有的：别的厂商没有 mode 也照常下发。
+  assert.deepEqual(ids([{ id: 'sora-2', kind: 'video', billing: { unit: 'per_second' } }]), ['sora-2']);
+  assert.equal(mediaModelsFromCatalog({ models: [{ id: 'heygen-avatar', kind: 'video', mode: 'avatar', inputs: { required: ['avatar_id'] }, billing: {} }] })[0].avatar.engine, 'iv');
+});
+
 test('media() caches per refresh and 503s before the first load', async () => {
   let data = catalog;
   const cat = new LanehubCatalog({ call: async () => data }, { log: () => {} });

@@ -61,10 +61,19 @@ export class LanehubCatalog {
 const STUDIO_PARAMS = { aspect_ratio: 'enum', resolution: 'enum', quality: 'enum', mode: 'enum', n: 'integer', duration: 'integer',
   seed: 'integer', scale_by: 'integer', sound: 'boolean', enhance_prompt: 'boolean', negative_prompt: 'string' };
 
+// HeyGen 是唯一带 mode 的产品线：lanehub 的 controller/catalog.go 只在
+// providers/heygen 的入参契约（params.go）登记过这个型号时才给 mode + inputs。
+// 没 mode 的 heygen- 型号意味着 lanehub 压根没有它的提交路径（docs/heygen-onboarding.md：
+// 「这两条线没有提交路径，卖出去必失败」），网关也不知道它收什么参数——目录里既没有
+// duration、也没有 avatar 块，工作台只能摆出一个点了必失败的型号。所以不下发。
+// 今天命中的是 heygen-video-agent / heygen-video-translate；heygen-avatar(-iii) 有
+// mode=avatar、heygen-image/studio/cinematic-avatar 也各有 mode，都照常下发。
+const composableModel = (m) => !/^heygen-/.test(m.id) || Boolean(avatarCatalogSpec(m).mode);
+
 // lanehub 目录 → 网页 ModelSpec。取值原样保留（flare 的 "1K" 不转小写）；目录不给默认值，
 // 比例优先 1:1，其余取第一个取值。
 export function mediaModelsFromCatalog(catalog) {
-  return catalog.models.filter((m) => ['image', 'video'].includes(m.kind) && typeof m.id === 'string').map((m) => {
+  return catalog.models.filter((m) => ['image', 'video'].includes(m.kind) && typeof m.id === 'string' && composableModel(m)).map((m) => {
     const fields = m.params?.fields ?? [];
     const supported = (name) => fields.some((f) => f.field === name && !f.unsupported);
     const params = [];
