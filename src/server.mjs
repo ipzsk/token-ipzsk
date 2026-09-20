@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { databaseFromEnv, bootstrap } from './database.mjs';
 import { Upstream } from './upstream.mjs';
 import { Scheduler } from './scheduler.mjs';
-import { createCustomerAuth } from './customer-auth.mjs';
+import { createCustomerAuth, SIGNUP_BONUS_CNY } from './customer-auth.mjs';
 import { loadMailer } from './email.mjs';
 import { createImageCaptcha } from './captcha.mjs';
 import { createApp } from './app.mjs';
@@ -15,8 +15,9 @@ import { syncImageArchives } from './image-archive.mjs';
 import { cleanupMedia } from './uploads.mjs';
 import { drainThumbJobs, thumbConcurrency, thumbPriority } from './media-thumbs.mjs';
 import { warmAvatarLists } from './studio.mjs';
-import { reconcileLanehubCharges, reconcileLanehubTopups } from './lanehub-charges.mjs';
-import { provisionIfEnabled } from './lanehub.mjs';
+import { reconcileLanehubCharges } from './lanehub-charges.mjs';
+import { loadWaffo } from './waffo.mjs';
+import { deliverPayments } from './payments.mjs';
 
 const db = await databaseFromEnv();
 const secretDir = process.env.UPSTREAM_SECRET_DIR ?? '/run/upstream';
@@ -26,7 +27,6 @@ await bootstrap(db,upstream,{ secretDir,adminPasswordFile:process.env.ADMIN_PASS
   initialModels:(process.env.INITIAL_MODELS ?? 'gpt-4o-mini').split(',').filter(Boolean) });
 await db.recover();
 await upstream.refresh();
-const voucherKey=Buffer.from((await readFile('/run/secrets/voucher-encryption-key','utf8')).trim(),'base64url');
 const origin=process.env.PUBLIC_ORIGIN ?? 'https://api.ipzsk.com';
 const customerAuthSecret=(await readFile('/run/secrets/customer-auth-secret','utf8')).trim();
 const customerAuth=createCustomerAuth({db,origin,secret:customerAuthSecret,
@@ -57,11 +57,10 @@ const lanehubCatalog = lanehub ? new LanehubCatalog(lanehub, { log: (o,msg)=>con
 if (lanehubCatalog) await lanehubCatalog.start();
 // R2 图片归档：没配 R2_CONFIG_FILE 就关掉（日志里会有 image_archive_disabled），生图不受影响。
 const imageStorage = process.env.R2_CONFIG_FILE ? await loadR2Storage(process.env.R2_CONFIG_FILE) : null;
-const appOptions = { db,upstream,voucherKey,customerAuth,imageStorage,
+const appOptions = { db,upstream,customerAuth,imageStorage,waffo:await loadWaffo(),
   lanehub,lanehubCatalog,lanehubAccountId:process.env.LANEHUB_ACCOUNT_ID ?? null,
-  // 新人额度：默认 ¥5。折算汇率显式给，不从对面实时取——同一批新用户按不同汇率
-  // 折算会让「都送了 5 块」变成各自不同的积分。
-  lanehubSignupCny:Number(process.env.LANEHUB_SIGNUP_CNY ?? 5),
+  // 与本地钱包共用注册赠额；旧环境变量不再覆盖 ¥5 的规则。
+  lanehubSignupCny:SIGNUP_BONUS_CNY,
   lanehubUsdCny,lanehubQuotaPerUnit,
   // 可选：HEALTH_DETAILS_TOKEN 让本机以外（如宿主机经 127.0.0.1:3000）也能读 /healthz/details。
   healthToken:process.env.HEALTH_DETAILS_TOKEN || null,
@@ -69,6 +68,13 @@ const appOptions = { db,upstream,voucherKey,customerAuth,imageStorage,
   origin:process.env.PUBLIC_ORIGIN ?? 'https://api.ipzsk.com',secureCookies:true,
   logger:{ level:'warn', redact:['req.headers.authorization','req.headers.cookie','res.headers.set-cookie','password','key','token'] } };
 const app = await createApp(appOptions);
+let paymentsPending;
+const syncPayments = () => {
+  if (appOptions.waffo?.mode !== 'prod' || paymentsPending) return;
+  paymentsPending = deliverPayments(db,lanehub).catch(() => app.log.error('payment_delivery_failed'))
+    .finally(() => { paymentsPending=null; });
+};
+const paymentTimer=setInterval(syncPayments,5000);paymentTimer.unref();syncPayments();
 const syncTimer = setInterval(() => upstream.refresh().catch(() => app.log.error('balance_refresh_failed')),120_000);
 syncTimer.unref();
 const syncCharges = () => upstream.syncTaskCharges().then(result => {
@@ -79,10 +85,6 @@ const syncCharges = () => upstream.syncTaskCharges().then(result => {
     if (!lanehub || !(lanehubUsdCny>0)) return;
     const charges = await reconcileLanehubCharges(db,lanehub,{usdCnyRate:lanehubUsdCny,quotaPerUnit:lanehubQuotaPerUnit});
     if (charges.failed) app.log.warn({failed:charges.failed},'lanehub_charge_sync_failed');
-    // 充值补账：兑换当场那次调用失败时，这里是唯一的补救。
-    const topups = await reconcileLanehubTopups(db,lanehub,{usdCnyRate:lanehubUsdCny,quotaPerUnit:lanehubQuotaPerUnit},
-      (user) => provisionIfEnabled(db,appOptions,user));
-    if (topups.failed) app.log.warn({failed:topups.failed},'lanehub_topup_sync_failed');
   }).catch(() => app.log.error('lanehub_charge_sync_failed'));
 const chargeTimer = setInterval(syncCharges,120_000);
 chargeTimer.unref();
@@ -120,6 +122,7 @@ const mediaTimer=setInterval(syncMedia,5000);mediaTimer.unref();syncMedia();
 let stopping = false;
 for (const event of ['SIGTERM','SIGINT']) process.on(event,async () => {
   if (stopping) return; stopping=true;
+  clearInterval(paymentTimer);await paymentsPending;
   clearInterval(archiveTimer);clearInterval(cleanupTimer);clearInterval(thumbTimer);clearInterval(mediaTimer);clearInterval(syncTimer);clearInterval(proxyTimer);clearInterval(chargeTimer); upstream.close();
   await app.close(); await upstream.pending?.catch(() => {}); await upstream.taskChargesPending?.catch(() => {}); await mediaPending; await archivePending; await cleanupPending; await thumbPending; await db.close();
 });

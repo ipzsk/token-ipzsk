@@ -203,8 +203,8 @@ draft ──freeze──▶ frozen ──pay──▶ paid
 
 ## 六、充值与余额
 
-- 兑换码 → `wallet_entries`（本地流水）→ 立刻搬到 lanehub（幂等键 `voucher:<兑换码 id>`），
-  失败由定时扫描补上
+- Waffo 在线支付 → 服务端验签与订单复核 → 支付工作器发放额度；异常结果转人工核账，详情见 `WAFFO-PAYMENTS.md`。
+- 新用户注册赠送 5 元，仅一次；历史入账记录继续保留。
 - `GET /api/me/wallet`：lanehub 模式下读对面的额度（`source: "lanehub"`），
   本地那张表只剩充值流水
 

@@ -1,5 +1,4 @@
 import { units, decimal } from './billing.mjs';
-import { creditAccount, provisionIfEnabled } from './lanehub.mjs';
 import { accrueEarning } from './earnings.mjs';
 
 // lanehub 模式下这一侧**不预扣也不扣钱**——钱是 lanehub 从客户自己的额度里扣的。
@@ -103,40 +102,6 @@ export async function reconcileLanehubCharges(db, lanehub, options) {
   return { scanned: rows.length, settled, released, failed };
 }
 
-/**
- * 充值补账：兑换码的钱写在这一侧的 wallet_entries 上，而 lanehub 模式下客户花的是
- * lanehub 的额度——不搬过去，那笔钱就躺在一个花不掉的钱包里。
- *
- * 幂等键是 `voucher:<兑换码 id>`，所以兑换当场调一次、这里再扫一次，都只会入账一次。
- * 兑换成功后的那次调用失败（lanehub 抖一下）时，这个扫描就是唯一的补救。
- */
-export async function reconcileLanehubTopups(db, lanehub, options, provision) {
-  const { rows } = await db.query(`SELECT e.id,e.user_id,e.voucher_id,e.amount_cny,e.created_at,u.name,
-      (SELECT min(m.created_at) FROM lanehub_credits m WHERE m.user_id=e.user_id AND m.reference LIKE 'migrate:%') AS migrated_at
-    FROM wallet_entries e
-    JOIN users u ON u.id=e.user_id
-    LEFT JOIN lanehub_credits c ON c.reference='voucher:'||e.voucher_id
-    WHERE e.voucher_id IS NOT NULL AND c.reference IS NULL ORDER BY e.created_at LIMIT 20`);
-  let applied = 0, failed = 0;
-  for (const row of rows) {
-    // 迁移搬的是**净余额**，历史兑换码早已包含在里面。不设这道闸的话，老客户的每一张
-    // 旧兑换码都会被当成「没补上的充值」再加一遍——2026-09-13 上线时就是这么多送出去
-    // ¥130 的。没有迁移记录的客户（迁移之后才注册的）不受影响，他的兑换码全都要补。
-    if (row.migrated_at && new Date(row.created_at) <= new Date(row.migrated_at)) continue;
-    try {
-      const account = await provision({ userId: row.user_id, name: row.name });
-      if (!account) break;               // 开关关着，这整件事就不该发生
-      const result = await creditAccount(db, lanehub, {
-        userId: row.user_id, lanehubUserId: account.lanehub_user_id, amountCny: row.amount_cny,
-        usdCnyRate: await lanehub.usdRate().catch(() => options.usdCnyRate), quotaPerUnit: options.quotaPerUnit,
-        reference: 'voucher:' + row.voucher_id, remark: '兑换码充值',
-      });
-      if (result.applied) applied++;
-    } catch { failed++; }
-  }
-  return { scanned: rows.length, applied, failed };
-}
-
 /** 客户在 lanehub 的余额，折成人民币。lanehub 模式下这才是他真正能花的钱。 */
 export async function lanehubBalance(lanehub, account, { usdCnyRate, quotaPerUnit }) {
   const quota = Number((await lanehub.balance(account.lanehub_user_id))?.quota ?? 0);
@@ -144,15 +109,4 @@ export async function lanehubBalance(lanehub, account, { usdCnyRate, quotaPerUni
   const amount = quotaToCny(Math.max(0, Math.trunc(quota)), rate, quotaPerUnit);
   // lanehub 不冻结额度（这一侧也不再预扣），所以可用 = 余额。
   return { balance_cny: amount, frozen_cny: '0.00000000', available_cny: amount };
-}
-
-/** 兑换成功后立刻把钱搬到 lanehub。失败不抛——扫描会补，兑换本身已经成立。 */
-export async function creditVoucher(db, lanehub, options, { userId, name, voucherId, amountCny }) {
-  const account = await provisionIfEnabled(db, options, { userId, name });
-  if (!account) return { applied: false, quota: 0 };
-  return creditAccount(db, lanehub, {
-    userId, lanehubUserId: account.lanehub_user_id, amountCny,
-    usdCnyRate: await lanehub.usdRate().catch(() => options.lanehubUsdCny), quotaPerUnit: options.lanehubQuotaPerUnit,
-    reference: 'voucher:' + voucherId, remark: '兑换码充值',
-  });
 }

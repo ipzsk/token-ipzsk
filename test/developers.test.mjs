@@ -7,7 +7,7 @@ import {passwordHash,hash,token,httpError} from '../src/security.mjs';
 
 test('three roles isolate administration, plugin ownership, usage and customer records',async t=>{
  assert.ok(process.env.TEST_DB_HOST);const schema='developer_test_'+randomUUID().replaceAll('-','');
- const config={host:process.env.TEST_DB_HOST,database:'gateway_test',user:'gateway',password:process.env.TEST_DB_PASSWORD};
+ const config={host:process.env.TEST_DB_HOST,port:Number(process.env.TEST_DB_PORT || 5432),database:'gateway_test',user:'gateway',password:process.env.TEST_DB_PASSWORD};
  const setup=database(config);await setup.query(`CREATE SCHEMA ${schema}`);const db=database({...config,options:`-c search_path=${schema}`});let app;
  const alice=randomUUID(),bob=randomUUID(),customer=randomUUID();
  try{
@@ -29,8 +29,8 @@ test('three roles isolate administration, plugin ownership, usage and customer r
    assert.equal((await call(alice,path,undefined,{authorization:'Bearer '+secret})).statusCode,403);
    assert.equal((await call(alice,path+'/apply',{display_name:'Again'},{origin:'https://evil.example'})).statusCode,403);
   });
-  await t.test('only superadmin can review developers, publish plugins, inspect profit or manage vouchers',async()=>{
-   for(const role of ['operator','viewer'])for(const route of ['/developers','/plugins','/plugin-usage','/vouchers/summary','/ledger','/overview','/requests'])assert.equal((await admin(route,undefined,role)).statusCode,403,role+route);
+  await t.test('only superadmin can review developers, publish plugins, inspect profit or inspect wallet entries',async()=>{
+   for(const role of ['operator','viewer'])for(const route of ['/developers','/plugins','/plugin-usage','/wallet/entries','/ledger','/overview','/requests'])assert.equal((await admin(route,undefined,role)).statusCode,403,role+route);
    assert.equal((await admin('/developers/'+alice+'/review',{state:'approved'},'operator')).statusCode,403);
    for(const user of [alice,bob])assert.equal((await admin('/developers/'+user+'/review',{state:'approved'})).statusCode,200);
    assert.equal((await call(alice,path)).json().profile.state,'approved');

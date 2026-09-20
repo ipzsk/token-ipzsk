@@ -20,7 +20,7 @@
 | 模型代理与协议 | src/gateway.mjs、src/agent-protocols.mjs | test/agent-protocols.test.mjs |
 | 用户认证、验证码、凭证 | src/customer-auth.mjs、src/account-keys.mjs、src/captcha.mjs | test/customer-auth.test.mjs、test/captcha.test.mjs |
 | 管理员权限 | src/admin-accounts.mjs、src/security.mjs | test/accounts-billing.test.mjs |
-| 钱包、充值、冻结结算 | src/vouchers.mjs、src/billing.mjs、src/text-pricing.mjs | test/vouchers.test.mjs、test/accounts-billing.test.mjs、docs/ACCOUNT-ARCHITECTURE.md |
+| 钱包、充值、冻结结算 | src/wallet.mjs、src/payments.mjs、src/billing.mjs、src/text-pricing.mjs | test/wallet.test.mjs、test/accounts-billing.test.mjs、docs/ACCOUNT-ARCHITECTURE.md |
 | 插件审核、开发者、分成 | src/plugins.mjs、src/developers.mjs | test/plugins.test.mjs、test/developers.test.mjs、docs/plugin-market.md |
 | 媒体任务与费用 | src/media-task-sync.mjs、src/task-charges.mjs、src/image-results.mjs、src/image-upload.mjs | test/image-upload.test.mjs、test/image-results.test.mjs、docs/ASYNC-IMAGE-TASKS.md |
 | 桌面初始化与版本目录 | src/desktop.mjs、src/desktop-releases.mjs、src/desktop-releases.json | test/desktop-releases.test.mjs |

@@ -11,7 +11,7 @@
 7. 在 `/home/ubuntu/api-gateway` 运行 `sudo docker compose up -d --no-deps --force-recreate gateway`，加载配置。
 8. 在 `/account` 用本人可查收邮箱发验证码，完成真实收信、注册、重新登录测试。配置存在不代表投递已验证。
 
-未配置时邮箱发送返回 503，不生成假验证码，不输出到日志。原 `/redeem` 平台凭证兑换入口保留。后台“用户管理”显示发信配置状态和已验证注册人数。
+未配置时邮箱发送返回 503，不生成假验证码，不输出到日志。新用户完成注册与邮箱验证后赠送 5 元，仅限一次。后台“用户管理”显示发信配置状态和已验证注册人数。
 
 参考：
 - [腾讯云发送邮件 API](https://cloud.tencent.com/document/product/1288/51034)

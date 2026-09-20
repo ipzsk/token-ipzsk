@@ -86,6 +86,8 @@ ALTER TABLE requests ADD COLUMN IF NOT EXISTS cost_recorded_at timestamptz;
 ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS details jsonb;
 INSERT INTO schema_version (version) VALUES (3) ON CONFLICT DO NOTHING;
 
+-- Legacy archive only: retained for historical wallet foreign keys and auditability.
+-- No application routes or workers issue, redeem, export or reconcile these codes.
 CREATE TABLE IF NOT EXISTS voucher_batches (
   id uuid PRIMARY KEY, name text NOT NULL CHECK(length(name) BETWEEN 1 AND 100),
   amount_cny numeric(20,8) NOT NULL CHECK(amount_cny IN (10,50,100)),
@@ -704,3 +706,53 @@ DO $$ BEGIN
   END IF;
 END $$;
 INSERT INTO schema_version(version) VALUES(24) ON CONFLICT DO NOTHING;
+
+-- v25: Waffo checkout orders and durable verified webhook receipts. Test orders never enter wallets.
+CREATE TABLE IF NOT EXISTS payment_orders (
+  id uuid PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES users(id),
+  mode text NOT NULL CHECK(mode IN ('test','prod')),
+  pack_key text NOT NULL CHECK(pack_key IN ('cny_10','cny_50','cny_100')),
+  product_id text NOT NULL,
+  amount_cny numeric(20,8) NOT NULL CHECK(amount_cny IN (10,50,100)),
+  currency text NOT NULL CHECK(currency='CNY'),
+  idempotency_key uuid NOT NULL,
+  target text NOT NULL CHECK(target IN ('test','lanehub','local')),
+  lanehub_user_id integer,
+  quota bigint CHECK(quota>0),
+  checkout_session_id text,
+  provider_order_id text,
+  state text NOT NULL DEFAULT 'creating' CHECK(state IN ('creating','checkout_ready','checkout_failed','paid','crediting','credited','test_completed','refund_review','review_required')),
+  review_reason text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  paid_at timestamptz,
+  credited_at timestamptz,
+  UNIQUE(user_id,idempotency_key), UNIQUE(mode,provider_order_id),
+  CHECK((mode='test')=(target='test')),
+  CHECK(target<>'lanehub' OR (lanehub_user_id IS NOT NULL AND quota IS NOT NULL)),
+  CHECK(mode='prod' OR state NOT IN ('paid','crediting','credited'))
+);
+CREATE INDEX IF NOT EXISTS payment_orders_user ON payment_orders(user_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS payment_orders_delivery ON payment_orders(state,created_at) WHERE state IN ('paid','crediting','review_required','refund_review');
+CREATE TABLE IF NOT EXISTS payment_events (
+  mode text NOT NULL CHECK(mode IN ('test','prod')),
+  event_id text NOT NULL,
+  event_type text NOT NULL,
+  provider_order_id text NOT NULL,
+  order_id uuid NOT NULL REFERENCES payment_orders(id),
+  payload_hash text NOT NULL,
+  received_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY(mode,event_id)
+);
+ALTER TABLE wallet_entries ADD COLUMN IF NOT EXISTS payment_order_id uuid UNIQUE REFERENCES payment_orders(id);
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT 1 FROM schema_version WHERE version=25) THEN
+    ALTER TABLE wallet_entries DROP CONSTRAINT wallet_entries_source_check;
+    ALTER TABLE wallet_entries ADD CONSTRAINT wallet_entries_source_check CHECK (
+      (source='voucher' AND voucher_id IS NOT NULL AND payment_order_id IS NULL) OR
+      (source='signup_bonus' AND voucher_id IS NULL AND payment_order_id IS NULL) OR
+      (source='payment' AND voucher_id IS NULL AND payment_order_id IS NOT NULL));
+    INSERT INTO schema_version(version) VALUES(25);
+  END IF;
+END $$;

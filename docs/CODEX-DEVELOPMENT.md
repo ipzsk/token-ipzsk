@@ -86,9 +86,9 @@ node --test tests/captcha-ui.test.mjs
 | 号池与限流调度 | src/admin.mjs、src/upstream.mjs、src/scheduler.mjs | test/core.test.mjs、test/integration.test.mjs |
 | 模型与媒体协议 | src/gateway.mjs、src/agent-protocols.mjs、src/image-upload.mjs | test/agent-protocols.test.mjs、test/image-upload.test.mjs |
 | 认证与平台凭证 | src/customer-auth.mjs、src/account-keys.mjs、src/captcha.mjs | test/customer-auth.test.mjs、test/captcha.test.mjs |
-| 钱包与价格 | src/billing.mjs、src/vouchers.mjs、src/text-pricing.mjs | test/accounts-billing.test.mjs、test/vouchers.test.mjs、test/text-pricing.test.mjs |
+| 钱包与价格 | src/billing.mjs、src/wallet.mjs、src/payments.mjs、src/text-pricing.mjs | test/accounts-billing.test.mjs、test/wallet.test.mjs、test/text-pricing.test.mjs |
 | 插件与开发者 | src/plugins.mjs、src/developers.mjs | test/plugins.test.mjs、test/developers.test.mjs |
-| 管理端页面 | public/index.html、app.js、accounts.js、plugins.js、vouchers.js | 对应接口测试及浏览器验收 |
+| 管理端页面 | public/index.html、app.js、accounts.js、plugins.js、wallet.js | 对应接口测试及浏览器验收 |
 | 数据库结构 | src/schema.sql、src/database.mjs | 对应隔离数据库集成测试 |
 
 1. 从 createApp 的路由挂载和相关模块开始，读取对应管理界面及测试，明确使用管理员会话、用户会话还是插件凭证。
@@ -250,7 +250,7 @@ dsh plugin --profile web add /ABSOLUTE/PATH/plugin-package.tgz
 | 隔离集成测试 | gateway_test 数据库，gateway 用户 | 负责人安全注入 TEST_DB_PASSWORD；不使用生产库密码 |
 | Vercel 部署 | ipzsk 对应 Vercel 项目 | 自己的已授权账号登录，确认项目绑定；不共享所有者 Token |
 
-服务器秘密相对 /home/ubuntu/api-gateway：secrets/db-password、secrets/db-admin-password、secrets/admin-password、secrets/voucher-encryption-key、secrets/customer-auth-secret、secrets/mail/、secrets/upstream/。这些是运维定位信息，不是允许 Codex 读取或写入文档的授权。正式运行通过文件挂载使用，排查先看配置就绪状态及脱敏错误。
+服务器秘密相对 /home/ubuntu/api-gateway：secrets/db-password、secrets/db-admin-password、secrets/admin-password、secrets/customer-auth-secret、secrets/mail/、secrets/upstream/。这些是运维定位信息，不是允许 Codex 读取或写入文档的授权。正式运行通过文件挂载使用，排查先看配置就绪状态及脱敏错误。
 
 在任务提示中可以写“所需测试凭据已通过环境或受控文件配置，可使用但不得输出”，前提是负责人已实际完成配置。Codex 先检查是否可用，不打印值；缺少权限时继续完成无凭据可做的代码和模拟测试，并明确列出待授权项。
 
@@ -310,7 +310,7 @@ ssh -p 22 -i ~/.ssh/ipzsk_dev_ed25519 ubuntu@43.135.34.238
 | 服务器 | /home/ubuntu/api-gateway/public | 网关管理端静态页面 |
 | 服务器 | /home/ubuntu/api-gateway/compose.yaml；Dockerfile；Caddyfile | 容器编排、网关镜像构建与反向代理配置 |
 | 服务器 | /home/ubuntu/api-gateway/ops | 备份、数据库启动、邮件配置等运维脚本 |
-| 服务器 | /home/ubuntu/api-gateway/secrets | 数据库、会话、充值码和邮件秘密；不纳入源码同步 |
+| 服务器 | /home/ubuntu/api-gateway/secrets | 数据库、会话和邮件秘密；不纳入源码同步 |
 | 服务器 | /home/ubuntu/api-gateway/secrets/upstream | 上游凭证目录；不向客户端或开发仓库分发 |
 | 服务器 | /home/ubuntu/api-gateway/backups | 数据库 dump 及配套受限秘密备份 |
 | 服务器 | /home/ubuntu/api-gateway/downloads | Caddy /downloads/ 静态下载挂载；不等同于官网 GitHub Latest |
@@ -408,7 +408,7 @@ tar -czf "/tmp/ipzsk-source-${archive_stamp}.tgz" src public ops package.json pa
 printf "%s\n" "/tmp/ipzsk-source-${archive_stamp}.tgz"
 ```
 
-备份脚本会创建并校验 backups/gateway-时间戳.dump，同时在相关秘密存在时备份充值码加密密钥、会话秘密和邮件配置。这些备份不上传飞书、GitHub 或普通协作目录。同机备份不能覆盖主机丢失风险；既有文档中的旧 /tmp 备份名称不能作为当前可用回退点。
+备份脚本会创建并校验 backups/gateway-时间戳.dump，同时在相关秘密存在时备份会话秘密和邮件配置。这些备份不上传飞书、GitHub 或普通协作目录。同机备份不能覆盖主机丢失风险；既有文档中的旧 /tmp 备份名称不能作为当前可用回退点。
 
 在本机完成上一节实际同步后，回到远端运行：
 

@@ -11,3 +11,5 @@ downloads/
 *.tgz
 .DS_Store
 src/.deployed-commit
+ops/waffo-prod.json
+ops/waffo-test.json

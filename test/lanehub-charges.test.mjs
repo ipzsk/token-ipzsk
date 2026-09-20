@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { quotaToCny, recordLanehubCharge, reconcileLanehubTopups } from '../src/lanehub-charges.mjs';
+import { quotaToCny, recordLanehubCharge } from '../src/lanehub-charges.mjs';
 
 // 补记账单用的内存库：只认这两条语句。
-function fakeDb(rows = []) {
-  const billing = [], credits = new Map();
+function fakeDb() {
+  const billing = [];
   const db = {
-    billing, credits, topups: rows,
+    billing,
     tx: (work) => work(db),
     async query(sql, args = []) {
       if (/INSERT INTO request_billing/.test(sql)) {
@@ -17,17 +17,7 @@ function fakeDb(rows = []) {
           amount: settled ? args[2] : 0, snapshot: settled ? args[3] : args[2] });
         return { rowCount: 1, rows: [] };
       }
-      // 真 SQL 用 LEFT JOIN lanehub_credits 把已补过的排除掉；这里照做，
-      // 否则测出来的「幂等」是 creditAccount 的，不是这个扫描的。
-      if (/FROM wallet_entries e/.test(sql)) {
-        const pending = rows.filter((r) => !credits.has('voucher:' + r.voucher_id));
-        return { rowCount: pending.length, rows: pending };
-      }
       if (/INSERT INTO plugin_earnings/.test(sql)) return { rowCount: 0, rows: [] };
-      if (/INSERT INTO lanehub_credits/.test(sql)) {
-        if (credits.has(args[0])) return { rowCount: 0, rows: [] };
-        credits.set(args[0], { quota: args[3] }); return { rowCount: 1, rows: [{ reference: args[0] }] };
-      }
       return { rowCount: 0, rows: [] };
     },
   };
@@ -82,43 +72,6 @@ test('日志还没落库时不写行，超时之后写 released 终止重试', a
   const stale = { ...request, completed_at: new Date(Date.now() - 3600_000) };
   assert.equal(await recordLanehubCharge(old, empty(), stale, RATES), 'released');
   assert.equal(old.billing[0].state, 'released');
-});
-
-// 充值失败后补账：同一张兑换码只能补一次，补过的不再出现在待补列表里。
-test('充值补账按 voucher 幂等', async () => {
-  const db = fakeDb([{ id: 'e1', user_id: 'u1', voucher_id: 'v1', amount_cny: '10', name: 'A' }]);
-  const lanehub = fakeLanehub([]);
-  const provision = async () => ({ lanehub_user_id: 7 });
-  const first = await reconcileLanehubTopups(db, lanehub, RATES, provision);
-  const second = await reconcileLanehubTopups(db, lanehub, RATES, provision);
-  assert.equal(first.applied, 1);
-  assert.equal(second.applied, 0, '第二次必须什么都不做');
-  assert.equal(db.credits.get('voucher:v1').quota, Math.round((10 / 7) * 500000));
-});
-
-// 迁移搬的是净余额，历史兑换码已经在里面了。再补一遍就是白送——上线当天送出去 ¥130。
-test('迁移之前的兑换码不再补账，之后的照补', async () => {
-  const db = fakeDb([
-    { id: 'e1', user_id: 'u1', voucher_id: 'v1', amount_cny: '50', name: 'A',
-      created_at: '2026-09-01T00:00:00Z', migrated_at: '2026-09-13T08:30:00Z' },
-    { id: 'e2', user_id: 'u1', voucher_id: 'v2', amount_cny: '10', name: 'A',
-      created_at: '2026-09-13T09:00:00Z', migrated_at: '2026-09-13T08:30:00Z' },
-    { id: 'e3', user_id: 'u2', voucher_id: 'v3', amount_cny: '20', name: 'B',
-      created_at: '2026-09-01T00:00:00Z', migrated_at: null },
-  ]);
-  const result = await reconcileLanehubTopups(db, fakeLanehub([]), RATES, async () => ({ lanehub_user_id: 7 }));
-  assert.equal(result.applied, 2);
-  assert.equal(db.credits.has('voucher:v1'), false, '迁移之前的那张已经在净余额里了');
-  assert.ok(db.credits.has('voucher:v2'), '迁移之后兑的要补');
-  assert.ok(db.credits.has('voucher:v3'), '没迁移过的客户全都要补');
-});
-
-test('开关关着时一分钱都不搬', async () => {
-  const db = fakeDb([{ id: 'e1', user_id: 'u1', voucher_id: 'v1', amount_cny: '10', name: 'A' }]);
-  const lanehub = fakeLanehub([]);
-  const result = await reconcileLanehubTopups(db, lanehub, RATES, async () => null);
-  assert.equal(result.applied, 0);
-  assert.equal(db.credits.size, 0);
 });
 
 // 折算汇率必须取对面的：拿配置里那个去折，实测差 4%（配 7 / 对面 6.7078），

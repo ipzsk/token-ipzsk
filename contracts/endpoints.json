@@ -550,6 +550,29 @@
       "auth": "cookie",
       "errors": [
         "customer_login_required",
+        "forbidden_role",
+        "invalid_id",
+        "invalid_payment_amount",
+        "invalid_payment_event",
+        "invalid_payment_signature",
+        "online_payment_unavailable",
+        "payment_environment_mismatch",
+        "payment_event_conflict",
+        "payment_mismatch",
+        "payment_order_unmatched"
+      ],
+      "method": "GET",
+      "path": "/api/admin/payments",
+      "roles": [
+        "admin",
+        "operator",
+        "viewer"
+      ]
+    },
+    {
+      "auth": "cookie",
+      "errors": [
+        "customer_login_required",
         "forbidden_role"
       ],
       "method": "GET",
@@ -1510,6 +1533,37 @@
     },
     {
       "auth": "cookie_or_bearer",
+      "errors": [
+        "customer_login_required",
+        "invalid_id",
+        "invalid_payment_pack",
+        "online_payment_unavailable",
+        "payment_checkout_already_requested",
+        "payment_checkout_failed",
+        "payment_email_unavailable",
+        "payment_wallet_unavailable"
+      ],
+      "method": "POST",
+      "path": "/api/me/payments/checkout"
+    },
+    {
+      "auth": "cookie_or_bearer",
+      "errors": [
+        "customer_login_required"
+      ],
+      "method": "GET",
+      "path": "/api/me/payments/options"
+    },
+    {
+      "auth": "cookie_or_bearer",
+      "errors": [
+        "customer_login_required"
+      ],
+      "method": "GET",
+      "path": "/api/me/payments/orders"
+    },
+    {
+      "auth": "cookie_or_bearer",
       "errors": [],
       "method": "GET",
       "path": "/api/me/plugin-market"
@@ -2099,22 +2153,6 @@
         "type"
       ],
       "response": "VoiceList"
-    },
-    {
-      "auth": "cookie_or_bearer",
-      "errors": [
-        "credit_reference_required",
-        "invalid_api_token",
-        "invalid_credit_amount",
-        "invalid_voucher",
-        "lanehub_token_create_failed",
-        "lanehub_user_create_failed",
-        "lanehub_username_collision",
-        "not_found",
-        "voucher_unavailable"
-      ],
-      "method": "POST",
-      "path": "/api/me/vouchers/redeem"
     },
     {
       "auth": "cookie_or_bearer",
@@ -3465,24 +3503,6 @@
       ]
     },
     {
-      "code": "batch_already_assigned",
-      "status": [
-        409
-      ]
-    },
-    {
-      "code": "batch_conflict",
-      "status": [
-        409
-      ]
-    },
-    {
-      "code": "batch_expired",
-      "status": [
-        409
-      ]
-    },
-    {
       "code": "billing_not_pending",
       "status": [
         409
@@ -3728,12 +3748,6 @@
       "code": "email_verification_required",
       "status": [
         403
-      ]
-    },
-    {
-      "code": "export_required",
-      "status": [
-        409
       ]
     },
     {
@@ -4056,12 +4070,6 @@
       ]
     },
     {
-      "code": "invalid_denomination",
-      "status": [
-        400
-      ]
-    },
-    {
       "code": "invalid_email",
       "status": [
         400
@@ -4075,12 +4083,6 @@
     },
     {
       "code": "invalid_expiry",
-      "status": [
-        400
-      ]
-    },
-    {
-      "code": "invalid_export_format",
       "status": [
         400
       ]
@@ -4291,6 +4293,30 @@
     },
     {
       "code": "invalid_password",
+      "status": [
+        401
+      ]
+    },
+    {
+      "code": "invalid_payment_amount",
+      "status": [
+        400
+      ]
+    },
+    {
+      "code": "invalid_payment_event",
+      "status": [
+        400
+      ]
+    },
+    {
+      "code": "invalid_payment_pack",
+      "status": [
+        400
+      ]
+    },
+    {
+      "code": "invalid_payment_signature",
       "status": [
         401
       ]
@@ -4546,18 +4572,6 @@
       ]
     },
     {
-      "code": "invalid_voucher",
-      "status": [
-        400
-      ]
-    },
-    {
-      "code": "invalid_voucher_state",
-      "status": [
-        400
-      ]
-    },
-    {
       "code": "invalid_workspace",
       "status": [
         400
@@ -4666,15 +4680,15 @@
       ]
     },
     {
-      "code": "no_available_vouchers",
-      "status": [
-        409
-      ]
-    },
-    {
       "code": "not_found",
       "status": [
         404
+      ]
+    },
+    {
+      "code": "online_payment_unavailable",
+      "status": [
+        503
       ]
     },
     {
@@ -4705,6 +4719,54 @@
       "code": "password_too_short",
       "status": [
         400
+      ]
+    },
+    {
+      "code": "payment_checkout_already_requested",
+      "status": [
+        409
+      ]
+    },
+    {
+      "code": "payment_checkout_failed",
+      "status": [
+        502
+      ]
+    },
+    {
+      "code": "payment_email_unavailable",
+      "status": [
+        409
+      ]
+    },
+    {
+      "code": "payment_environment_mismatch",
+      "status": [
+        400
+      ]
+    },
+    {
+      "code": "payment_event_conflict",
+      "status": [
+        409
+      ]
+    },
+    {
+      "code": "payment_mismatch",
+      "status": [
+        409
+      ]
+    },
+    {
+      "code": "payment_order_unmatched",
+      "status": [
+        409
+      ]
+    },
+    {
+      "code": "payment_wallet_unavailable",
+      "status": [
+        503
       ]
     },
     {
@@ -5087,24 +5149,6 @@
     },
     {
       "code": "voice_id_required",
-      "status": [
-        400
-      ]
-    },
-    {
-      "code": "voucher_not_unused",
-      "status": [
-        409
-      ]
-    },
-    {
-      "code": "voucher_service_unavailable",
-      "status": [
-        503
-      ]
-    },
-    {
-      "code": "voucher_unavailable",
       "status": [
         400
       ]
