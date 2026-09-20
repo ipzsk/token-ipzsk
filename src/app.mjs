@@ -34,15 +34,17 @@ export async function createApp(options) {
       .header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
   });
   // Only the customer website can make credentialed browser requests. Admin stays same-origin.
+  // /v1/* and /api/videos/* are Bearer routes the website calls cross-origin: the preflight must answer
+  // before the auth hook, otherwise the browser sees 401 without CORS headers and never sends the request.
   app.addHook('onRequest', async (req, reply) => {
-    if (!/^\/api\/(auth|me|account|public|admin)\//.test(req.url)) return;
+    if (!/^\/(v1|api\/(auth|me|account|public|admin|videos))\//.test(req.url)) return;
     reply.header('Vary', 'Origin');
     if (req.headers.origin === customerOrigin) {
       reply.header('Access-Control-Allow-Origin', customerOrigin)
         .header('Access-Control-Allow-Credentials', 'true');
       if (req.method === 'OPTIONS') return reply.code(204)
         .header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS')
-        .header('Access-Control-Allow-Headers', 'Content-Type, Idempotency-Key').send();
+        .header('Access-Control-Allow-Headers', 'Authorization, Content-Type, Idempotency-Key').send();
     } else if (req.method === 'OPTIONS') return reply.code(403).send();
   });
   app.options('/api/*', async (_req, reply) => reply.code(403).send());

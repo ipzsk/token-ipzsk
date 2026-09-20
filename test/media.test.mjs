@@ -99,21 +99,26 @@ test('time-sliced GET URLs are stable inside a slice and never near expiry', () 
   }
 });
 
-test('CORS preflight covers public/admin prefixes and write methods; admin console stays same-origin', async () => {
+test('CORS preflight covers public/admin/bearer prefixes and write methods; admin console stays same-origin', async () => {
   const app = await createApp({ db: {}, upstream: {}, scheduler: { keys: new Map(), accounts: new Map() }, origin: 'https://api.ipzsk.com' });
   app.get('/api/public/cache-probe', async (_req, reply) => { reply.header('Cache-Control', 'private, max-age=60'); return {}; });
   try {
     const preflight = (url, origin, method) => app.inject({ url, method: 'OPTIONS', headers: { origin, 'access-control-request-method': method } });
-    for (const prefix of ['/api/auth/x', '/api/me/assets', '/api/account/status', '/api/public/cases', '/api/admin/cases']) {
+    for (const prefix of ['/api/auth/x', '/api/me/assets', '/api/account/status', '/api/public/cases', '/api/admin/cases',
+      '/v1/images/generations', '/v1/videos/generations', '/api/videos/generations']) {
       for (const method of ['GET', 'POST', 'PUT', 'PATCH', 'DELETE']) {
         const r = await preflight(prefix, 'https://www.ipzsk.com', method);
         assert.equal(r.statusCode, 204, prefix + method);
         assert.match(r.headers['access-control-allow-methods'], new RegExp(`\\b${method}\\b`));
-        assert.equal(r.headers['access-control-allow-headers'], 'Content-Type, Idempotency-Key');
+        assert.equal(r.headers['access-control-allow-headers'], 'Authorization, Content-Type, Idempotency-Key');
         assert.equal(r.headers['access-control-allow-origin'], 'https://www.ipzsk.com');
         assert.equal((await preflight(prefix, 'https://evil.example', method)).statusCode, 403);
       }
     }
+    // the browser must be able to read the response too, including the 401 the site shows as "请先登录"
+    const unauth = await app.inject({ url: '/v1/images/generations', method: 'POST', headers: { origin: 'https://www.ipzsk.com' }, payload: {} });
+    assert.equal(unauth.statusCode, 401);
+    assert.equal(unauth.headers['access-control-allow-origin'], 'https://www.ipzsk.com');
     const admin = await preflight('/admin/api/users', 'https://www.ipzsk.com', 'POST');
     assert.ok(admin.statusCode >= 400); assert.equal(admin.headers['access-control-allow-origin'], undefined);
     assert.equal((await app.inject({ url: '/api/public/cache-probe' })).headers['cache-control'], 'private, max-age=60');
