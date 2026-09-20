@@ -1,14 +1,14 @@
 import { setupPlugins } from '/admin/plugins.js';
 import { setupAccounts } from '/admin/accounts.js';
-import { setupVouchers } from '/admin/vouchers.js';
+import { setupWallet } from '/admin/wallet.js';
 const $ = (s) => document.querySelector(s);
 const state = { page:'overview',accounts:[],keys:[],users:[],providerTypes:[],requestPage:1,filter:{},edit:null };
-const titles = { plugins:['插件市场与用量','PLUGIN MARKET'], management:['账户与账单','ACCOUNTS & BILLING'], vouchers:['充值码管理','VOUCHERS'], overview:['服务总览','OVERVIEW'],pool:['API 号池','UPSTREAM POOL'],users:['用户管理','USERS'],requests:['调用记录','REQUEST LOG'] };
+const titles = { plugins:['插件市场与用量','PLUGIN MARKET'], management:['账户与账单','ACCOUNTS & BILLING'], wallet:['入账流水','WALLET'], overview:['服务总览','OVERVIEW'],pool:['API 号池','UPSTREAM POOL'],users:['用户管理','USERS'],requests:['调用记录','REQUEST LOG'] };
 const number = (v) => v === null || v === undefined ? '—' : Number(v).toLocaleString('zh-CN');
 const money = (v) => v === null || v === undefined ? '未同步' : Number(v).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2})+' 元';
 const charge = (v) => v === null || v === undefined ? '待核实' : Number(v).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:8})+' 元';
 const time = (v) => v ? new Date(v).toLocaleString('zh-CN',{hour12:false}) : '尚无记录';
-const errors = {invalid_denomination:'仅支持 10、50、100 元面额。',invalid_expiry:'有效期必须晚于当前时间。',batch_conflict:'重复生成请求参数不一致，请重新打开生成窗口。',export_required:'请先导出并导入售卖网站。',batch_already_assigned:'该批次已经分配，不能改为其他渠道。',batch_expired:'该批次已过期。',voucher_not_unused:'该码已兑换或已作废。',no_available_vouchers:'没有可用的未兑换充值码。',voucher_service_unavailable:'充值码服务尚未就绪。',admin_login_required:'请重新登录。',invalid_password:'密码不正确。',invalid_charge:'请填写非负金额，最多 8 位小数。',charge_not_ready:'请求尚未完成或未发送上游，不能录入扣费。',invalid_api_token:'访问凭证无效。',rate_limited:'操作过于频繁，请稍后再试。',origin_denied:'请求来源不匹配，请使用正式管理台地址。',key_already_exists:'这把 Key 已在号池中。',already_exists:'名称或凭证已存在。',invalid_upstream_key:'请检查 APIMart Key 格式。',internal_error:'服务暂时不可用，请稍后再试。',invalid_models:'请填写至少一个有效模型名称。',invalid_base_url:'上游地址必须是合法的 https 地址，且不带查询参数。',invalid_provider_type:'不支持这个上游类型，请从下拉列表中选择。'};
+const errors = {admin_login_required:'请重新登录。',invalid_password:'密码不正确。',invalid_charge:'请填写非负金额，最多 8 位小数。',charge_not_ready:'请求尚未完成或未发送上游，不能录入扣费。',invalid_api_token:'访问凭证无效。',rate_limited:'操作过于频繁，请稍后再试。',origin_denied:'请求来源不匹配，请使用正式管理台地址。',key_already_exists:'这把 Key 已在号池中。',already_exists:'名称或凭证已存在。',invalid_upstream_key:'请检查 APIMart Key 格式。',internal_error:'服务暂时不可用，请稍后再试。',invalid_models:'请填写至少一个有效模型名称。',invalid_base_url:'上游地址必须是合法的 https 地址，且不带查询参数。',invalid_provider_type:'不支持这个上游类型，请从下拉列表中选择。'};
 function el(tag,text,cls) { const n=document.createElement(tag); if(text!==undefined)n.textContent=text; if(cls)n.className=cls;return n; }
 function notice(message,error=false) { const n=$('#notice');n.textContent=message;n.hidden=false;n.className=error?'error':''; }
 function loginView() { $('#login-view').hidden=false;$('#console-view').hidden=true;document.querySelectorAll('dialog[open]').forEach((d)=>d.close()); }
@@ -103,7 +103,7 @@ async function loadRequests(){
 }
 async function refresh(){
   $('#refresh').disabled=true;
-  try{await ({plugins:pluginUi.refresh,overview, pool:loadPool,users:loadUsers,requests:loadRequests,vouchers:voucherUi.refresh,management:accountUi.refresh}[state.page])();$('#sync-label').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});}
+  try{await ({plugins:pluginUi.refresh,overview, pool:loadPool,users:loadUsers,requests:loadRequests,wallet:walletUi.refresh,management:accountUi.refresh}[state.page])();$('#sync-label').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});}
   finally{$('#refresh').disabled=false;}
 }
 async function go(page){state.page=page;document.querySelectorAll('.page').forEach((n)=>n.hidden=n.id!=='page-'+page);document.querySelectorAll('[data-page]').forEach((b)=>b.classList.toggle('active',b.dataset.page===page));$('#page-title').textContent=titles[page][0];$('#breadcrumb').textContent=titles[page][1];if(page==='requests'){state.users=(await api('/users')).rows;const selected=$('#filter-user').value;$('#filter-user').replaceChildren(new Option('全部用户',''),...state.users.map((u)=>new Option(u.name,u.id)));$('#filter-user').value=selected;}await refresh();}
@@ -142,7 +142,7 @@ $('#filter-form').addEventListener('submit',action(async(e)=>{e.preventDefault()
 $('#prev-page').addEventListener('click',action(async()=>{state.requestPage--;await loadRequests();}));
 $('#next-page').addEventListener('click',action(async()=>{state.requestPage++;await loadRequests();}));
 $('#export-csv').addEventListener('click',()=>{window.location.href='/admin/api/requests/export?'+new URLSearchParams(state.filter);});
-const voucherUi=setupVouchers({api,action,el,table,cell,button,rowActions,money,time,number,notice,formData});
+const walletUi=setupWallet({api,action,table,cell,money,time,number});
 try{await api('/session');$('#login-view').hidden=true;$('#console-view').hidden=false;await enterConsole();}catch{loginView();}
 setInterval(()=>{if(!['management','plugins'].includes(state.page)&&!document.hidden&&!$('#console-view').hidden&&!document.querySelector('dialog[open]'))refresh().catch((e)=>notice(e.message,true));},30000);
 

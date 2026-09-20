@@ -208,7 +208,7 @@ export async function provisionCustomer(db, lanehub, upstream, {
 /**
  * 充值入账：把人民币加到这个客户在 lanehub 的额度上。
  *
- * **幂等键是 reference**（支付单号 / 兑换码 id / 迁移批次+客户）。支付回调重放、
+ * **幂等键是 reference**（注册赠送 / 迁移批次+客户）。注册流程重试、
  * 迁移脚本重跑都必须落到同一个 reference 上——否则每重放一次就是白送一次钱。
  *
  * 先占位再调对面：反过来的话（先加额度再写库）进程在两步之间挂掉，重跑会加两次。

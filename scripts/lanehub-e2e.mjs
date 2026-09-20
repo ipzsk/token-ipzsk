@@ -22,8 +22,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { database } from '../src/database.mjs';
 import { Upstream } from '../src/upstream.mjs';
-import { Lanehub, provisionCustomer, creditAccount } from '../src/lanehub.mjs';
-import { reconcileLanehubCharges, reconcileLanehubTopups } from '../src/lanehub-charges.mjs';
+import { Lanehub, provisionCustomer } from '../src/lanehub.mjs';
+import { reconcileLanehubCharges } from '../src/lanehub-charges.mjs';
 
 const spend = process.argv.includes('--spend');
 const env = (name, fallback) => process.env[name] ?? fallback;
@@ -37,7 +37,7 @@ if (missing.length) {
 
 // 固定的测试身份：跑第二次要落在同一个客户上，否则每跑一次就多一个 lanehub 用户。
 const TEST_USER_ID = env('LANEHUB_E2E_USER_ID', '00000000-0000-4000-8000-00000000e2e1');
-const SIGNUP_CNY = Number(env('LANEHUB_SIGNUP_CNY', '5'));
+const SIGNUP_CNY = 5;
 const USD_CNY = Number(env('LANEHUB_USD_CNY', '7'));
 const QUOTA_PER_UNIT = Number(env('LANEHUB_QUOTA_PER_UNIT', '500000'));
 const MODEL = env('LANEHUB_E2E_MODEL', 'gpt-image-2');
@@ -175,18 +175,6 @@ try {
     check('幂等：重复补记不会多出账单行', billsBefore === billsAfter, `${billsBefore} → ${billsAfter}`);
   }
 
-  // ── 5. 充值补账（不花钱：走的是我们自己的入账，不打上游） ────────────────
-  // 兑换码的钱写在这一侧的 wallet_entries 上，必须搬到 lanehub，否则客户花不掉。
-  const voucherId = env('LANEHUB_E2E_VOUCHER_ID', '00000000-0000-4000-8000-00000000e2e2');
-  const applied = await creditAccount(db, lanehub, {
-    userId: TEST_USER_ID, lanehubUserId: first.lanehub_user_id, amountCny: '1',
-    usdCnyRate: USD_CNY, quotaPerUnit: QUOTA_PER_UNIT, reference: 'voucher:' + voucherId, remark: 'e2e 充值',
-  }).catch(() => ({ applied: false }));
-  const credited = (await db.query('SELECT count(*)::int AS n FROM lanehub_credits WHERE reference=$1', ['voucher:' + voucherId])).rows[0].n;
-  check('充值：兑换码的钱能搬到 lanehub', credited === 1, applied.applied ? '本次入账' : '之前已入账');
-  const sweep = await reconcileLanehubTopups(db, lanehub, { usdCnyRate: USD_CNY, quotaPerUnit: QUOTA_PER_UNIT },
-    async () => ({ lanehub_user_id: first.lanehub_user_id }));
-  check('幂等：补账扫描不会重复入账', sweep.applied === 0, `扫到 ${sweep.scanned} 条待补`);
 } finally {
   await db.close();
 }

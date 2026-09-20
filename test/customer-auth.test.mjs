@@ -21,7 +21,7 @@ test('SES request uses a single recipient and an approved template, with UTC sco
 
 test('password login, verified registration and recovery',async t=>{
   assert.ok(process.env.TEST_DB_HOST);const schema='password_test_'+randomUUID().replaceAll('-','');
-  const config={host:process.env.TEST_DB_HOST,database:'gateway_test',user:'gateway',password:process.env.TEST_DB_PASSWORD};
+  const config={host:process.env.TEST_DB_HOST,port:Number(process.env.TEST_DB_PORT || 5432),database:'gateway_test',user:'gateway',password:process.env.TEST_DB_PASSWORD};
   const setup=database(config);await setup.query(`CREATE SCHEMA ${schema}`);
   const db=database({...config,options:`-c search_path=${schema}`});let app,ip=1;
   const usedProofs=new Set(),checkedProofs=[];const captcha={ready:true,async verify(proof){checkedProofs.push(proof);if(!proof.token.startsWith('test-valid-')||usedProofs.has(proof.token))throw httpError(403,'captcha_invalid');usedProofs.add(proof.token);}};
@@ -31,7 +31,7 @@ test('password login, verified registration and recovery',async t=>{
     await db.migrate();const customerAuth=createCustomerAuth({db,secret:randomBytes(32).toString('base64url'),origin:'https://api.ipzsk.com',mailer,captcha});
     await customerAuth.migrate();await customerAuth.migrate();
     await db.query('INSERT INTO administrators(id,password_hash) VALUES(1,$1)',[await passwordHash('auth-test-admin-password')]);
-    app=await createApp({db,customerAuth,voucherKey:randomBytes(32),upstream:{},scheduler:{keys:new Map(),accounts:new Map()},origin:'https://api.ipzsk.com',secureCookies:true});
+    app=await createApp({db,customerAuth,upstream:{},scheduler:{keys:new Map(),accounts:new Map()},origin:'https://api.ipzsk.com',secureCookies:true});
     const send=(path,body,cookie='',origin='https://www.ipzsk.com')=>app.inject({url:path,method:body?'POST':'GET',payload:body?{captcha:{token:'test-valid-'+randomUUID()},...body}:body,remoteAddress:'192.0.2.'+(ip++),headers:{origin,cookie,'x-forwarded-for':'198.51.100.99'}});
     const auth=(path,body,cookie)=>send('/api/auth'+path,body,cookie);
     const cookies=r=>[].concat(r.headers['set-cookie']??[]).map(x=>x.split(';')[0]).join('; ');
@@ -82,6 +82,16 @@ test('password login, verified registration and recovery',async t=>{
       const signedIn=await login('alice@example.com');assert.equal(signedIn.statusCode,200,signedIn.body);aliceCookie=cookies(signedIn);
       assert.match(aliceCookie,/ipzsk_customer/);assert.match([].concat(signedIn.headers['set-cookie']).join(' '),/HttpOnly/);
       aliceId=(await send('/api/me/profile',undefined,aliceCookie)).json().user.id;
+    });
+    await t.test('verified signup receives exactly 5 yuan once, including concurrent repeat visits',async()=>{
+      await Promise.all(Array.from({length:5},()=>send('/api/me/profile',undefined,aliceCookie)));
+      const fresh=cookies(await login('alice@example.com'));
+      const balance=await send('/api/me/wallet',undefined,fresh);
+      assert.equal(balance.statusCode,200,balance.body);
+      assert.equal(balance.json().available_cny,'5.00000000');
+      assert.equal(balance.json().available_points,'500.00');
+      const credits=(await db.query("SELECT amount_cny,source FROM wallet_entries WHERE user_id=$1",[aliceId])).rows;
+      assert.deepEqual(credits,[{amount_cny:'5.00000000',source:'signup_bonus'}]);
     });
     await t.test('login never registers and remains available without mail service',async()=>{
       assert.equal((await login('missing@example.com')).statusCode,401);assert.equal((await login('alice@example.com','wrong-password')).statusCode,401);

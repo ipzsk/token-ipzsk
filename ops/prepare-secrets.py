@@ -8,7 +8,7 @@ base.mkdir(mode=0o700, exist_ok=True)
 upstream = base / "upstream"
 upstream.mkdir(mode=0o700, exist_ok=True)
 (base / "mail").mkdir(mode=0o700, exist_ok=True)
-for name in ("db-password", "db-admin-password", "admin-password", "voucher-encryption-key", "customer-auth-secret"):
+for name in ("db-password", "db-admin-password", "admin-password", "customer-auth-secret"):
     path = base / name
     if not path.exists():
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

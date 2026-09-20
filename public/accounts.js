@@ -33,7 +33,7 @@ export function setupAccounts({api,action,el,table,cell,button,rowActions,charge
     async ledger(){const d=await api('/ledger');table(content,['时间','用户','类型','金额变动','账面余额','请求 ID'],d.rows.map(r=>[time(r.created_at),r.user_name,r.kind==='recharge'?'充值':'消费',charge(r.amount_cny),charge(r.balance_after_cny),r.request_id??'—']));},
     async administrators(){
       const d=await api('/administrators'),box=el('div');content.append(box);table(box,['用户名','权限','状态','操作'],d.rows.map(r=>[r.username,r.role,r.enabled?'启用':'停用',r.enabled?button('停用',async()=>{if(!confirm('停用此管理员并注销其会话？'))return;await api('/administrators/'+r.id+'/disable','POST',{});await refresh();}):'—']));
-      const name=input('管理员用户名'),pass=input('初始密码（至少 16 位）','password'),role=el('select');role.append(new Option('运营（用户、号池、充值码管理）','operator'),new Option('只读','viewer'),new Option('超级管理员','superadmin'));
+      const name=input('管理员用户名'),pass=input('初始密码（至少 16 位）','password'),role=el('select');role.append(new Option('运营（用户、号池管理）','operator'),new Option('只读','viewer'),new Option('超级管理员','superadmin'));
       content.append(name.l,pass.l,role,button('创建管理员',async()=>{await api('/administrators','POST',{username:name.n.value,password:pass.n.value,role:role.value});pass.n.value='';await refresh();}));
     },
     async password(){const old=input('当前密码','password'),next=input('新密码（至少 16 位）','password');content.append(old.l,next.l,button('修改密码并退出',async()=>{await api('/password','POST',{current_password:old.n.value,password:next.n.value});old.n.value='';next.n.value='';location.reload();}));},

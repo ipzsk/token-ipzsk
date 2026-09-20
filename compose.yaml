@@ -50,7 +50,6 @@ services:
       - ./secrets/upstream:/run/upstream
       - ./secrets/db-password:/run/secrets/db-password:ro
       - ./secrets/admin-password:/run/secrets/admin-password:ro
-      - ./secrets/voucher-encryption-key:/run/secrets/voucher-encryption-key:ro
       - ./secrets/customer-auth-secret:/run/secrets/customer-auth-secret:ro
       - ./secrets/mail:/run/mail:ro
     tmpfs: ["/tmp:size=16m,mode=1777"]

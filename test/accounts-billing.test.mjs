@@ -1,21 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {randomUUID,randomBytes} from 'node:crypto';
+import {randomUUID} from 'node:crypto';
 import {database} from '../src/database.mjs';
 import {createApp} from '../src/app.mjs';
 import {passwordHash} from '../src/security.mjs';
 import {reserveRequest,settleRequest,wallet} from '../src/billing.mjs';
+import {deliverPayments} from '../src/payments.mjs';
 import {issueKey} from '../src/account-keys.mjs';
 
 test('account-owned keys, roles and atomic wallet charging',async t=>{
   assert.ok(process.env.TEST_DB_HOST);const schema='billing_test_'+randomUUID().replaceAll('-','');
-  const config={host:process.env.TEST_DB_HOST,database:'gateway_test',user:'gateway',password:process.env.TEST_DB_PASSWORD};
+  const config={host:process.env.TEST_DB_HOST,port:Number(process.env.TEST_DB_PORT || 5432),database:'gateway_test',user:'gateway',password:process.env.TEST_DB_PASSWORD};
   const setup=database(config);await setup.query(`CREATE SCHEMA ${schema}`);
   const db=database({...config,options:`-c search_path=${schema}`});let app;const upstream={},scheduler={keys:new Map(),accounts:new Map()};
   try{
     await db.migrate();await db.migrate();
     await db.query('INSERT INTO administrators(id,password_hash) VALUES(1,$1)',[await passwordHash('test-only-administrator')]);
-    app=await createApp({db,upstream,scheduler,voucherKey:randomBytes(32),origin:'https://api.ipzsk.com',secureCookies:true});
+    app=await createApp({db,upstream,scheduler,origin:'https://api.ipzsk.com',secureCookies:true});
     const call=(path,body,cookie,method=body?'POST':'GET')=>app.inject({url:'/admin/api'+path,method,payload:body,headers:{origin:'https://api.ipzsk.com',cookie:cookie??''}});
     const cookie=r=>[].concat(r.headers['set-cookie']??[]).map(s=>s.split(';')[0]).join('; ');
     const root=cookie(await call('/login',{password:'test-only-administrator'}));
@@ -40,11 +41,13 @@ test('account-owned keys, roles and atomic wallet charging',async t=>{
         assert.equal((await call('/users',{name:'Role user'},c)).statusCode,role==='viewer'?403:200);
       }
     });
-    // Credit via the production voucher flow, preserving ledger constraints.
-    const batch=randomUUID();await call('/vouchers/batches',{id:batch,name:'Billing tests',amount_cny:10,quantity:1},root);
-    const exported=await call('/vouchers/batches/'+batch+'/export',{format:'txt'},root);await call('/vouchers/batches/'+batch+'/assign',{channel:'test'},root);
+    // Isolated paid-order fixture; use the same delivery path as online recharge.
+    const order=randomUUID();
+    await db.query(`INSERT INTO payment_orders(id,user_id,mode,pack_key,product_id,amount_cny,currency,idempotency_key,target,state)
+      VALUES($1,$2,'prod','cny_10','PROD_fixture',10,'CNY',$3,'local','paid')`,[order,user,randomUUID()]);
+    await deliverPayments(db,null);
+    assert.equal((await wallet(db,user)).balance_cny,'10.00000000');
     const active=await db.tx(c=>issueKey(c,user));
-    const redeemed=await app.inject({url:'/api/me/vouchers/redeem',method:'POST',payload:{code:exported.body.trim()},headers:{authorization:'Bearer '+active.token}});assert.equal(redeemed.statusCode,200);
     const body={model:'gpt-5.6-sol',messages:[{role:'user',content:'hello'}],max_tokens:10};
     const request=async()=>{const id=randomUUID();await db.query('INSERT INTO requests(id,user_id,model,fingerprint,stream,access_token_id) VALUES($1,$2,$3,$4,false,$5)',[id,user,body.model,id,active.id]);return id;};
     const settle=(id,data)=>db.tx(c=>settleRequest(c,id,data));

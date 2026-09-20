@@ -14,7 +14,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { httpError } from './security.mjs';
 import { customerAuthRoutes, customerOrigin } from './customer-auth.mjs';
 import { adminRoutes } from './admin.mjs';
-import { voucherRoutes } from './vouchers.mjs';
+import { walletRoutes } from './wallet.mjs';
 import { gatewayRoutes } from './gateway.mjs';
 import { roleRoutes } from './roles.mjs';
 import { uploadRoutes } from './uploads.mjs';
@@ -23,6 +23,7 @@ import { libraryRoutes } from './library.mjs';
 import { caseRoutes } from './cases.mjs';
 import { adminStudioRoutes } from './admin-studio.mjs';
 import { adminOpsRoutes } from './admin-ops.mjs';
+import { paymentRoutes } from './payments.mjs';
 
 export async function createApp(options) {
   const app = Fastify({ logger: options.logger ?? false, logController:new LogController({ disableRequestLogging:true }),
@@ -56,7 +57,7 @@ export async function createApp(options) {
     // Never return SQL details, upstream credentials, request bodies, or headers.
     const code = dbConflict ? 'already_exists' : (error.statusCode && error.code ? error.code : (status < 500 ? 'invalid_request' : 'internal_error'));
     if (status === 500) app.log.error({ request_id:req.id },'request_failed');
-    const messages={insufficient_balance:'点数不足，请先使用充值码充值后再使用。',billing_unavailable:'计费服务暂不可用，请稍后重试。',billing_requires_priced_text_and_output_limit:'此模型或服务尚未配置可靠价格，暂不可用。',unpriced_image_options:'此图片规格暂未开放计费。'};
+    const messages={insufficient_balance:'点数不足，请前往账户页在线充值。',billing_unavailable:'计费服务暂不可用，请稍后重试。',billing_requires_priced_text_and_output_limit:'此模型或服务尚未配置可靠价格，暂不可用。',unpriced_image_options:'此图片规格暂未开放计费。'};
     reply.code(status).send({ error:{ code, message:messages[code]??code, ...(error.statusCode && error.fields ? error.fields : {}) } });
   });
   app.get('/healthz', async () => { await options.db.query('SELECT 1'); return { status:'ok' }; });
@@ -80,8 +81,8 @@ export async function createApp(options) {
   });
   app.get('/', async (_req, reply) => reply.redirect('/admin'));
   for (const [path, file, type] of [['/admin','index.html','text/html'],['/admin/','index.html','text/html'],
-    ['/redeem','redeem.html','text/html'],['/redeem.js','redeem.js','text/javascript'],['/admin/pricing.html','pricing.html','text/html'],
-    ['/admin/plugins.js','plugins.js','text/javascript'],['/admin/accounts.js','accounts.js','text/javascript'],['/admin/style.css','style.css','text/css'],['/admin/app.js','app.js','text/javascript'],['/admin/vouchers.js','vouchers.js','text/javascript']]) {
+    ['/admin/pricing.html','pricing.html','text/html'],
+    ['/admin/plugins.js','plugins.js','text/javascript'],['/admin/accounts.js','accounts.js','text/javascript'],['/admin/style.css','style.css','text/css'],['/admin/app.js','app.js','text/javascript'],['/admin/wallet.js','wallet.js','text/javascript']]) {
     const content = await readFile(new URL(`../public/${file}`,import.meta.url));
     app.get(path, async (_req, reply) => reply.type(type + '; charset=utf-8').send(content));
   }
@@ -91,7 +92,7 @@ export async function createApp(options) {
   gatewayRoutes(app,options);
   imageArchiveRoutes(app,options);
   workspaceRoutes(app,options);
-  voucherRoutes(app,options);
+  walletRoutes(app,options);
   customerAuthRoutes(app,options);
   accountKeyRoutes(app,options);
   desktopRoutes(app,options);
@@ -101,6 +102,7 @@ export async function createApp(options) {
   pluginRoutes(app,options);
   developerRoutes(app,options);
   roleRoutes(app,options);
+  paymentRoutes(app,options);
   uploadRoutes(app,options);
   studioRoutes(app,options);
   libraryRoutes(app,options);

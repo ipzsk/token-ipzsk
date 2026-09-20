@@ -9,10 +9,6 @@ test -s "$output.partial"
 mv "$output.partial" "$output"
 # Validate the archive structure without restoring over the live database.
 docker compose exec -T db pg_restore --list < "$output" > /dev/null
-# The encryption key is needed to recover exported voucher inventory. Keep it private.
-if [ -f secrets/voucher-encryption-key ]; then
-  install -m 600 secrets/voucher-encryption-key "${output%.dump}.voucher-key"
-fi
 if [ -f secrets/customer-auth-secret ]; then
   install -m 600 secrets/customer-auth-secret "${output%.dump}.customer-auth-secret"
 fi
