@@ -26,7 +26,8 @@ if ! node scripts/ops/check-compose.mjs "$TMP/compose.yaml"; then
 fi
 
 ssh $SSH_OPTS "$SSH_USER@$SSH_HOST" bash -s "$REMOTE_DIR" "$REF" "${DRY_RUN:-}" "${FORCE:-}" <<'REMOTE'
-set -euo pipefail; cd "$1"; REF="$2"; DRY_RUN="$3"; FORCE="$4"
+# ssh 把参数拼成一条命令行再交给远端 shell 解析，空参数会整个消失，所以这里用 ${n:-} 取默认。
+set -euo pipefail; cd "$1"; REF="$2"; DRY_RUN="${3:-}"; FORCE="${4:-}"
 [ -d .git ] || { echo "❌ $PWD 还不是 git 仓库，先做一次初始化（见 DEPLOYMENT.md）"; exit 1; }
 git fetch --prune origin
 echo "== 当前 $(git rev-parse --short HEAD)  →  目标 $(git rev-parse --short "$REF") =="
