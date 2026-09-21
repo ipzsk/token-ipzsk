@@ -13,3 +13,25 @@ downloads/
 src/.deployed-commit
 ops/waffo-prod.json
 ops/waffo-test.json
+
+# 服务器自己的运行时配置：跟仓库里的 .example 不一样（服务器那份有 lanehub 服务、R2 配置、
+# 真实域名），git 化部署后由服务器持有，部署不碰。本地开发：cp compose.example.yaml compose.yaml
+compose.yaml
+compose.override.yaml
+Caddyfile
+*.bak-*
+*.orig
+*.tar.gz
+.deployed-release.json
+src/.deployed-release.json
+# macOS 经 rsync 留下的 AppleDouble 垃圾
+._*
+# 早期 rsync 带尾斜杠把 scripts/ 摊到了根目录，这些是重复件，以 scripts/ 下的为准
+/lanehub-e2e.mjs
+/lanehub-migrate.mjs
+/lanehub-switch.mjs
+/local-stack.mjs
+/market-chain-e2e.mjs
+/prod-smoke.mjs
+/skill-chain-e2e.mjs
+/releases/

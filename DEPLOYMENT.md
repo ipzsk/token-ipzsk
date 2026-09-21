@@ -100,3 +100,45 @@ Vercel 正式版本 `dpl_8ANJgTtvgk249ymY3vAPj4MjYAwB` 提供 `https://www.ipzsk
 lanehub 先部署：新增 `PUT /api/lane_matrix/batch`，矩阵渠道增加 `balance` / `balance_updated_time` / `balance_supported` / `balance_unit`。部署前备份 `backups/lanehub-20260917T132605Z.db`，verify-prod 全部通过。
 
 网关随后部署 `b89cc03`：新增 `/api/admin/ops/*` 8 条路由（线路矩阵读写、渠道、探测=余额接口、仪表盘、日志），无数据库迁移。DRY_RUN 核对只传 admin-ops 相关 4 个文件；134 项测试通过。线上验证：lanehub 新字段已返回、批量接口空请求不写库、网关未登录返回 `customer_login_required`、healthz 200。网站 `/admin` 运维页未部署，方案见网站仓库 `docs/admin-ops.md`。
+
+## 部署方式：服务器自己 git fetch（2026-09-21 起）
+
+以前是本机 rsync 同步 + `src/.deployed-commit` 文本文件记账。那套有两个坑：手工发布会漏记，
+脚本就误判「有人在服务器上改过」（2026-09-20 实际发生过，把一次 3 行的修复卡了半天）；
+`rsync --delete` 还可能删掉没进仓库的文件。现在服务器自己是一个 git 仓库：
+
+- 漂移检测交给 `git status --porcelain`，真相就是仓库状态，没有第二套记账
+- `git reset --hard` 只动被跟踪的文件，服务器独有的 `compose.yaml` / `Caddyfile` / `downloads/` /
+  `secrets/` 都在 `.gitignore` 里，部署不会碰
+- 回滚 = `REF=<旧提交> scripts/ops/deploy-prod.sh`
+
+仓库里的 `compose.example.yaml` / `Caddyfile.example` 只是样板。服务器那份不一样（有 lanehub
+服务、R2 配置、真实域名），由服务器持有。本地开发 `cp compose.example.yaml compose.yaml`。
+
+### 一次性初始化（已做过就跳过）
+
+服务器用只读 deploy key 拉私有仓库。公钥在 `~/.ssh/ipzsk_gateway_deploy.pub`，由仓库 admin
+在 GitHub → Settings → Deploy keys 添加，**不要勾 Allow write access**。
+
+```sh
+cd /home/ubuntu/api-gateway
+ssh -T git@github.com                     # 认证通了会说 successfully authenticated
+git init -b main
+git remote add origin git@github.com:JayceHuang/ipzsk-api-gateway.git
+git fetch origin
+git reset --mixed origin/main             # 只建索引，不覆盖任何文件
+git status                                # 确认差异只有预期内的那些，再往下走
+git reset --hard origin/main              # 确认无误后对齐
+```
+
+`git reset --mixed` 之后一定要看一眼 `git status`：那是唯一能在覆盖前发现「服务器上有未入库改动」
+的机会。2026-09-20 就是靠这一步发现生产跑着 Waffo 支付那套没合进 main 的代码。
+
+### 日常部署
+
+```sh
+secretctl secret run ipzsk-prod-server --map password=SSHPASS --map username=SSH_USER -- \
+  scripts/ops/deploy-prod.sh
+```
+
+`DRY_RUN=1` 只看差异；`REF=<提交>` 部署/回滚到指定版本；`FORCE=1` 丢弃服务器上被跟踪文件的改动。
