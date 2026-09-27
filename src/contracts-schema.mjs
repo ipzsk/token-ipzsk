@@ -56,6 +56,7 @@ const caseFields = {
   id: string, title: string, prompt: string, category: string, category_zh: nullable(string), tags: array(string), model: nullable(string),
   params: json, template: nullable(ref('CaseTemplate')), author: nullable(string), author_url: nullable(string), source_url: nullable(string),
   source_repo: nullable(string), license_note: nullable(string), image: ref('CaseImage'),
+  kind: ref('CaseKind'), video: nullable(ref('CaseVideo')), license_tier: nullable(ref('LicenseTier')),
 };
 const canvasSummary = {
   id: uuid, title: string, revision: int(1), thumb_id: nullable(uuid), thumb: nullable(ref('MediaAsset')), created_at: datetime, updated_at: datetime,
@@ -64,7 +65,7 @@ const errorBody = ref('ApiError');
 const adminCaseFields = {
   title: string, prompt: string, category: string, category_zh: nullable(string), tags: array(string), model: nullable(string), params: json,
   template: nullable(ref('CaseTemplate')), author: nullable(string), author_url: nullable(string), source_repo: nullable(string), source_url: nullable(string),
-  license_note: nullable(string),
+  license_note: nullable(string), kind: ref('CaseKind'), license_tier: nullable(ref('LicenseTier')),
 };
 const optionalCaseFields = Object.fromEntries(Object.entries(adminCaseFields).map(([k, v]) => [k, opt(v)]));
 const adminGeneration = {
@@ -221,6 +222,11 @@ export const schemas = {
 
   // ── 案例库（公开） ──
   CaseImage: object({ width: nullable(int(0)), height: nullable(int(0)), urls: object({ w480: nullable(string), w960: nullable(string), orig: string }) }),
+  // image = picture cases; video / avatar (数字人) cases carry an example video. A video case without its own cover shows the video poster as image.
+  CaseKind: lit('image', 'video', 'avatar'),
+  CaseVideo: object({ width: nullable(int(0)), height: nullable(int(0)), duration_ms: nullable(int(0)), urls: object({ orig: string, poster: nullable(string) }) }),
+  // A: the repo author's own prompt under the repo licence; B: curated repost, rights stay with the original author (credit author/source_url).
+  LicenseTier: lit('A', 'B'),
   CaseTemplateItem: object({
     key: opt(string), label: string, description: opt(string), count: opt(int(1, 12)),
     params: opt(object({ aspect_ratio: opt(string), resolution: opt(string) })), anchor: opt(boolean), references: opt(array(object({ slot: string }))),
@@ -229,7 +235,9 @@ export const schemas = {
   InspirationCase: object(caseFields),
   InspirationCaseDetail: object({ ...caseFields, references: array(ref('CaseImage')), similar: array(ref('InspirationCase'), 12) }),
   // cat: comma-separated categories (OR); repeated cat= is accepted too.
-  CaseListQuery: object({ cat: opt(string), q: opt(string), cursor: opt(string), limit: opt(int(1, 60)) }),
+  // kind defaults to image, so old clients keep getting picture cases only.
+  CaseListQuery: object({ cat: opt(string), q: opt(string), cursor: opt(string), limit: opt(int(1, 60)), kind: opt(ref('CaseKind')) }),
+  CaseCategoriesQuery: object({ kind: opt(ref('CaseKind')) }),
   CaseCategory: object({ category: string, category_zh: nullable(string), count: int(0) }),
   CaseCategories: object({ items: array(ref('CaseCategory')) }),
 
@@ -248,10 +256,10 @@ export const schemas = {
   UserRef: object({ id: uuid, email: nullable(string), name: opt(nullable(string)) }),
   AdminMe: object({ user: ref('UserRef'), roles: array(ref('Role')), session: object({ created_at: datetime, expires_at: datetime }) }),
   CaseStatus: lit('draft', 'published', 'hidden'),
-  AdminCase: object({ ...adminCaseFields, id: string, cover: nullable(ref('MediaAsset')), references: array(ref('MediaAsset'), 8), status: ref('CaseStatus'),
+  AdminCase: object({ ...adminCaseFields, id: string, cover: nullable(ref('MediaAsset')), video: nullable(ref('MediaAsset')), references: array(ref('MediaAsset'), 8), status: ref('CaseStatus'),
     position: number, created_at: datetime, updated_at: datetime }),
   AdminCasePage: object({ items: array(ref('AdminCase')), next_cursor: nullable(string), total: int(0) }),
-  AdminCaseQuery: object({ status: opt(ref('CaseStatus')), category: opt(string), q: opt(string), cursor: opt(string), limit: opt(int(1, 100)) }),
+  AdminCaseQuery: object({ status: opt(ref('CaseStatus')), category: opt(string), kind: opt(ref('CaseKind')), q: opt(string), cursor: opt(string), limit: opt(int(1, 100)) }),
   AdminCaseCreate: object({ ...optionalCaseFields, id: opt(nullable(string)), title: string, prompt: string, category: string, cover_asset_id: uuid }),
   AdminCasePatch: object({ ...optionalCaseFields, status: opt(ref('CaseStatus')), expected_updated_at: opt(nullable(datetime)) }),
   CaseConflict: object({ error: errorBody, case: ref('AdminCase') }),
@@ -265,6 +273,8 @@ export const schemas = {
   ),
   BulkStatusResult: object({ items: array(ref('BulkStatusItem'), 200) }),
   CaseCoverPut: object({ asset_id: uuid }),
+  // The actor's own ready video (uploaded via /api/me/uploads); null removes the case video.
+  CaseVideoPut: object({ asset_id: nullable(uuid) }),
   CaseReferencesPut: object({ asset_ids: array(uuid, 8) }),
   AdminUserQuery: object({ q: string, cursor: opt(string), limit: opt(int(1, 100)) }),
   AdminUserSummary: object({ id: uuid, email: nullable(string), name: string, email_verified: boolean, created_at: datetime, roles: array(ref('Role')) }),

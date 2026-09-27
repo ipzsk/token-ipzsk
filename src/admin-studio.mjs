@@ -6,7 +6,7 @@ import { hash, RateLimiter } from './security.mjs';
 import { stable } from './validation.mjs';
 import { fail, isUuid, plainObject } from './studio.mjs';
 import { publicAsset, OBJECT_CACHE_CONTROL } from './uploads.mjs';
-import { CASE_ID, validCaseTemplate, withTemplateKeys, encodeCaseCursor } from './cases.mjs';
+import { CASE_ID, CASE_KINDS, validCaseTemplate, withTemplateKeys, encodeCaseCursor } from './cases.mjs';
 import { enqueueThumb } from './media-thumbs.mjs';
 import { requireRole, grantRole, revokeRole, loadRoles, ROLES } from './roles.mjs';
 import { refreshMediaTask } from './media-task-sync.mjs';
@@ -19,7 +19,7 @@ const GEN_STATUSES = ['queued', 'running', 'succeeded', 'failed', 'cancelled'];
 const TERMINAL = ['completed', 'failed', 'cancelled'];
 const TEXT = { title: [100, false], prompt: [20000, false], category: [60, false], category_zh: [60, true], model: [100, true], author: [200, true],
   author_url: [2000, true], source_repo: [200, true], source_url: [2000, true], license_note: [2000, true] };
-const FIELDS = [...Object.keys(TEXT), 'tags', 'params', 'template'];
+const FIELDS = [...Object.keys(TEXT), 'tags', 'params', 'template', 'kind', 'license_tier'];
 // Changing any of these on a published case re-runs the publish check (§2.2).
 const PUBLISH_FIELDS = ['title', 'prompt', 'category', 'license_note', 'source_repo', 'source_url', 'author_url', 'template'];
 
@@ -59,6 +59,12 @@ export function caseValues(b) {
     } else if (k === 'params') {
       if (!plainObject(v) || JSON.stringify(v).length > 10_000) throw fail(400, 'invalid_params');
       out.params = v;
+    } else if (k === 'kind') {
+      if (!CASE_KINDS.includes(v)) throw fail(400, 'invalid_kind');
+      out.kind = v;
+    } else if (k === 'license_tier') {
+      if (v !== null && v !== 'A' && v !== 'B') throw fail(400, 'invalid_license_tier');
+      out.license_tier = v;
     } else out.template = withTemplateKeys(validCaseTemplate(v));
   }
   return out;
@@ -114,13 +120,15 @@ export function adminStudioRoutes(app, options) {
   // ── 案例 ──
   async function casesOut(q, rows, full) {
     if (!rows.length) return [];
-    const covers = new Map((await q.query('SELECT * FROM media_assets WHERE id=ANY($1::uuid[])', [rows.map((r) => r.cover_id)])).rows.map((a) => [a.id, a]));
+    const covers = new Map((await q.query('SELECT * FROM media_assets WHERE id=ANY($1::uuid[])',
+      [rows.flatMap((r) => [r.cover_id, r.video_id].filter(Boolean))])).rows.map((a) => [a.id, a]));
     const refs = full ? (await q.query(`SELECT r.case_id,a.* FROM inspiration_case_references r JOIN media_assets a ON a.id=r.asset_id
       WHERE r.case_id=ANY($1::text[]) ORDER BY r.position`, [rows.map((r) => r.id)])).rows : [];
     return rows.map((r) => ({ id: r.id, title: r.title, prompt: full ? r.prompt : r.prompt.slice(0, 200), category: r.category, category_zh: r.category_zh,
       tags: r.tags, model: r.model, params: r.params, template: r.template, cover: covers.has(r.cover_id) ? publicAsset(covers.get(r.cover_id), storage) : null,
       references: refs.filter((x) => x.case_id === r.id).map((a) => publicAsset(a, storage)), author: r.author, author_url: r.author_url,
-      source_repo: r.source_repo, source_url: r.source_url, license_note: r.license_note, status: r.status, position: r.position,
+      source_repo: r.source_repo, source_url: r.source_url, license_note: r.license_note, kind: r.kind, license_tier: r.license_tier,
+      video: r.video_id && covers.has(r.video_id) ? publicAsset(covers.get(r.video_id), storage) : null, status: r.status, position: r.position,
       created_at: r.created_at, updated_at: r.updated_at }));
   }
   async function oneCase(q, id) {
@@ -129,15 +137,16 @@ export function adminStudioRoutes(app, options) {
     return (await casesOut(q, [row], true))[0];
   }
   async function assertPublishable(c, row) {
-    const cover = (await c.query('SELECT status FROM media_assets WHERE id=$1', [row.cover_id])).rows[0];
-    const issues = publishIssues(row, cover?.status);
+    const cover = (await c.query('SELECT status,kind,variants FROM media_assets WHERE id=$1', [row.cover_id])).rows[0];
+    // A video used as cover is shown through its ffmpeg poster; not publishable until the poster exists.
+    const issues = publishIssues(row, cover?.kind === 'video' && !cover.variants?.poster ? 'poster_pending' : cover?.status);
     if (issues.length) throw fail(422, 'case_publish_invalid', { fields: issues });
   }
   // §2.4: only the actor's own ready image; the case gets a copy (user_id NULL, source 'case') so user cleanup never touches it.
-  async function ownAsset(actorId, assetId) {
+  async function ownAsset(actorId, assetId, kind = 'image') {
     const a = isUuid(assetId) && (await db.query(`SELECT * FROM media_assets WHERE id=$1 AND user_id=$2 AND status<>'deleted'`, [assetId, actorId])).rows[0];
     if (!a) throw fail(404, 'asset_not_found');
-    if (a.kind !== 'image') throw fail(400, 'asset_not_image');
+    if (a.kind !== kind) throw fail(400, `asset_not_${kind}`); // asset_not_image, asset_not_video
     if (a.status !== 'ready') throw fail(409, 'asset_not_ready');
     return a;
   }
@@ -148,8 +157,8 @@ export function adminStudioRoutes(app, options) {
     return { id, key, src };
   }
   async function insertCopy(c, { id, key, src }) {
-    await c.query(`INSERT INTO media_assets(id,user_id,kind,source,status,object_key,content_type,bytes,sha256,width,height)
-      VALUES($1,NULL,'image','case','ready',$2,$3,$4,$5,$6,$7)`, [id, key, src.content_type, src.bytes, src.sha256, src.width, src.height]);
+    await c.query(`INSERT INTO media_assets(id,user_id,kind,source,status,object_key,content_type,bytes,sha256,width,height,duration_ms)
+      VALUES($1,NULL,$8,'case','ready',$2,$3,$4,$5,$6,$7,$9)`, [id, key, src.content_type, src.bytes, src.sha256, src.width, src.height, src.kind, src.duration_ms ?? null]);
     await enqueueThumb(c, id);
   }
   // A failed transaction must not leave copied objects behind.
@@ -187,6 +196,10 @@ export function adminStudioRoutes(app, options) {
     if (q.category !== undefined && q.category !== '') {
       if (typeof q.category !== 'string' || q.category.length > 60) throw fail(400, 'invalid_category');
       args.push(q.category); where.push(`category=$${args.length}`);
+    }
+    if (q.kind !== undefined && q.kind !== '') {
+      if (!CASE_KINDS.includes(q.kind)) throw fail(400, 'invalid_kind');
+      args.push(q.kind); where.push(`kind=$${args.length}`);
     }
     if (q.q !== undefined && q.q !== '') {
       if (typeof q.q !== 'string' || q.q.length > 100) throw fail(400, 'invalid_query');
@@ -254,12 +267,12 @@ export function adminStudioRoutes(app, options) {
         }
         await insertCopy(c, copy);
         const v = { category_zh: null, tags: [], model: null, params: {}, template: null, author: null, author_url: null, source_repo: null,
-          source_url: null, license_note: null, ...values };
+          source_url: null, license_note: null, kind: 'image', license_tier: null, ...values };
         await c.query(`INSERT INTO inspiration_cases(id,title,prompt,category,category_zh,tags,model,params,template,author,author_url,source_repo,source_url,
-            license_note,cover_id,status,position,created_at,updated_at)
-          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'draft',(SELECT coalesce(min(position),1)-1 FROM inspiration_cases),${NOW_MS},${NOW_MS})`,
+            license_note,cover_id,kind,license_tier,status,position,created_at,updated_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'draft',(SELECT coalesce(min(position),1)-1 FROM inspiration_cases),${NOW_MS},${NOW_MS})`,
         [id, v.title, v.prompt, v.category, v.category_zh, v.tags, v.model, JSON.stringify(v.params), v.template && JSON.stringify(v.template),
-          v.author, v.author_url, v.source_repo, v.source_url, v.license_note, copy.id]).catch((e) => {
+          v.author, v.author_url, v.source_repo, v.source_url, v.license_note, copy.id, v.kind, v.license_tier]).catch((e) => {
           throw e.code === '23505' && e.constraint === 'inspiration_cases_pkey' ? fail(409, 'case_id_taken') : e;
         });
         await audit(c, req, 'case.create', id, { status: 'draft' });
@@ -371,8 +384,32 @@ export function adminStudioRoutes(app, options) {
       await insertCopy(c, copy);
       await c.query(`UPDATE inspiration_cases SET cover_id=$2,updated_at=${NOW_MS} WHERE id=$1`, [id, copy.id]);
       await c.query(`UPDATE media_assets SET status='deleted',deleted_at=now() WHERE id=$1 AND source='case'
-        AND NOT EXISTS (SELECT 1 FROM inspiration_case_references r WHERE r.asset_id=$1)`, [cur.cover_id]);
+        AND NOT EXISTS (SELECT 1 FROM inspiration_case_references r WHERE r.asset_id=$1)
+        AND NOT EXISTS (SELECT 1 FROM inspiration_cases c WHERE c.video_id=$1)`, [cur.cover_id]);
       await audit(c, req, 'case.cover', id, { from_asset_id: cur.cover_id, to_asset_id: copy.id, source_asset_id: src.id });
+    });
+    return oneCase(db, id);
+  });
+
+  // Symmetric to cover: the actor's own ready mp4 is copied into the case. asset_id null removes the video (not while it is the cover).
+  app.put('/api/admin/cases/:id/video', async (req) => {
+    await requireRole(req, 'operator', 'admin');
+    ready();
+    writeLimit(req);
+    const b = body(req), id = req.params.id;
+    unknownField(b, ['asset_id']);
+    if (b.asset_id !== null && !isUuid(b.asset_id)) throw fail(400, 'invalid_asset_id');
+    await caseExists(id);
+    const src = b.asset_id === null ? null : await ownAsset(req.apiUser.id, b.asset_id, 'video');
+    const copy = src && await copyAsset(src);
+    await withCopies(copy ? [copy] : [], async (c) => {
+      const cur = await lockCase(c, id);
+      if (!copy && cur.video_id && cur.cover_id === cur.video_id) throw fail(409, 'video_is_cover');
+      if (copy) await insertCopy(c, copy);
+      await c.query(`UPDATE inspiration_cases SET video_id=$2,video_source=NULL,updated_at=${NOW_MS} WHERE id=$1`, [id, copy?.id ?? null]);
+      // The old video stays when it is still the cover (poster); otherwise it is retired like a replaced cover.
+      if (cur.video_id && cur.video_id !== cur.cover_id) await c.query(`UPDATE media_assets SET status='deleted',deleted_at=now() WHERE id=$1 AND source='case'`, [cur.video_id]);
+      await audit(c, req, 'case.video', id, { from_asset_id: cur.video_id, to_asset_id: copy?.id ?? null, source_asset_id: src?.id ?? null });
     });
     return oneCase(db, id);
   });
@@ -421,7 +458,7 @@ export function adminStudioRoutes(app, options) {
       if (wasPublic) throw fail(409, 'case_not_draft');
       const refs = (await c.query('DELETE FROM inspiration_case_references WHERE case_id=$1 RETURNING asset_id', [id])).rows.map((r) => r.asset_id);
       await c.query('DELETE FROM inspiration_cases WHERE id=$1', [id]);
-      await c.query(`UPDATE media_assets SET status='deleted',deleted_at=now() WHERE id=ANY($1::uuid[]) AND source='case'`, [[cur.cover_id, ...refs]]);
+      await c.query(`UPDATE media_assets SET status='deleted',deleted_at=now() WHERE id=ANY($1::uuid[]) AND source='case'`, [[cur.cover_id, cur.video_id, ...refs].filter(Boolean)]);
       await audit(c, req, 'case.delete', id, { title: cur.title });
     });
     return reply.code(204).send();
@@ -683,6 +720,7 @@ export const routeMeta = {
   'PATCH /api/admin/cases/:id/position': { body: 'CasePositionPatch', response: 'CasePosition' },
   'POST /api/admin/cases/bulk-status': { body: 'BulkStatusRequest', response: 'BulkStatusResult' },
   'PUT /api/admin/cases/:id/cover': { body: 'CaseCoverPut', response: 'AdminCase' },
+  'PUT /api/admin/cases/:id/video': { body: 'CaseVideoPut', response: 'AdminCase' },
   'PUT /api/admin/cases/:id/references': { body: 'CaseReferencesPut', response: 'AdminCase' },
   'DELETE /api/admin/cases/:id': { response: 'Empty' },
   'GET /api/admin/users': { query: 'AdminUserQuery', response: 'Page<AdminUserSummary>' },

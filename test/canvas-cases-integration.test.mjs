@@ -156,7 +156,7 @@ test('B4: canvas, folders, case import, public cases, favorites, backfill, video
       assert.equal(lines.length, 3); assert.match(lines[0], /^create\t20000\t/);
       assert.equal((await db.query('SELECT count(*)::int AS n FROM inspiration_cases')).rows[0].n, 0);
       const stats = await importCases({ db, storage: r2.storage, manifest, imagesDir: site, fetcher, log: quiet });
-      assert.deepEqual(stats, { created: 3, updated: 0, unchanged: 0, image_uploaded: 3, failed: 0 });
+      assert.deepEqual(stats, { created: 3, updated: 0, unchanged: 0, image_uploaded: 3, video_uploaded: 0, failed: 0 });
       assert.equal(remoteFetches, 2, 'one retry after 503');
       const rows = (await db.query(`SELECT a.*,c.id,c.cover_id,c.status,c.position,c.template FROM inspiration_cases c JOIN media_assets a ON a.id=c.cover_id ORDER BY c.position`)).rows;
       assert.deepEqual(rows.map((r) => r.id), manifest.map((m) => m.id));
@@ -167,13 +167,13 @@ test('B4: canvas, folders, case import, public cases, favorites, backfill, video
       }
       assert.equal(rows[1].template.items.length, manifest[1].template.items.length);
       const again = await importCases({ db, storage: r2.storage, manifest, imagesDir: site, fetcher, log: quiet });
-      assert.deepEqual(again, { created: 0, updated: 0, unchanged: 3, image_uploaded: 0, failed: 0 });
+      assert.deepEqual(again, { created: 0, updated: 0, unchanged: 3, image_uploaded: 0, video_uploaded: 0, failed: 0 });
       assert.equal(remoteFetches, 2, 'unchanged source → no fetch');
       // Metadata change only → update without re-upload; a hidden case stays hidden.
       await db.query("UPDATE inspiration_cases SET status='hidden' WHERE id=$1", [manifest[2].id]);
       const edited = manifest.map((m, i) => i === 2 ? { ...m, title: m.title + '（改）' } : m);
       assert.deepEqual(await importCases({ db, storage: r2.storage, manifest: edited, imagesDir: site, fetcher, log: quiet }),
-        { created: 0, updated: 1, unchanged: 2, image_uploaded: 0, failed: 0 });
+        { created: 0, updated: 1, unchanged: 2, image_uploaded: 0, video_uploaded: 0, failed: 0 });
       assert.equal((await db.query('SELECT status FROM inspiration_cases WHERE id=$1', [manifest[2].id])).rows[0].status, 'hidden');
       await db.query("UPDATE inspiration_cases SET status='published' WHERE id=$1", [manifest[2].id]);
     });
@@ -186,8 +186,9 @@ test('B4: canvas, folders, case import, public cases, favorites, backfill, video
       const items = r.json().items;
       assert.deepEqual(items.map((x) => x.id), manifest.map((m) => m.id));
       const first = items[0];
-      assert.deepEqual(Object.keys(first).sort(), ['author', 'author_url', 'category', 'category_zh', 'id', 'image', 'license_note', 'model', 'params', 'prompt',
-        'source_repo', 'source_url', 'tags', 'template', 'title'].sort());
+      assert.deepEqual(Object.keys(first).sort(), ['author', 'author_url', 'category', 'category_zh', 'id', 'image', 'kind', 'license_note', 'license_tier', 'model',
+        'params', 'prompt', 'source_repo', 'source_url', 'tags', 'template', 'title', 'video'].sort());
+      assert.equal(first.kind, 'image'); assert.equal(first.video, null); assert.equal(first.license_tier, null);
       assert.ok(first.image.width > 0); assert.match(first.image.urls.orig, /X-Amz-Signature=/); assert.equal(first.image.urls.w480, null);
       const paged = (await pub('/api/public/cases?limit=2')).json();
       assert.equal(paged.items.length, 2);
@@ -223,6 +224,53 @@ test('B4: canvas, folders, case import, public cases, favorites, backfill, video
       for (let i = 0; i < 120; i++) last = await app.inject({ url: '/api/public/case-categories', remoteAddress: '198.51.100.7' });
       assert.equal(last.statusCode, 200);
       assert.equal((await app.inject({ url: '/api/public/case-categories', remoteAddress: '198.51.100.7' })).statusCode, 429);
+    });
+
+    await t.test('video / avatar cases: mp4 import (no cover → poster), draft status, kind filter, per-kind categories, similar within kind', async () => {
+      let fetches = 0;
+      const vfetch = async (url) => {
+        fetches++;
+        if (String(url) === 'https://v.cases.test/webm') return new Response(fixture('pixel.png')); // not an mp4
+        assert.equal(String(url), 'https://v.cases.test/a.mp4');
+        return new Response(fixture('faststart.mp4'));
+      };
+      const tag = manifest[0].tags[0]; // shared with an image case: similar must still stay within the kind
+      const vm = [
+        { id: 'v-1', kind: 'video', license_tier: 'B', title: '视频', prompt: 'p', category: 'film', tags: [tag], video: { url: 'https://v.cases.test/a.mp4' } },
+        { id: 'v-2', kind: 'avatar', license_tier: 'A', title: '口播', prompt: 'p', category: 'ugc', video_url: 'https://v.cases.test/a.mp4',
+          image: { url: '/image-studio/assets/fixture-a.png' } },
+        { id: 'v-bad', kind: 'video', title: 'x', prompt: 'p', category: 'film', video_url: 'https://v.cases.test/webm' },
+      ];
+      const logs = [];
+      const stats = await importCases({ db, storage: r2.storage, manifest: vm, imagesDir: site, fetcher: vfetch, log: (l) => logs.push(l), status: 'draft' });
+      assert.deepEqual(stats, { created: 2, updated: 0, unchanged: 0, image_uploaded: 1, video_uploaded: 2, failed: 1 });
+      assert.match(logs.join('\n'), /failed\tv-bad\tunsupported_video_type/);
+      const rows = (await db.query(`SELECT c.*,v.kind AS vk,v.content_type AS vt,v.thumb_state AS vts,v.object_key AS vkey FROM inspiration_cases c
+        JOIN media_assets v ON v.id=c.video_id WHERE c.id=ANY('{v-1,v-2}') ORDER BY c.id`)).rows;
+      assert.deepEqual(rows.map((r) => [r.id, r.kind, r.status, r.license_tier, r.vk, r.vt, r.vts]),
+        [['v-1', 'video', 'draft', 'B', 'video', 'video/mp4', 'queued'], ['v-2', 'avatar', 'draft', 'A', 'video', 'video/mp4', 'queued']]);
+      assert.equal(rows[0].cover_id, rows[0].video_id, 'no own cover: the video is the cover');
+      assert.notEqual(rows[1].cover_id, rows[1].video_id);
+      assert.match(rows[0].vkey, /^cases\/[0-9a-f-]+\/orig\.mp4$/);
+      const before = fetches;
+      assert.deepEqual(await importCases({ db, storage: r2.storage, manifest: vm.slice(0, 2), imagesDir: site, fetcher: vfetch, log: quiet, status: 'draft' }),
+        { created: 0, updated: 0, unchanged: 2, image_uploaded: 0, video_uploaded: 0, failed: 0 });
+      assert.equal(fetches, before, 'unchanged video source → no fetch');
+
+      assert.equal((await pub('/api/public/cases?kind=video')).json().items.length, 0, 'drafts are not public');
+      await db.query(`UPDATE media_assets SET variants=$2 WHERE id=$1`, [rows[0].video_id, { poster: rows[0].vkey.replace('orig.mp4', 'poster.jpg') }]);
+      await db.query("UPDATE inspiration_cases SET status='published' WHERE id=ANY('{v-1,v-2}')");
+      assert.ok((await pub('/api/public/cases')).json().items.every((x) => x.kind === 'image'), 'default feed stays image-only');
+      const [v1] = (await pub('/api/public/cases?kind=video')).json().items;
+      assert.equal(v1.id, 'v-1'); assert.equal(v1.license_tier, 'B');
+      assert.match(v1.video.urls.orig, /orig\.mp4.*X-Amz-Signature=/); assert.match(v1.video.urls.poster, /poster\.jpg/);
+      assert.match(v1.image.urls.orig, /poster\.jpg/, 'poster stands in for the cover');
+      assert.deepEqual((await pub('/api/public/cases?kind=avatar')).json().items.map((x) => x.id), ['v-2']);
+      assert.equal((await pub('/api/public/cases?kind=gif')).statusCode, 400);
+      assert.deepEqual((await pub('/api/public/case-categories?kind=video')).json().items, [{ category: 'film', category_zh: null, count: 1 }]);
+      assert.ok(!(await pub('/api/public/case-categories')).json().items.some((c) => c.category === 'film'));
+      assert.deepEqual((await pub('/api/public/cases/v-1')).json().similar, [], 'image cases sharing the tag are not similar to a video');
+      await db.query("DELETE FROM inspiration_cases WHERE id=ANY('{v-1,v-2}')");
     });
 
     await t.test('public desktop-release: signed installer URLs from R2, CORS, 503 when the bucket has nothing', async () => {

@@ -453,7 +453,8 @@ END $$;
 ALTER TABLE wallet_entries ALTER COLUMN voucher_id DROP NOT NULL;
 ALTER TABLE wallet_entries ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'voucher';
 DO $$ BEGIN
-  IF NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conname='wallet_entries_source_check') THEN
+  -- conrelid scopes the check to this schema's table (tests run many schemas in one database).
+  IF NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conname='wallet_entries_source_check' AND conrelid='wallet_entries'::regclass) THEN
     ALTER TABLE wallet_entries ADD CONSTRAINT wallet_entries_source_check
       CHECK((source='voucher' AND voucher_id IS NOT NULL) OR (source='signup_bonus' AND voucher_id IS NULL));
   END IF;
@@ -756,3 +757,15 @@ DO $$ BEGIN
     INSERT INTO schema_version(version) VALUES(25);
   END IF;
 END $$;
+
+-- v26: video / 数字人 inspiration cases. Existing rows are image cases (kind DEFAULT 'image').
+-- video_id: the example video (media_assets kind 'video'); a case without its own cover points cover_id at that video
+-- and shows its ffmpeg poster. video_source: import source URL, re-import skips the fetch when unchanged (like cover_source).
+-- license_tier: A = author's own prompt under the repo licence, B = curated repost (rights stay with the original author).
+ALTER TABLE inspiration_cases ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'image' CHECK (kind IN ('image','video','avatar'));
+ALTER TABLE inspiration_cases ADD COLUMN IF NOT EXISTS video_id uuid REFERENCES media_assets(id);
+ALTER TABLE inspiration_cases ADD COLUMN IF NOT EXISTS video_source text;
+ALTER TABLE inspiration_cases ADD COLUMN IF NOT EXISTS license_tier text CHECK (license_tier IN ('A','B'));
+CREATE INDEX IF NOT EXISTS inspiration_cases_kind_feed ON inspiration_cases (status, kind, category, position);
+CREATE INDEX IF NOT EXISTS inspiration_cases_kind_all ON inspiration_cases (status, kind, position, id);
+INSERT INTO schema_version(version) VALUES(26) ON CONFLICT DO NOTHING;

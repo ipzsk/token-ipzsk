@@ -19,8 +19,11 @@ export interface AdminCase {
   source_repo: string | null
   source_url: string | null
   license_note: string | null
+  kind: CaseKind
+  license_tier: LicenseTier | null
   id: string
   cover: MediaAsset | null
+  video: MediaAsset | null
   references: MediaAsset[] // max 8 items
   status: CaseStatus
   position: number
@@ -41,6 +44,8 @@ export interface AdminCaseCreate {
   source_repo?: string | null
   source_url?: string | null
   license_note?: string | null
+  kind?: CaseKind
+  license_tier?: LicenseTier | null
   id?: string | null
   cover_asset_id: Uuid
 }
@@ -63,12 +68,15 @@ export interface AdminCasePatch {
   source_repo?: string | null
   source_url?: string | null
   license_note?: string | null
+  kind?: CaseKind
+  license_tier?: LicenseTier | null
   status?: CaseStatus
   expected_updated_at?: IsoTime | null
 }
 export interface AdminCaseQuery {
   status?: CaseStatus
   category?: string
+  kind?: CaseKind
   q?: string
   cursor?: string
   limit?: number // integer 1..100
@@ -354,6 +362,9 @@ export interface CanvasThumbPost {
 export interface CaseCategories {
   items: CaseCategory[]
 }
+export interface CaseCategoriesQuery {
+  kind?: CaseKind
+}
 export interface CaseCategory {
   category: string
   category_zh: string | null
@@ -375,11 +386,13 @@ export interface CaseImage {
     orig: string
   }
 }
+export type CaseKind = "image" | "video" | "avatar"
 export interface CaseListQuery {
   cat?: string
   q?: string
   cursor?: string
   limit?: number // integer 1..60
+  kind?: CaseKind
 }
 export interface CasePosition {
   id: string
@@ -409,6 +422,18 @@ export interface CaseTemplateItem {
   references?: {
     slot: string
   }[]
+}
+export interface CaseVideo {
+  width: number | null // integer 0..
+  height: number | null // integer 0..
+  duration_ms: number | null // integer 0..
+  urls: {
+    orig: string
+    poster: string | null
+  }
+}
+export interface CaseVideoPut {
+  asset_id: Uuid | null
 }
 export interface ChannelSummary {
   id: number // integer 1..
@@ -558,6 +583,9 @@ export interface InspirationCase {
   source_repo: string | null
   license_note: string | null
   image: CaseImage
+  kind: CaseKind
+  video: CaseVideo | null
+  license_tier: LicenseTier | null
 }
 export interface InspirationCaseDetail {
   id: string
@@ -575,6 +603,9 @@ export interface InspirationCaseDetail {
   source_repo: string | null
   license_note: string | null
   image: CaseImage
+  kind: CaseKind
+  video: CaseVideo | null
+  license_tier: LicenseTier | null
   references: CaseImage[]
   similar: InspirationCase[] // max 12 items
 }
@@ -649,6 +680,7 @@ export interface LaneMatrixSaveResult {
     }
   }[]
 }
+export type LicenseTier = "A" | "B"
 export interface LogEntry {
   id: number // integer 1..
   created_at: number // integer 0..
@@ -1027,6 +1059,7 @@ export interface Endpoints {
   "PUT /api/admin/cases/:id/cover": { body: CaseCoverPut; response: AdminCase }
   "PATCH /api/admin/cases/:id/position": { body: CasePositionPatch; response: CasePosition }
   "PUT /api/admin/cases/:id/references": { body: CaseReferencesPut; response: AdminCase }
+  "PUT /api/admin/cases/:id/video": { body: CaseVideoPut; response: AdminCase }
   "POST /api/admin/cases/bulk-status": { body: BulkStatusRequest; response: BulkStatusResult }
   "GET /api/admin/generations": { body: never; response: Page<AdminGeneration> }
   "GET /api/admin/generations/:id": { body: never; response: AdminGenerationDetail }

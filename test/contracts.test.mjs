@@ -37,7 +37,12 @@ const asset = { id: A1, user_id: USER, kind: 'image', source: 'upload', status: 
   width: 1, height: 1, duration_ms: null, variants: { w480: `u/${USER}/${A1}/w480.webp` }, created_at: now, thumb_state: 'done', task_id: T1, result_index: 0, cursor_at };
 const item = { item_id: id(11), kind: 'image', model: 'gpt-image-2.5-flare', prompt: 'p', params: { resolution: '1K' }, reference_asset_ids: [A1, A2], mentions: [{ type: 'subject', id: S1, name: '小猫' }] };
 const caseRow = { id: 'case-1', title: 't', prompt: 'p', category: 'poster', category_zh: '海报', tags: ['a'], model: null, params: {}, template: { items: [{ label: 'x', count: 2, references: [{ slot: 'face' }] }] },
-  author: null, author_url: null, source_url: null, source_repo: null, license_note: null, position: 1, cover_id: A1, object_key: 'cases/x/orig.png', variants: {}, width: 10, height: 10 };
+  author: null, author_url: null, source_url: null, source_repo: null, license_note: null, position: 1, cover_id: A1, object_key: 'cases/x/orig.png', variants: {}, width: 10, height: 10,
+  kind: 'image', license_tier: null, video_id: null };
+// Video case whose cover is the video itself (poster as image), exercising CaseVideo.
+const videoCaseRow = { ...caseRow, id: 'case-v', kind: 'video', license_tier: 'B', cover_kind: 'video', object_key: 'cases/v/orig.mp4',
+  variants: { poster: 'cases/v/poster.jpg', w480: 'cases/v/w480.jpg' }, video_id: A2, video_key: 'cases/v/orig.mp4',
+  video_variants: { poster: 'cases/v/poster.jpg' }, video_width: 720, video_height: 1280, video_duration_ms: 5000 };
 const ROWS = [
   [/FROM generation_references gr/, () => [{ ...asset, record_id: R1 }, { ...asset, id: A2, status: 'deleted', record_id: R1 }]],
   [/FROM media_assets WHERE task_id=ANY/, () => [asset]],
@@ -57,7 +62,7 @@ const ROWS = [
   [/FROM asset_folders f/, () => [{ id: F1, name: '收藏', position: 1, count: 2, created_at: now }]],
   [/FROM inspiration_case_references/, () => [{ cover_id: A2, object_key: 'cases/y/orig.png', variants: { w480: 'cases/y/w480.webp' }, width: 5, height: 5 }]],
   [/GROUP BY category/, () => [{ category: 'poster', category_zh: '海报', count: 3 }]],
-  [/FROM inspiration_cases c/, () => [caseRow, { ...caseRow, id: 'case-2' }]],
+  [/FROM inspiration_cases c/, () => [caseRow, videoCaseRow]],
   [/count\(\*\)::int AS count/, () => [{ count: 0, bytes: '0' }]],
   [/FROM media_assets WHERE id=\$1 AND user_id=\$2 AND source=\$3/, () => [asset]],
   [/UPDATE media_assets SET status='deleted'/, () => [{ id: A1 }]],

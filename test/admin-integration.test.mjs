@@ -127,6 +127,7 @@ test('B5 admin API: permission matrix and behaviour', async (t) => {
         ['W', 'PATCH', () => `/api/admin/cases/${matrixCase}/position`, () => ({ after_id: neighbor })],
         ['W', 'POST', () => '/api/admin/cases/bulk-status', () => ({ ids: [matrixCase], status: 'draft' })],
         ['W', 'PUT', () => `/api/admin/cases/${matrixCase}/cover`, async (who) => ({ asset_id: await upload(who) })],
+        ['W', 'PUT', () => `/api/admin/cases/${matrixCase}/video`, async (who) => ({ asset_id: await upload(who, { kind: 'video' }) })],
         ['W', 'PUT', () => `/api/admin/cases/${matrixCase}/references`, () => ({ asset_ids: [] })],
         ['W', 'DELETE', () => seedCase().then((id) => `/api/admin/cases/${id}`)],
         ['W', 'POST', () => `/api/admin/generations/${syncable}/resync`, () => ({})],
@@ -257,6 +258,39 @@ test('B5 admin API: permission matrix and behaviour', async (t) => {
       assert.deepEqual(order.map((r) => r.id).slice(-3), [p2, p1, p3]);
       assert.equal(order.find((r) => r.id === p1).position, tight.position);
       assert.ok(Number.isInteger(order.at(-1).position));
+    });
+
+    await t.test('case video: own ready mp4 copied; kind / license_tier; poster gates publish; not removable while it is the cover', async () => {
+      const call = await makeApp();
+      const id = await seedCase({ status: 'draft' });
+      assert.equal((await call('admin', 'PUT', `/api/admin/cases/${id}/video`, { asset_id: await upload('admin') })).json().error.code, 'asset_not_video');
+      assert.equal((await call('admin', 'PUT', `/api/admin/cases/${id}/video`, { asset_id: 'x' })).json().error.code, 'invalid_asset_id');
+      const src = await upload('admin', { kind: 'video' });
+      const r = await call('admin', 'PUT', `/api/admin/cases/${id}/video`, { asset_id: src });
+      assert.equal(r.statusCode, 200, r.body);
+      const vid = r.json().video.id;
+      assert.notEqual(vid, src);
+      assert.deepEqual((await db.query('SELECT user_id,source,kind,content_type,object_key,thumb_state FROM media_assets WHERE id=$1', [vid])).rows[0],
+        { user_id: null, source: 'case', kind: 'video', content_type: 'video/mp4', object_key: `cases/${vid}/orig.mp4`, thumb_state: 'queued' });
+      assert.deepEqual((await auditRows('case.video', id)).map((x) => x.details), [{ from_asset_id: null, to_asset_id: vid, source_asset_id: src }]);
+      const p = await call('admin', 'PATCH', `/api/admin/cases/${id}`, { kind: 'video', license_tier: 'B' });
+      assert.equal(p.statusCode, 200, p.body); assert.equal(p.json().kind, 'video'); assert.equal(p.json().license_tier, 'B');
+      assert.equal((await call('admin', 'PATCH', `/api/admin/cases/${id}`, { kind: 'gif' })).json().error.code, 'invalid_kind');
+      assert.equal((await call('admin', 'PATCH', `/api/admin/cases/${id}`, { license_tier: 'C' })).json().error.code, 'invalid_license_tier');
+      assert.deepEqual((await call('admin', 'GET', '/api/admin/cases?kind=video')).json().items.map((x) => x.id), [id]);
+      // The video as its own cover: publishing waits for the ffmpeg poster; removing the video is refused.
+      await db.query('UPDATE inspiration_cases SET cover_id=video_id WHERE id=$1', [id]);
+      const early = await call('admin', 'PATCH', `/api/admin/cases/${id}`, { status: 'published' });
+      assert.equal(early.statusCode, 422); assert.deepEqual(early.json().error.fields, [{ field: 'cover', code: 'cover_not_ready' }]);
+      await db.query(`UPDATE media_assets SET variants=$2 WHERE id=$1`, [vid, { poster: `cases/${vid}/poster.jpg` }]);
+      assert.equal((await call('admin', 'PATCH', `/api/admin/cases/${id}`, { status: 'published' })).statusCode, 200);
+      assert.equal((await call('admin', 'PUT', `/api/admin/cases/${id}/video`, { asset_id: null })).json().error.code, 'video_is_cover');
+      // A new own cover keeps the old cover (the video) alive; then the video can be removed and is retired.
+      assert.equal((await call('admin', 'PUT', `/api/admin/cases/${id}/cover`, { asset_id: await upload('admin') })).statusCode, 200);
+      assert.equal((await db.query('SELECT status FROM media_assets WHERE id=$1', [vid])).rows[0].status, 'ready');
+      const removed = await call('admin', 'PUT', `/api/admin/cases/${id}/video`, { asset_id: null });
+      assert.equal(removed.statusCode, 200, removed.body); assert.equal(removed.json().video, null);
+      assert.equal((await db.query('SELECT status FROM media_assets WHERE id=$1', [vid])).rows[0].status, 'deleted');
     });
 
     await t.test('cover and references are re-homed copies (user_id NULL, source case, thumb queued); copy failure 502', async () => {
