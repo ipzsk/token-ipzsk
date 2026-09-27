@@ -121,7 +121,7 @@ test('数字人: audio upload, avatar generation, quote, lists, archive, subject
   let app;
   try {
     await db.migrate(); await db.migrate();
-    assert.equal((await db.query('SELECT max(version) AS v FROM schema_version')).rows[0].v, 26);
+    assert.equal((await db.query('SELECT max(version) AS v FROM schema_version')).rows[0].v, 27);
     const accountId = randomUUID();
     await db.query(`INSERT INTO upstream_accounts (id,name,concurrency,base_url,provider_type) VALUES ($1,'lanehub',50,$2,'lanehub')`, [accountId, LANE]);
     await db.query(`INSERT INTO app_settings (key,value) VALUES ('lanehub_mode','on')`);

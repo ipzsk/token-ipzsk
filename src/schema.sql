@@ -769,3 +769,20 @@ ALTER TABLE inspiration_cases ADD COLUMN IF NOT EXISTS license_tier text CHECK (
 CREATE INDEX IF NOT EXISTS inspiration_cases_kind_feed ON inspiration_cases (status, kind, category, position);
 CREATE INDEX IF NOT EXISTS inspiration_cases_kind_all ON inspiration_cases (status, kind, position, id);
 INSERT INTO schema_version(version) VALUES(26) ON CONFLICT DO NOTHING;
+
+-- v27: admin wallet grants (POST /api/admin/users/:id/wallet-grants). source='admin_grant' needs a reason (note) and the
+-- granting admin; like 'payment', in lanehub mode the row is the local history of a quota credited on lanehub.
+ALTER TABLE wallet_entries ADD COLUMN IF NOT EXISTS note text;
+ALTER TABLE wallet_entries ADD COLUMN IF NOT EXISTS granted_by uuid REFERENCES users(id);
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT 1 FROM schema_version WHERE version=27) THEN
+    ALTER TABLE wallet_entries DROP CONSTRAINT IF EXISTS wallet_entries_source_check;
+    ALTER TABLE wallet_entries ADD CONSTRAINT wallet_entries_source_check CHECK (
+      (source='voucher' AND voucher_id IS NOT NULL AND payment_order_id IS NULL) OR
+      (source='signup_bonus' AND voucher_id IS NULL AND payment_order_id IS NULL) OR
+      (source='payment' AND voucher_id IS NULL AND payment_order_id IS NOT NULL) OR
+      (source='admin_grant' AND voucher_id IS NULL AND payment_order_id IS NULL AND granted_by IS NOT NULL
+        AND char_length(btrim(coalesce(note,'')))>=2));
+    INSERT INTO schema_version(version) VALUES(27);
+  END IF;
+END $$;

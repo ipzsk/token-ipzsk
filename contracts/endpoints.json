@@ -680,6 +680,34 @@
       ]
     },
     {
+      "auth": "cookie",
+      "body": "WalletGrantCreate",
+      "body_shape": "{ amount_cny: Decimal reason: string }",
+      "errors": [
+        "credit_reference_required",
+        "customer_login_required",
+        "forbidden_role",
+        "idempotency_conflict",
+        "invalid_amount",
+        "invalid_credit_amount",
+        "invalid_idempotency_key",
+        "invalid_json",
+        "invalid_reason",
+        "lanehub_account_missing",
+        "lanehub_token_create_failed",
+        "lanehub_user_create_failed",
+        "lanehub_username_collision",
+        "unknown_field",
+        "user_not_found"
+      ],
+      "method": "POST",
+      "path": "/api/admin/users/:id/wallet-grants",
+      "response": "WalletGrantResult",
+      "roles": [
+        "admin"
+      ]
+    },
+    {
       "auth": "public",
       "errors": [],
       "method": "POST",
@@ -4635,6 +4663,12 @@
       "code": "key_limit_reached",
       "status": [
         409
+      ]
+    },
+    {
+      "code": "lanehub_account_missing",
+      "status": [
+        503
       ]
     },
     {

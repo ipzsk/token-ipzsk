@@ -23,7 +23,7 @@ export function walletRoutes(app, options) {
       ? await lanehubBalance(lanehub, account, { usdCnyRate: lanehubUsdCny, quotaPerUnit: lanehubQuotaPerUnit })
       : await wallet(db, req.apiUser.id);
     const rows = (await db.query(`SELECT id,amount_cny,balance_after_cny,created_at,
-      CASE WHEN source='signup_bonus' THEN 'signup_bonus' ELSE 'recharge' END AS kind
+      CASE WHEN source IN ('signup_bonus','admin_grant') THEN source ELSE 'recharge' END AS kind
       FROM wallet_entries WHERE user_id=$1 UNION ALL SELECT id,-amount_cny,balance_after_cny,created_at,'consumption' AS kind
       FROM wallet_debits WHERE user_id=$1 ORDER BY created_at DESC,id LIMIT 30`, [req.apiUser.id])).rows;
     return { user: { id: req.apiUser.id, name: req.apiUser.name }, ...balances,

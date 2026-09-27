@@ -74,7 +74,7 @@ test('ops hardening against gateway_test', async (t) => {
   let app;
   try {
     await db.migrate(); await db.migrate();
-    assert.equal((await db.query('SELECT max(version) AS v FROM schema_version')).rows[0].v, 26);
+    assert.equal((await db.query('SELECT max(version) AS v FROM schema_version')).rows[0].v, 27);
     const accountId = randomUUID();
     await db.query(`INSERT INTO upstream_accounts (id,name,concurrency,base_url,provider_type) VALUES ($1,'lanehub',50,$2,'lanehub')`, [accountId, LANE]);
     for (const id of [alice, bob]) await db.query('INSERT INTO users(id,name,email,email_verified,auth_user_id) VALUES($1,$2,$3,true,$4)', [id, 'fixture', id + '@example.com', 'auth-' + id]);

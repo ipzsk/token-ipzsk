@@ -275,6 +275,10 @@ export const schemas = {
   CaseCoverPut: object({ asset_id: uuid }),
   // The actor's own ready video (uploaded via /api/me/uploads); null removes the case video.
   CaseVideoPut: object({ asset_id: nullable(uuid) }),
+  // 补发余额：amount_cny 为 0.01–1000 元、最多两位小数的字符串；reason 2–200 字；需 Idempotency-Key 头。
+  WalletGrantCreate: object({ amount_cny: decimal, reason: string }),
+  WalletGrant: object({ id: uuid, amount_cny: decimal, reason: string, created_at: datetime }),
+  WalletGrantResult: object({ grant: ref('WalletGrant'), wallet: nullable(object({ available_points: decimal, frozen_points: decimal })), wallet_error: nullable(string) }),
   CaseReferencesPut: object({ asset_ids: array(uuid, 8) }),
   AdminUserQuery: object({ q: string, cursor: opt(string), limit: opt(int(1, 100)) }),
   AdminUserSummary: object({ id: uuid, email: nullable(string), name: string, email_verified: boolean, created_at: datetime, roles: array(ref('Role')) }),

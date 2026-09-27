@@ -1046,6 +1046,24 @@ export interface VoiceItem {
 export interface VoiceList {
   items: VoiceItem[]
 }
+export interface WalletGrant {
+  id: Uuid
+  amount_cny: Decimal
+  reason: string
+  created_at: IsoTime
+}
+export interface WalletGrantCreate {
+  amount_cny: Decimal
+  reason: string
+}
+export interface WalletGrantResult {
+  grant: WalletGrant
+  wallet: {
+    available_points: Decimal
+    frozen_points: Decimal
+  } | null
+  wallet_error: string | null
+}
 
 /** Typed endpoints (only routes with a routeMeta entry). */
 export interface Endpoints {
@@ -1079,6 +1097,7 @@ export interface Endpoints {
   "GET /api/admin/users/:id": { body: never; response: AdminUserDetail }
   "DELETE /api/admin/users/:id/roles/:role": { body: never; response: RolesResponse }
   "PUT /api/admin/users/:id/roles/:role": { body: never; response: RolesResponse }
+  "POST /api/admin/users/:id/wallet-grants": { body: WalletGrantCreate; response: WalletGrantResult }
   "GET /api/me/assets": { body: never; response: Page<MediaAsset> }
   "DELETE /api/me/assets/:id": { body: never; response: void }
   "GET /api/me/avatars": { body: never; response: AvatarList }

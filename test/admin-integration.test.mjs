@@ -66,12 +66,14 @@ test('B5 admin API: permission matrix and behaviour', async (t) => {
       const u = (await db.query('SELECT id,name,email FROM users WHERE id=$1', [id])).rows[0];
       return { ...u, token_id: null, session_id: 'session-' + id, session_created_at: sessions.get(id) };
     } };
-    const lane = { reply: () => ({ data: [] }) };
+    const lane = { reply: () => ({ data: [] }), quota: [], failQuota: false };
     const task = { reply: () => Response.json({ data: { status: 'processing' } }) };
     const upstream = { request: async (_ref, path) => { const r = task.reply(path); return r instanceof Response ? r : Response.json(r); } };
     const makeApp = async () => {
       const app = await createApp({ db, customerAuth, imageStorage: r2.storage, upstream, scheduler: { keys: new Map(), accounts: new Map() }, origin: 'https://api.ipzsk.com',
-        lanehub: { call: async () => lane.reply(), usdRate: async () => 7, balance: async () => ({ quota: 0 }) }, lanehubUsdCny: 7, lanehubQuotaPerUnit: 500000 });
+        lanehub: { call: async () => lane.reply(), usdRate: async () => 7, balance: async () => ({ quota: 0 }),
+          addQuota: async (id, quota, remark) => { if (lane.failQuota) { lane.failQuota = false; throw new Error('lanehub down'); } lane.quota.push([id, quota, remark]); } },
+        lanehubUsdCny: 7, lanehubQuotaPerUnit: 500000 });
       apps.push(app);
       return (who, method, url, payload, headers = {}) => app.inject({ method, url, payload,
         headers: { origin: SITE, ...(who ? { cookie: 'fixture=' + U[who] } : {}), ...headers } });
@@ -391,6 +393,49 @@ test('B5 admin API: permission matrix and behaviour', async (t) => {
       await grantRole(db, U.admin, 'admin'); await grantRole(db, U.expired, 'admin');
       assert.equal((await call('admin', 'DELETE', `/api/admin/users/${U.target}/roles/operator`)).statusCode, 200);
       assert.equal((await call('target', 'GET', '/api/admin/me')).statusCode, 403);
+    });
+
+    await t.test('wallet grants: admin only, validation, idempotent replay, local + lanehub credit, audit, ledger constraint', async () => {
+      const call = await makeApp();
+      const url = `/api/admin/users/${U.target}/wallet-grants`, body = { amount_cny: '50', reason: '测试补发' };
+      const post = (who, b = body, key = 'g1') => call(who, 'POST', url, b, key === null ? {} : { 'idempotency-key': key });
+      for (const who of ['viewer', 'operator']) assert.equal((await post(who)).json().error.code, 'forbidden_role', who);
+      for (const [b, code] of [[{ amount_cny: '0', reason: 'ok' }, 'invalid_amount'], [{ amount_cny: '1000.01', reason: 'ok' }, 'invalid_amount'],
+        [{ amount_cny: '1.234', reason: 'ok' }, 'invalid_amount'], [{ amount_cny: 5, reason: 'ok' }, 'invalid_amount'],
+        [{ amount_cny: '5', reason: ' x ' }, 'invalid_reason'], [{ ...body, extra: 1 }, 'unknown_field']]) {
+        assert.equal((await post('admin', b, 'bad')).json().error.code, code, JSON.stringify(b));
+      }
+      assert.equal((await post('admin', body, null)).json().error.code, 'invalid_idempotency_key');
+      assert.equal((await call('admin', 'POST', `/api/admin/users/${randomUUID()}/wallet-grants`, body, { 'idempotency-key': 'g0' })).json().error.code, 'user_not_found');
+      assert.equal((await db.query("SELECT count(*)::int n FROM wallet_entries WHERE source='admin_grant'")).rows[0].n, 0, 'rejections write nothing');
+
+      // Local wallet mode.
+      const first = (await post('admin')).json();
+      assert.deepEqual([first.grant.amount_cny, first.grant.reason, first.wallet.available_points], ['50.00', '测试补发', '5000.00000000']);
+      const replay = (await post('admin')).json();
+      assert.equal(replay.grant.id, first.grant.id, 'same key replays the same grant');
+      assert.equal(replay.wallet.available_points, '5000.00000000', 'replay credits nothing');
+      assert.equal((await post('admin', { ...body, amount_cny: '60' })).json().error.code, 'idempotency_conflict');
+      const audits = await auditRows('wallet.grant', U.target);
+      assert.deepEqual(audits.map((a) => [a.actor_user_id, a.details.amount_cny, a.details.reason]), [[U.admin, '50.00', '测试补发']]);
+      const mine = (await call('target', 'GET', '/api/me/wallet')).json();
+      assert.deepEqual(mine.entries.map((e) => e.kind), ['admin_grant'], 'shown to the user as a platform grant, not an error');
+      await assert.rejects(() => db.query(`INSERT INTO wallet_entries(id,user_id,amount_cny,balance_after_cny,source,granted_by) VALUES($1,$2,1,1,'admin_grant',$3)`,
+        [randomUUID(), U.target, U.admin]), { code: '23514' }, 'admin_grant without a reason violates the ledger constraint');
+
+      // Lanehub mode: quota lands on lanehub once per grant, even when the first attempt fails and is retried with the same key.
+      await db.query(`INSERT INTO lanehub_accounts(user_id,lanehub_user_id,key_id) VALUES($1,4242,$2)`, [U.target, keyId]);
+      await db.query("INSERT INTO app_settings(key,value) VALUES('lanehub_mode','on')");
+      lane.failQuota = true;
+      assert.equal((await post('admin', { amount_cny: '7', reason: '补偿失败任务' }, 'g2')).statusCode, 500);
+      assert.equal((await auditRows('wallet.grant', U.target)).length, 1, 'nothing recorded when lanehub refused');
+      const retried = (await post('admin', { amount_cny: '7', reason: '补偿失败任务' }, 'g2')).json();
+      const again = (await post('admin', { amount_cny: '7', reason: '补偿失败任务' }, 'g2')).json();
+      assert.equal(again.grant.id, retried.grant.id);
+      assert.deepEqual(lane.quota, [[4242, 500000, '平台补发：补偿失败任务']], '¥7 at 7 CNY/USD = 1 unit, credited exactly once');
+      assert.equal((await auditRows('wallet.grant', U.target)).length, 2);
+      await db.query("DELETE FROM app_settings WHERE key='lanehub_mode'");
+      await db.query('DELETE FROM lanehub_accounts WHERE user_id=$1', [U.target]);
     });
 
     await t.test('generations: filters, cursor, detail, resync and cancel rules, audit, no money moved', async () => {

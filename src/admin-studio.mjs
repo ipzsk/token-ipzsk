@@ -1,6 +1,6 @@
 // 管理中台第一批（docs/admin-api.md，design §9）：案例库、用户与角色、生成记录、审计日志。
 // 旧中台 /admin/api/* 在 admin*.mjs，不动。身份由 gateway.mjs 的 /api/admin/* 钩子识别（仅 cookie 会话 + 非 GET 校验 Origin），
-// 每个路由第一行 requireRole；写操作的审计与改动同一事务。本模块不动钱：钱包只读，resync 调后台同一套同步/回填函数。
+// 每个路由第一行 requireRole；写操作的审计与改动同一事务。只有「补发余额」动钱（仅 admin，幂等），其余钱包只读，resync 调后台同一套同步/回填函数。
 import { randomBytes, randomUUID } from 'node:crypto';
 import { hash, RateLimiter } from './security.mjs';
 import { stable } from './validation.mjs';
@@ -11,7 +11,7 @@ import { enqueueThumb } from './media-thumbs.mjs';
 import { requireRole, grantRole, revokeRole, loadRoles, ROLES } from './roles.mjs';
 import { refreshMediaTask } from './media-task-sync.mjs';
 import { recordLanehubCharge, syncChargedPoints, lanehubBalance } from './lanehub-charges.mjs';
-import { lanehubMode } from './lanehub.mjs';
+import { creditAccount, lanehubMode, provisionIfEnabled } from './lanehub.mjs';
 import { wallet, points } from './billing.mjs';
 
 const STATUSES = ['draft', 'published', 'hidden'];
@@ -589,6 +589,20 @@ export function adminStudioRoutes(app, options) {
     return u;
   };
 
+  /** Balance as the user sees it: lanehub is authoritative in lanehub mode. Read only: never provisions (that grants the signup credit). */
+  const walletOf = async (userId) => {
+    try {
+      if (options.lanehub && await lanehubMode(db)) {
+        const account = (await db.query('SELECT lanehub_user_id FROM lanehub_accounts WHERE user_id=$1', [userId])).rows[0];
+        if (!account) return { wallet: null, wallet_error: 'lanehub_account_missing' };
+        const b = await lanehubBalance(options.lanehub, account, { usdCnyRate: options.lanehubUsdCny, quotaPerUnit: options.lanehubQuotaPerUnit });
+        return { wallet: { available_points: points(b.available_cny), frozen_points: points(b.frozen_cny) }, wallet_error: null };
+      }
+      const b = await wallet(db, userId);
+      return { wallet: { available_points: points(b.available_cny), frozen_points: points(b.frozen_cny) }, wallet_error: null };
+    } catch { return { wallet: null, wallet_error: 'billing_unavailable' }; }
+  };
+
   app.get('/api/admin/users', async (req) => {
     await requireRole(req, 'viewer', 'operator', 'admin');
     const q = req.query ?? {}, term = typeof q.q === 'string' ? q.q.trim() : '';
@@ -616,21 +630,7 @@ export function adminStudioRoutes(app, options) {
     const lastSignIn = u.auth_user_id ? await db.query('SELECT max("createdAt") AS at FROM auth_sessions WHERE "userId"=$1', [u.auth_user_id])
       .then((r) => r.rows[0]?.at ?? null, () => null) : null;
     const developer = (await db.query('SELECT state FROM developer_profiles WHERE user_id=$1', [u.id])).rows[0]?.state ?? null;
-    let walletOut = null, walletError = null;
-    try {
-      if (options.lanehub && await lanehubMode(db)) {
-        // Read only: never provision here (provisioning grants the signup credit).
-        const account = (await db.query('SELECT lanehub_user_id FROM lanehub_accounts WHERE user_id=$1', [u.id])).rows[0];
-        if (!account) walletError = 'lanehub_account_missing';
-        else {
-          const b = await lanehubBalance(options.lanehub, account, { usdCnyRate: options.lanehubUsdCny, quotaPerUnit: options.lanehubQuotaPerUnit });
-          walletOut = { available_points: points(b.available_cny), frozen_points: points(b.frozen_cny) };
-        }
-      } else {
-        const b = await wallet(db, u.id);
-        walletOut = { available_points: points(b.available_cny), frozen_points: points(b.frozen_cny) };
-      }
-    } catch { walletOut = null; walletError = 'billing_unavailable'; }
+    const { wallet: walletOut, wallet_error: walletError } = await walletOf(u.id);
     const usage = (await db.query(`SELECT count(*) FILTER (WHERE created_at>now()-interval '30 days')::int AS generations,
         count(*) FILTER (WHERE created_at>now()-interval '30 days' AND status='succeeded')::int AS succeeded,
         count(*) FILTER (WHERE created_at>now()-interval '30 days' AND status='failed')::int AS failed,
@@ -673,6 +673,48 @@ export function adminStudioRoutes(app, options) {
     const u = await userFor(req.params.id);
     await revokeRole(db, u.id, req.params.role, req.apiUser.id);
     return { roles: await loadRoles(db, u.id) };
+  });
+
+  // ── 补发余额（唯一动钱的管理接口）──
+  // Idempotency-Key 必填：同一个 key 重放只会落到同一笔补发（grant id 记在 admin_idempotency.case_id 里），
+  // 每一步都幂等（lanehub 侧按 reference、本地按主键），中途失败用同一个 key 重试即可补齐，不会多发。
+  app.post('/api/admin/users/:id/wallet-grants', async (req) => {
+    await requireRole(req, 'admin');
+    writeLimit(req);
+    const b = body(req), actor = req.apiUser.id;
+    unknownField(b, ['amount_cny', 'reason']);
+    const amount = typeof b.amount_cny === 'string' && /^\d{1,4}(\.\d{1,2})?$/.test(b.amount_cny) ? Number(b.amount_cny) : NaN;
+    if (!(amount > 0 && amount <= 1000)) throw fail(400, 'invalid_amount');
+    const reason = typeof b.reason === 'string' ? b.reason.trim() : '';
+    if (reason.length < 2 || reason.length > 200) throw fail(400, 'invalid_reason');
+    const key = req.headers['idempotency-key'];
+    if (typeof key !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(key)) throw fail(400, 'invalid_idempotency_key');
+    const u = await userFor(req.params.id);
+    const fingerprint = hash(JSON.stringify(stable({ user: u.id, amount_cny: amount.toFixed(2), reason })));
+    // A stale (>24h) key starts a new grant, same as case creation.
+    const claim = (await db.query(`INSERT INTO admin_idempotency(user_id,key,fingerprint,case_id) VALUES($1,$2,$3,$4)
+      ON CONFLICT (user_id,key) DO UPDATE SET fingerprint=EXCLUDED.fingerprint,case_id=EXCLUDED.case_id,created_at=now()
+      WHERE admin_idempotency.created_at<=now()-interval '24 hours' RETURNING case_id`, [actor, key, fingerprint, randomUUID()])).rows[0]
+      ?? (await db.query('SELECT fingerprint,case_id FROM admin_idempotency WHERE user_id=$1 AND key=$2', [actor, key])).rows[0];
+    if (claim.fingerprint && claim.fingerprint !== fingerprint) throw fail(409, 'idempotency_conflict');
+    const grantId = claim.case_id, value = amount.toFixed(2);
+    if (options.lanehub && await lanehubMode(db)) {
+      const account = await provisionIfEnabled(db, options, { userId: u.id, name: u.name });
+      if (!account) throw fail(503, 'lanehub_account_missing');
+      await creditAccount(db, options.lanehub, { userId: u.id, lanehubUserId: account.lanehub_user_id, amountCny: amount,
+        usdCnyRate: await options.lanehub.usdRate().catch(() => options.lanehubUsdCny), quotaPerUnit: options.lanehubQuotaPerUnit,
+        reference: `admin_grant:${grantId}`, remark: '平台补发：' + reason });
+    }
+    await db.tx(async (c) => {
+      await c.query('SELECT id FROM users WHERE id=$1 FOR UPDATE', [u.id]);
+      const balance = (await c.query(`SELECT coalesce(sum(amount_cny),0)+$2::numeric-coalesce((SELECT sum(amount_cny) FROM wallet_debits WHERE user_id=$1),0) AS amount
+        FROM wallet_entries WHERE user_id=$1`, [u.id, value])).rows[0].amount;
+      const added = await c.query(`INSERT INTO wallet_entries(id,user_id,amount_cny,balance_after_cny,source,note,granted_by)
+        VALUES($1,$2,$3,$4,'admin_grant',$5,$6) ON CONFLICT (id) DO NOTHING`, [grantId, u.id, value, balance, reason, actor]);
+      if (added.rowCount) await audit(c, req, 'wallet.grant', u.id, { grant_id: grantId, amount_cny: value, reason });
+    });
+    const row = (await db.query('SELECT id,amount_cny,note,created_at FROM wallet_entries WHERE id=$1', [grantId])).rows[0];
+    return { grant: { id: row.id, amount_cny: Number(row.amount_cny).toFixed(2), reason: row.note, created_at: row.created_at }, ...(await walletOf(u.id)) };
   });
 
   // ── 审计 ──
@@ -727,6 +769,7 @@ export const routeMeta = {
   'GET /api/admin/users/:id': { response: 'AdminUserDetail' },
   'GET /api/admin/roles': { response: 'AdminStaff' },
   'PUT /api/admin/users/:id/roles/:role': { response: 'RolesResponse' },
+  'POST /api/admin/users/:id/wallet-grants': { body: 'WalletGrantCreate', response: 'WalletGrantResult' },
   'DELETE /api/admin/users/:id/roles/:role': { response: 'RolesResponse' },
   'GET /api/admin/generations': { query: 'AdminGenerationQuery', response: 'Page<AdminGeneration>' },
   'GET /api/admin/generations/:id': { response: 'AdminGenerationDetail' },
