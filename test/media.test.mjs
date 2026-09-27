@@ -124,3 +124,11 @@ test('CORS preflight covers public/admin/bearer prefixes and write methods; admi
     assert.equal((await app.inject({ url: '/api/public/cache-probe' })).headers['cache-control'], 'private, max-age=60');
   } finally { await app.close(); }
 });
+
+test('publicAddress: public unicast of either family, private ranges rejected', async () => {
+  const { publicAddress } = await import('../src/image-results.mjs');
+  for (const ip of ['108.157.254.86', '2600:9000:2753:e600:1a:6e0e:c180:93a1', '::ffff:8.8.8.8']) assert.equal(publicAddress(ip), true, ip);
+  for (const ip of ['127.0.0.1', '10.0.0.1', '172.20.0.2', '192.168.1.1', '169.254.169.254', '100.64.0.1', '0.0.0.0',
+    '::', '::1', 'fc00::1', 'fd12::1', 'fe80::1', 'ff02::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '64:ff9b::a00:1', '2001:db8::1', 'not-an-ip'])
+    assert.equal(publicAddress(ip), false, ip);
+});

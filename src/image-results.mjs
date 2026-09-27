@@ -12,6 +12,15 @@ export function publicImageTask(task,origin) {
   if(!imageUrls(task).length)return task;
   return {...task,result:{...task.result,images:imageUrls(task).map((_,i)=>({url:[`${origin}/v1/tasks/${task.id}/image/${i}`]}))}};
 }
+// Public unicast only, either family. CDNs (CloudFront behind HeyGen) resolve to IPv6 as well: rejecting every IPv6
+// address failed each such result as invalid_image_host. Loopback / private / link-local / ULA / multicast stay blocked.
+export function publicAddress(ip){
+  if(isIP(ip)===4){const [a,b]=ip.split('.').map(Number);return a!==0&&a!==10&&a!==127&&a<224&&!(a===169&&b===254)&&!(a===172&&b>=16&&b<=31)&&!(a===192&&b===168)&&!(a===100&&b>=64&&b<=127);}
+  if(isIP(ip)!==6)return false;
+  const v=ip.toLowerCase();
+  if(v.startsWith('::ffff:'))return publicAddress(v.slice(7)); // IPv4-mapped: judge the IPv4 (hex form is not IPv4 → rejected)
+  return !(v==='::'||v==='::1'||/^f[cd]/.test(v)||/^fe[89ab]/.test(v)||/^ff/.test(v)||v.startsWith('64:ff9b:')||v.startsWith('2001:db8:'));
+}
 // Only upstream-returned public HTTPS images may be retrieved. Never forward a key.
 // lanehub puts thumbnails / subtitles / captioned videos under their own keys; still drop obvious image/subtitle links
 // from videos[] so a poster can never be archived or counted as the result.
@@ -41,8 +50,7 @@ export async function fetchResultMedia(url,fetcher=fetch,{types=['image/png','im
   let parsed;try{parsed=new URL(url);}catch{throw httpError(502,'invalid_image_url');}
   if(parsed.protocol!=='https:'||parsed.username||parsed.password||parsed.port&&parsed.port!=='443')throw httpError(502,'invalid_image_url');
   const addresses=await lookup(parsed.hostname,{all:true});
-  const publicV4=ip=>{const [a,b]=ip.split('.').map(Number);return isIP(ip)===4&&a!==0&&a!==10&&a!==127&&a<224&&!(a===169&&b===254)&&!(a===172&&b>=16&&b<=31)&&!(a===192&&b===168)&&!(a===100&&b>=64&&b<=127);};
-  if(!addresses.length||addresses.some(row=>!publicV4(row.address)))throw httpError(502,'invalid_image_host');
+  if(!addresses.length||addresses.some(row=>!publicAddress(row.address)))throw httpError(502,'invalid_image_host');
   const response=await fetcher(url,{redirect:'error',signal:AbortSignal.timeout(timeoutMs)});
   const type=response.headers.get('content-type')?.split(';')[0];
   if(!response.ok||!types.includes(type)){await response.body?.cancel();throw httpError(502,'image_download_failed');}
