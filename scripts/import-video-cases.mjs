@@ -4,7 +4,7 @@
 // are skipped: a case needs a cover or a video to show; generate one on the platform first.
 // Usage:
 //   node scripts/import-video-cases.mjs <cases.video.json> [<cases.avatar.json> ...]            # dry run: validate + print, touches nothing
-//   DATABASE_URL=... R2_CONFIG_FILE=... node scripts/import-video-cases.mjs <files...> --apply  # writes drafts
+//   R2_CONFIG_FILE=... node scripts/import-video-cases.mjs <files...> --apply  # writes drafts (DB from DATABASE_URL, or PGHOST in the gateway container)
 //   --placeholder-cover <https url>  prompt-only cases import behind this cover instead of being skipped
 import { readFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
@@ -12,7 +12,7 @@ import { CASE_ID, caseFromManifest } from '../src/cases.mjs';
 
 const { values, positionals } = parseArgs({ allowPositionals: true, options: { apply: { type: 'boolean', default: false }, 'placeholder-cover': { type: 'string' } } });
 if (!positionals.length) {
-  console.error('usage: node scripts/import-video-cases.mjs <cases.json>... [--apply]  (--apply needs DATABASE_URL and R2_CONFIG_FILE)');
+  console.error('usage: node scripts/import-video-cases.mjs <cases.json>... [--apply]  (--apply needs R2_CONFIG_FILE and a database: DATABASE_URL or PGHOST)');
   process.exit(2);
 }
 
@@ -70,11 +70,11 @@ if (!values.apply) {
     by_tier: count((m) => m.license_tier), without_own_cover: manifest.filter((m) => !m.image).length,
     skipped: Object.fromEntries(Object.entries(skipped).map(([k, ids]) => [k, { count: ids.length, ids: ids.slice(0, 5) }])) }, null, 2));
 } else {
-  if (!process.env.DATABASE_URL || !process.env.R2_CONFIG_FILE) { console.error('--apply needs DATABASE_URL and R2_CONFIG_FILE'); process.exit(2); }
-  const { database } = await import('../src/database.mjs');
+  if (!process.env.R2_CONFIG_FILE) { console.error('--apply needs R2_CONFIG_FILE'); process.exit(2); }
+  const { databaseFromEnv } = await import('../src/database.mjs');
   const { loadR2Storage } = await import('../src/r2-storage.mjs');
   const { importCases } = await import('../src/cases.mjs');
-  const db = database({ connectionString: process.env.DATABASE_URL });
+  const db = await databaseFromEnv(); // DATABASE_URL locally, PGHOST + PGPASSWORD_FILE in the container
   try {
     if (!(await db.query('SELECT 1 FROM schema_version WHERE version=26')).rowCount) throw new Error('schema_v26_missing: deploy the gateway first');
     const storage = await loadR2Storage(process.env.R2_CONFIG_FILE);
