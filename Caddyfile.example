@@ -1,4 +1,12 @@
 api.ipzsk.com {
+  @model_stream path /v1/chat/completions
+  encode @model_stream {
+    gzip 1
+    minimum_length 1
+    match {
+      header Content-Type text/event-stream*
+    }
+  }
   header Strict-Transport-Security "max-age=31536000"
   handle_path /downloads/* {
     root * /srv/downloads
