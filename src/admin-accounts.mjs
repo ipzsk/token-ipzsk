@@ -1,6 +1,7 @@
 import { passwordHash,verifyPassword,httpError } from './security.mjs';
 import * as v from './validation.mjs';
-export function adminAccountRoutes(app,{db}){
+import { lanehubMode } from './lanehub.mjs';
+export function adminAccountRoutes(app,{db,lanehub=null}){
   app.get('/admin/api/administrators',async()=>({rows:(await db.query('SELECT id,username,role,enabled FROM administrators ORDER BY id')).rows}));
   app.post('/admin/api/administrators',async req=>{
     const username=v.text(req.body?.username,100),password=v.text(req.body?.password,256),role=req.body?.role;
@@ -33,9 +34,15 @@ export function adminAccountRoutes(app,{db}){
   app.get('/admin/api/audit',async()=>({rows:(await db.query(`SELECT e.id,e.action,e.target_id,e.created_at,e.details,a.username FROM audit_events e LEFT JOIN administrators a ON a.id=e.administrator_id ORDER BY e.id DESC LIMIT 200`)).rows}));
   app.get('/admin/api/ledger',async req=>{
     const user=req.query.user_id?v.uuid(req.query.user_id):null;
+    // lanehub 模式下消费不落 wallet_debits（钱是对面扣的），流水要从 request_billing 取——
+    // 否则后台的「钱包流水」只有充值、没有消费，对不上用户的真实余额。
+    const lanehubOn=Boolean(lanehub)&&await lanehubMode(db);
+    const consumption=lanehubOn
+      ? `SELECT request_id AS id,user_id,-charged_cny AS amount_cny,NULL::numeric AS balance_after_cny,coalesce(resolved_at,created_at) AS created_at,'consumption' AS kind,request_id FROM request_billing WHERE state='settled' AND charged_cny>0`
+      : `SELECT id,user_id,-amount_cny,balance_after_cny,created_at,'consumption' AS kind,request_id FROM wallet_debits`;
     return {rows:(await db.query(`SELECT l.*,u.name AS user_name FROM (
       SELECT id,user_id,amount_cny,balance_after_cny,created_at,'recharge' AS kind,NULL::uuid AS request_id FROM wallet_entries
-      UNION ALL SELECT id,user_id,-amount_cny,balance_after_cny,created_at,'consumption' AS kind,request_id FROM wallet_debits
+      UNION ALL ${consumption}
     ) l JOIN users u ON u.id=l.user_id WHERE ($1::uuid IS NULL OR user_id=$1) ORDER BY created_at DESC LIMIT 200`,[user])).rows};
   });
 }

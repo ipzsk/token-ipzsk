@@ -154,21 +154,36 @@ export function earningsRoutes(app,options){
    *   3. 钱真的回到用户手里
    *
    * 第 3 步在 lanehub 模式下是加回对面的额度，幂等键 `refund:<请求 id>:<序号>`；
-   * 本地模式下写一条 wallet_entries。**先在事务里记账，再去对面加钱**：
-   * 反过来的话中途挂掉会重复退。加钱失败时整个事务回滚，重试即可。
+   * 本地模式下写一条 wallet_entries。**记账与打款在同一个事务里**：加钱失败或打款未确认时
+   * 整笔回滚，不会出现「账面说退了、钱没到」。序号取自 request_billing.refund_seq 自增，
+   * 不再用「refund 计提行数」——没有插件归属的请求没有计提行，序号永远是 0，第二次退款会被吞掉。
    */
   app.post('/admin/api/billing/:id/refund',async(req)=>{
     const id=uuid(req.params.id),value=amount(req.body?.amount_cny),why=reason(req.body?.reason);
+    const found=(await db.query('SELECT user_id FROM request_billing WHERE request_id=$1',[id])).rows[0];
+    if(!found)throw httpError(404,'not_found');
+    const useLanehub=Boolean(lanehub)&&await lanehubMode(db);
+    // 建号/取号在事务外做：它可能跨网络且幂等。失败就整个请求失败，不留半笔退款。
+    const account=useLanehub?await provisionIfEnabled(db,options,{userId:found.user_id}):null;
+    if(useLanehub&&!account)throw httpError(503,'lanehub_account_missing');
+    const rate=useLanehub?await lanehub.usdRate().catch(()=>options.lanehubUsdCny):null;
     const plan=await db.tx(async(c)=>{
-      const found=(await c.query('SELECT user_id FROM request_billing WHERE request_id=$1',[id])).rows[0];
-      if(!found)throw httpError(404,'not_found');
       await c.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[found.user_id]);
       const bill=(await c.query('SELECT * FROM request_billing WHERE request_id=$1 FOR UPDATE',[id])).rows[0];
       if(bill.state!=='settled')throw httpError(409,'billing_not_settled');
       const remaining=units(bill.charged_cny)-units(bill.refunded_cny);
       if(units(value)>remaining)throw httpError(409,'refund_exceeds_charge');
-
-      await c.query('UPDATE request_billing SET refunded_cny=refunded_cny+$2 WHERE request_id=$1',[id,value]);
+      // 每一笔退款有自己的序号；同一笔重试会落回同一个 reference（幂等），不同笔永远不撞。
+      const seq=(await c.query('UPDATE request_billing SET refunded_cny=refunded_cny+$2,refund_seq=refund_seq+1 WHERE request_id=$1 RETURNING refund_seq',[id,value])).rows[0].refund_seq;
+      // 钱和账在同一事务里落：加钱失败就整笔回滚，重试时会用同一个（已回滚的）序号重新加。
+      if(useLanehub){
+        const credited=await creditAccount(c,lanehub,{userId:found.user_id,lanehubUserId:account.lanehub_user_id,amountCny:value,
+          usdCnyRate:rate,quotaPerUnit:options.lanehubQuotaPerUnit,reference:`refund:${id}:${seq}`,remark:'人工退款：'+why});
+        if(!credited.applied)throw httpError(409,'refund_reference_conflict');
+      }else{
+        const balance=(await c.query(`SELECT coalesce(sum(amount_cny),0)+$2::numeric-coalesce((SELECT sum(amount_cny) FROM wallet_debits WHERE user_id=$1),0) AS amount FROM wallet_entries WHERE user_id=$1`,[found.user_id,value])).rows[0].amount;
+        await c.query('INSERT INTO wallet_entries(id,user_id,amount_cny,balance_after_cny) VALUES($1,$2,$3,$4)',[randomUUID(),found.user_id,value,balance]);
+      }
       // 作者那边按同样的比例冲回去。没有归属或没配比例的请求本来就没计提，这里也不记。
       const request=(await c.query('SELECT plugin_owner_user_id,plugin_id,plugin_share_bps FROM requests WHERE id=$1',[id])).rows[0];
       let clawback='0';
@@ -177,24 +192,10 @@ export function earningsRoutes(app,options){
         if(units(clawback)>0n)await c.query(`INSERT INTO plugin_earnings (id,request_id,owner_user_id,plugin_id,kind,amount_cny)
           VALUES ($1,$2,$3,$4,'refund',$5)`,[randomUUID(),id,request.plugin_owner_user_id,request.plugin_id,'-'+clawback]);
       }
-      const seq=(await c.query(`SELECT count(*)::int AS n FROM plugin_earnings WHERE request_id=$1 AND kind='refund'`,[id])).rows[0].n;
       await c.query('INSERT INTO audit_events(action,target_id,administrator_id,details) VALUES($1,$2,$3,$4)',
-        ['billing.refund',id,req.administrator.id,JSON.stringify({amount_cny:value,reason:why,clawback_cny:clawback})]);
+        ['billing.refund',id,req.administrator.id,JSON.stringify({amount_cny:value,reason:why,clawback_cny:clawback,lanehub_seq:useLanehub?seq:null})]);
       return {userId:found.user_id,seq,clawback};
     });
-
-    // 钱回到用户手里。失败会抛出去，管理员看得到，重试落在同一个 reference 上。
-    if(lanehub&&await lanehubMode(db)){
-      const account=await provisionIfEnabled(db,options,{userId:plan.userId});
-      await creditAccount(db,lanehub,{userId:plan.userId,lanehubUserId:account.lanehub_user_id,amountCny:value,
-        usdCnyRate:await lanehub.usdRate().catch(()=>options.lanehubUsdCny),quotaPerUnit:options.lanehubQuotaPerUnit,
-        reference:`refund:${id}:${plan.seq}`,remark:'人工退款：'+why});
-    }else{
-      await db.tx(async(c)=>{
-        const balance=(await c.query(`SELECT coalesce(sum(amount_cny),0)+$2::numeric-coalesce((SELECT sum(amount_cny) FROM wallet_debits WHERE user_id=$1),0) AS amount FROM wallet_entries WHERE user_id=$1`,[plan.userId,value])).rows[0].amount;
-        await c.query('INSERT INTO wallet_entries(id,user_id,amount_cny,balance_after_cny) VALUES($1,$2,$3,$4)',[randomUUID(),plan.userId,value,balance]);
-      });
-    }
     return {ok:true,refunded_cny:value,clawback_cny:plan.clawback};
   });
 

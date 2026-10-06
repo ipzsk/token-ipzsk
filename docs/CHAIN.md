@@ -172,6 +172,10 @@ skills 是本地文件，谁都能往 `~/.../dsh-home/skills/` 扔一个。所�
 3. 钱真回到用户手里：lanehub 模式加回对面额度（幂等键 `refund:<请求 id>:<序号>`），
    本地模式写 `wallet_entries`
 
+第 3 步与 1、2 在**同一个事务**里：加钱失败或结果不明就整笔回滚，不会出现「账面说退了、
+钱没到」。序号取自 `request_billing.refund_seq`（schema v28）自增——以前用「refund 计提行数」
+当序号，没有插件归属的请求没有计提行，第二次部分退款会撞上同一个 reference 被静默吞掉。
+
 退不出比收的多（`refund_exceeds_charge`）。
 
 ### 结算单（人工打款的凭据）

@@ -8,7 +8,7 @@ import {createApp} from '../src/app.mjs';
 
 test('real database: guesses, expiry, action/email/IP binding, one-time proof and protected email routes',async t=>{
   assert.ok(process.env.TEST_DB_HOST);
-  const config={host:process.env.TEST_DB_HOST,database:'gateway_test',user:'gateway',password:process.env.TEST_DB_PASSWORD};
+  const config={host:process.env.TEST_DB_HOST,port:Number(process.env.TEST_DB_PORT??5432),database:'gateway_test',user:'gateway',password:process.env.TEST_DB_PASSWORD};
   const setup=database(config),schema='captcha_test_'+randomUUID().replaceAll('-','');
   await setup.query(`CREATE SCHEMA ${schema}`);
   const db=database({...config,options:`-c search_path=${schema}`});let app;

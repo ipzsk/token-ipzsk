@@ -786,3 +786,9 @@ DO $$ BEGIN
     INSERT INTO schema_version(version) VALUES(27);
   END IF;
 END $$;
+
+-- v28: 每笔退款一个自增序号，作为 lanehub 入账的幂等键（refund:<请求 id>:<序号>）。
+-- 原来用「refund 计提行数」当序号：没有插件归属的请求永远不会写计提行，第二次部分退款
+-- 会撞上同一个 reference `refund:<id>:0`，被 creditAccount 静默吞掉——账面记了退款，用户没拿到钱。
+ALTER TABLE request_billing ADD COLUMN IF NOT EXISTS refund_seq integer NOT NULL DEFAULT 0 CHECK(refund_seq>=0);
+INSERT INTO schema_version(version) VALUES(28) ON CONFLICT DO NOTHING;

@@ -30,7 +30,7 @@ test('GitHub import pins and checks the actual npm package, rejects unrelated UR
 
 test('plugin admin lifecycle and attributed accounting use an isolated PostgreSQL schema',async t=>{
  assert.ok(process.env.TEST_DB_HOST);const schema='plugin_test_'+randomUUID().replaceAll('-','');
- const config={host:process.env.TEST_DB_HOST,database:'gateway_test',user:'gateway',password:process.env.TEST_DB_PASSWORD};
+ const config={host:process.env.TEST_DB_HOST,port:Number(process.env.TEST_DB_PORT??5432),database:'gateway_test',user:'gateway',password:process.env.TEST_DB_PASSWORD};
  const setup=database(config);await setup.query(`CREATE SCHEMA ${schema}`);const db=database({...config,options:`-c search_path=${schema}`});let app;
  try{
   await db.migrate();const user=randomUUID(),plain=token('ipz_'),pluginToken=token('ipz_'),pluginId='7d8b7d87-b85f-49f1-bde7-a0b1a2f33401',key=randomUUID(),account=randomUUID();

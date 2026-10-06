@@ -22,13 +22,23 @@ export function walletRoutes(app, options) {
     const balances = account
       ? await lanehubBalance(lanehub, account, { usdCnyRate: lanehubUsdCny, quotaPerUnit: lanehubQuotaPerUnit })
       : await wallet(db, req.apiUser.id);
-    const rows = (await db.query(`SELECT id,amount_cny,balance_after_cny,created_at,
-      CASE WHEN source IN ('signup_bonus','admin_grant') THEN source ELSE 'recharge' END AS kind
-      FROM wallet_entries WHERE user_id=$1 UNION ALL SELECT id,-amount_cny,balance_after_cny,created_at,'consumption' AS kind
-      FROM wallet_debits WHERE user_id=$1 ORDER BY created_at DESC,id LIMIT 30`, [req.apiUser.id])).rows;
+    const rows = account
+      // lanehub 模式下这一侧不写 wallet_debits（钱是对面扣的），消费来自 request_billing。
+      // 不并进去的话，「余额变动」只看得见充值、看不见消费，用户会以为钱凭空少了。
+      ? (await db.query(`SELECT id,amount_cny,balance_after_cny,created_at,
+          CASE WHEN source IN ('signup_bonus','admin_grant') THEN source ELSE 'recharge' END AS kind
+          FROM wallet_entries WHERE user_id=$1
+          UNION ALL SELECT b.request_id,-b.charged_cny,NULL::numeric,coalesce(b.resolved_at,b.created_at),'consumption'
+          FROM request_billing b WHERE b.user_id=$1 AND b.state='settled' AND b.charged_cny>0
+          ORDER BY created_at DESC,id LIMIT 30`, [req.apiUser.id])).rows
+      : (await db.query(`SELECT id,amount_cny,balance_after_cny,created_at,
+          CASE WHEN source IN ('signup_bonus','admin_grant') THEN source ELSE 'recharge' END AS kind
+          FROM wallet_entries WHERE user_id=$1 UNION ALL SELECT id,-amount_cny,balance_after_cny,created_at,'consumption' AS kind
+          FROM wallet_debits WHERE user_id=$1 ORDER BY created_at DESC,id LIMIT 30`, [req.apiUser.id])).rows;
     return { user: { id: req.apiUser.id, name: req.apiUser.name }, ...balances,
       balance_points: points(balances.balance_cny), frozen_points: points(balances.frozen_cny), available_points: points(balances.available_cny),
       currency: 'CNY', source: account ? 'lanehub' : 'local',
-      entries: rows.map(row => ({ ...row, amount_points: points(row.amount_cny), balance_after_points: points(row.balance_after_cny) })) };
+      entries: rows.map(row => ({ ...row, amount_points: points(row.amount_cny),
+        balance_after_points: row.balance_after_cny === null ? null : points(row.balance_after_cny) })) };
   });
 }

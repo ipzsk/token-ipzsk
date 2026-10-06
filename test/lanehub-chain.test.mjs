@@ -253,6 +253,26 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
       assert.equal(over.statusCode,409,over.body);
     });
 
+    await t.test('无插件归属的请求：多次部分退款都必须真的回到 lanehub', async () => {
+      // 回归：退款幂等键曾经用「refund 计提行数」当序号。没有插件归属的请求永远没有计提行，
+      // 第二次部分退款会撞上第一次的 reference `refund:<id>:0`，被 creditAccount 静默吞掉——
+      // 账面记了退款、用户没拿到钱。绝大多数普通用户的请求都没有插件归属。
+      const login=await app.inject({url:'/admin/api/login',method:'POST',payload:{password:'test-administrator-password'},
+        headers:{origin:'https://api.ipzsk.com'}});
+      const cookie=login.headers['set-cookie'].split(';')[0];
+      const requestId=randomUUID();
+      await db.query(`INSERT INTO requests(id,user_id,model,status,fingerprint,stream) VALUES($1,$2,'test-model','succeeded','fp-refund',false)`,[requestId,userId]);
+      await db.query(`INSERT INTO request_billing(request_id,user_id,state,reserved_cny,charged_cny,price_snapshot)
+        VALUES($1,$2,'settled',1,1,'{}')`,[requestId,userId]);
+      const before=quotaAdded.length;
+      const refund=(amount)=>app.inject({url:'/admin/api/billing/'+requestId+'/refund',method:'POST',
+        headers:{cookie,origin:'https://api.ipzsk.com'},payload:{amount_cny:amount,reason:'测试多次部分退款'}});
+      assert.equal((await refund('0.20000000')).statusCode,200);
+      assert.equal((await refund('0.30000000')).statusCode,200);
+      assert.equal(quotaAdded.length,before+2,'两次退款各自要加一次 lanehub 额度');
+      assert.equal(Number((await db.query('SELECT refunded_cny FROM request_billing WHERE request_id=$1',[requestId])).rows[0].refunded_cny),0.5);
+    });
+
     await t.test('结算单：起草 → 冻结 → 打款；冻结之后的退款落到下一张单', async () => {
       const login=await app.inject({url:'/admin/api/login',method:'POST',payload:{password:'test-administrator-password'},
         headers:{origin:'https://api.ipzsk.com'}});

@@ -91,7 +91,7 @@ test('studio: generation records, quote, threads, queue, templates, subjects, fa
   let app;
   try {
     await db.migrate(); await db.migrate();
-    assert.deepEqual((await db.query('SELECT version FROM schema_version WHERE version>=18 ORDER BY version')).rows.map((r) => r.version), [18, 19, 20, 21, 22, 23, 24, 25, 26, 27]);
+    assert.deepEqual((await db.query('SELECT version FROM schema_version WHERE version>=18 ORDER BY version')).rows.map((r) => r.version), [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]);
     const accountId = randomUUID();
     await db.query(`INSERT INTO upstream_accounts (id,name,concurrency,base_url,provider_type) VALUES ($1,'lanehub',50,$2,'lanehub')`, [accountId, LANE]);
     await db.query(`INSERT INTO app_settings (key,value) VALUES ('lanehub_mode','on')`);

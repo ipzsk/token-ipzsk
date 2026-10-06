@@ -28,10 +28,23 @@ await bootstrap(db,upstream,{ secretDir,adminPasswordFile:process.env.ADMIN_PASS
 await db.recover();
 await upstream.refresh();
 const origin=process.env.PUBLIC_ORIGIN ?? 'https://api.ipzsk.com';
+// lanehub 客户端要在建 customerAuth **之前**备好：新人赠额发在谁那边，取决于这条链路是否真的接上。
+// 只配了地址、没配管理令牌是配置错误，不能静默降级成「本地也不发」——那会让每个新用户
+// 既拿不到对面的额度、也拿不到本地的（localSignupBonus 会跟着变成 false）。
+// 管理令牌优先从文件读：这台机器上别的密钥（数据库口令、管理员口令）都走 *_FILE，
+// 权限 600、不进 compose.yaml，这一个不该例外。
+const lanehubAdminToken = await adminTokenFromEnv();
+if (process.env.LANEHUB_BASE_URL && !lanehubAdminToken) throw new Error('lanehub_admin_token_required');
+// lanehub 客户端只在配好时才建：没配就是没开这条路，createApp 里那个 `Boolean(lanehub)`
+// 会把整条分支关掉——不会出现「开关是 on 但没有客户端」的半开状态。
+const lanehub = process.env.LANEHUB_BASE_URL
+  ? new Lanehub({ baseUrl:process.env.LANEHUB_BASE_URL, adminToken:lanehubAdminToken })
+  : null;
 const customerAuthSecret=(await readFile('/run/secrets/customer-auth-secret','utf8')).trim();
 const customerAuth=createCustomerAuth({db,origin,secret:customerAuthSecret,
   // 接了 lanehub 时新人赠额由对面发（provisionCustomer），本地不再发，否则一个新用户拿两份。
-  localSignupBonus:!process.env.LANEHUB_BASE_URL,
+  // 判据是**客户端是否真的建起来**，不是环境变量有没有填。
+  localSignupBonus:!lanehub,
   mailer:await loadMailer('/run/mail/tencent-ses.json'),captcha:createImageCaptcha({db,secret:customerAuthSecret})});
 await customerAuth.migrate();
 let trustedProxyAddresses=new Set(['127.0.0.1','::1']);
@@ -41,14 +54,6 @@ async function refreshProxyAddresses(){
 }
 await refreshProxyAddresses();
 const proxyTimer=setInterval(refreshProxyAddresses,60000);proxyTimer.unref();
-// lanehub 客户端只在配好时才建：没配就是没开这条路，createApp 里那个 `Boolean(lanehub)`
-// 会把整条分支关掉——不会出现「开关是 on 但没有客户端」的半开状态。
-// 管理令牌优先从文件读：这台机器上别的密钥（数据库口令、管理员口令）都走
-// *_FILE，权限 600、不进 compose.yaml，这一个不该例外。
-const lanehubAdminToken = await adminTokenFromEnv();
-const lanehub = process.env.LANEHUB_BASE_URL && lanehubAdminToken
-  ? new Lanehub({ baseUrl:process.env.LANEHUB_BASE_URL, adminToken:lanehubAdminToken })
-  : null;
 
 const lanehubUsdCny=Number(process.env.LANEHUB_USD_CNY ?? 0);
 const lanehubQuotaPerUnit=Number(process.env.LANEHUB_QUOTA_PER_UNIT ?? 500000);

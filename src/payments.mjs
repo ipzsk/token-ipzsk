@@ -5,6 +5,7 @@ import { loadRoles, requireRole } from './roles.mjs';
 import { units, decimal, wallet } from './billing.mjs';
 import { customerOrigin } from './customer-auth.mjs';
 import { checkoutUrl } from './waffo.mjs';
+import { lanehubMode } from './lanehub.mjs';
 
 const orderFields = 'id,mode,pack_key,amount_cny,currency,state,created_at,paid_at,credited_at';
 const monetary = value => {
@@ -139,7 +140,10 @@ export function paymentRoutes(app, { db, waffo = null, lanehub = null, lanehubQu
       throw httpError(409, 'payment_email_unavailable');
     const key = uuid(req.headers['idempotency-key']);
     const id = randomUUID();
-    let target = waffo.mode === 'test' ? 'test' : lanehub ? 'lanehub' : 'local', mapping, quota = null;
+    // 入账目标必须跟着**当前的额度真源**走，不能只看 lanehub 客户端是否存在：
+    // 回滚（lanehub_mode=off）后网站/后台读本地钱包，充值却还加在对面，用户会充了看不到。
+    const useLanehub = Boolean(lanehub) && await lanehubMode(db);
+    let target = waffo.mode === 'test' ? 'test' : useLanehub ? 'lanehub' : 'local', mapping, quota = null;
     if (target === 'lanehub') {
       mapping = (await db.query('SELECT lanehub_user_id FROM lanehub_accounts WHERE user_id=$1', [req.apiUser.id])).rows[0];
       if (!mapping) throw httpError(503, 'payment_wallet_unavailable');

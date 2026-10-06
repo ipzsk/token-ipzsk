@@ -83,23 +83,36 @@ async function recordLanehubBilling(db, lanehub, row, { usdCnyRate, quotaPerUnit
  * 扫一批还没有账单行的 lanehub 请求，补记扣费。和余额刷新挂在同一个定时器上。
  *
  * 媒体任务要等它走到终态才查：lanehub 那边任务失败会退费，中途查到的数字会被退掉。
+ *
+ * 一轮按 (completed_at,id) 游标往后翻，把能处理的都处理掉，不再每轮只取 20 条：
+ * 请求量一上来，旧实现会让账单一直积压，越接近「10 分钟查不到日志就作废」的边界；
+ * 前台余额是实时的，后台计费却排在队尾。查不到日志的行（还没落库）本轮跳过，
+ * 游标不会再被它们堵住，下一轮从头重试。
  */
-export async function reconcileLanehubCharges(db, lanehub, options) {
-  const { rows } = await db.query(`SELECT r.id,r.user_id,r.model,r.upstream_id,r.completed_at,t.status AS task_status FROM requests r
-    JOIN upstream_keys k ON k.id=r.key_id JOIN upstream_accounts a ON a.id=k.account_id
-    LEFT JOIN media_tasks t ON t.id=r.id LEFT JOIN request_billing b ON b.request_id=r.id
-    WHERE a.provider_type='lanehub' AND b.request_id IS NULL AND r.upstream_id IS NOT NULL
-      AND r.completed_at IS NOT NULL AND r.completed_at < now()-interval '30 seconds'
-      AND (t.id IS NULL OR t.status IN ('completed','failed','cancelled'))
-    ORDER BY r.completed_at LIMIT 20`);
-  let settled = 0, released = 0, failed = 0;
-  for (const row of rows) {
-    try {
-      const outcome = await recordLanehubCharge(db, lanehub, row, options);
-      if (outcome === 'settled') settled++; else if (outcome === 'released') released++;
-    } catch { failed++; }
+export async function reconcileLanehubCharges(db, lanehub, options, { batchSize = 100, maxRows = 1000 } = {}) {
+  let settled = 0, released = 0, failed = 0, scanned = 0;
+  let cursorAt = null, cursorId = null;
+  while (scanned < maxRows) {
+    const rows = (await db.query(`SELECT r.id,r.user_id,r.model,r.upstream_id,r.completed_at,t.status AS task_status FROM requests r
+      JOIN upstream_keys k ON k.id=r.key_id JOIN upstream_accounts a ON a.id=k.account_id
+      LEFT JOIN media_tasks t ON t.id=r.id LEFT JOIN request_billing b ON b.request_id=r.id
+      WHERE a.provider_type='lanehub' AND b.request_id IS NULL AND r.upstream_id IS NOT NULL
+        AND r.completed_at IS NOT NULL AND r.completed_at < now()-interval '30 seconds'
+        AND (t.id IS NULL OR t.status IN ('completed','failed','cancelled'))
+        AND ($1::timestamptz IS NULL OR (r.completed_at,r.id) > ($1::timestamptz,$2::uuid))
+      ORDER BY r.completed_at,r.id LIMIT $3`, [cursorAt, cursorId, batchSize])).rows;
+    if (!rows.length) break;
+    scanned += rows.length;
+    for (const row of rows) {
+      cursorAt = row.completed_at; cursorId = row.id;
+      try {
+        const outcome = await recordLanehubCharge(db, lanehub, row, options);
+        if (outcome === 'settled') settled++; else if (outcome === 'released') released++;
+      } catch { failed++; }
+    }
+    if (rows.length < batchSize) break;
   }
-  return { scanned: rows.length, settled, released, failed };
+  return { scanned, settled, released, failed };
 }
 
 /** 客户在 lanehub 的余额，折成人民币。lanehub 模式下这才是他真正能花的钱。 */

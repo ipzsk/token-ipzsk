@@ -26,12 +26,18 @@ export function desktopRoutes(app,options) {
     // 塞进去会把事务拖长，失败还会把注册一起回滚掉。
     // 这里失败也不该挡住 bootstrap：密钥在第一次发请求时还会再备一次（网关那条路）。
     await provisionIfEnabled(db,options,{userId:req.apiUser.id,name:req.apiUser.name}).catch(()=>{});
-    const rows=(await db.query(`SELECT DISTINCT unnest(k.models) AS model FROM upstream_keys k
-      JOIN upstream_accounts a ON a.id=k.account_id WHERE k.enabled AND a.enabled`)).rows;
-    const available=new Set(rows.map(row=>row.model));
+    const viaLanehub=Boolean(options.lanehubCatalog)&&await lanehubMode(db);
+    // 旧模式读本地号池的型号；lanehub 模式不查（密钥行的 models 永远是空的）。
+    const legacyAvailable=viaLanehub?null:new Set((await db.query(`SELECT DISTINCT unnest(k.models) AS model FROM upstream_keys k
+        JOIN upstream_accounts a ON a.id=k.account_id WHERE k.enabled AND a.enabled`)).rows.map((row)=>row.model));
     // lanehub 模式下目录从 lanehub 派生（真源在那边）；旧模式仍读本地快照。
-    const {models,image_models,video_models,canonical_params,default_model}=
-      (options.lanehubCatalog&&await lanehubMode(db))?options.lanehubCatalog.desktop():desktopCatalog(available);
+    const catalog=viaLanehub?options.lanehubCatalog.desktop():desktopCatalog(legacyAvailable);
+    // 插件白名单也要用**能卖的型号**来判：lanehub 客户密钥行的 models 是空的
+    //（lanehub.mjs ensureAccount 故意留空，避免被 legacy 池选中）。继续用 upstream_keys.models
+    // 过滤插件，会把插件全过滤掉、桌面端拿不到插件凭据，归属与分成整条断在这里。
+    // 用整个 lanehub 目录（含纯文本型号），不能只用 media()——那只含图片/视频。
+    const available=viaLanehub?new Set(options.lanehubCatalog.data.models.map((m)=>m.id)):legacyAvailable;
+    const {models,image_models,video_models,canonical_params,default_model}=catalog;
     if(!models.length)throw httpError(503,'desktop_models_unavailable');
     return db.tx(async c=>{
       const user=(await c.query('SELECT enabled FROM users WHERE id=$1 FOR UPDATE',[req.apiUser.id])).rows[0];
