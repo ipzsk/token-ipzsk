@@ -234,6 +234,7 @@ node scripts/lanehub-switch.mjs off      # 立刻回滚，不做检查
 | 整链（真库 + 假 lanehub） | `test/lanehub-chain.test.mjs` | 建号→插件归属→token→回写→分成报表→余额 |
 | 真钱 E2E | `node scripts/lanehub-e2e.mjs --spend` | 真 lanehub + 真上游，报价 = 实扣 = 回写 |
 | 变现链真钱 E2E | `node scripts/skill-chain-e2e.mjs` | 从 HTTP 入口进：提示词型 skill → 归属 → token → 扣费补记 → 作者计提 → 结算单 |
+| 网关入口计价链 | `node scripts/chain-live.mjs`（或 `inspect <request_id>`） | 登录→网站接口生成→余额/流水/账单/生成记录与 lanehub 实扣，含分组倍率与加价报告。用法与倍率说明见 [CHAIN-TESTING.md](./CHAIN-TESTING.md) |
 
 2026-09-13 实跑（APIMart 的 `deepseek-v4-flash`，经 lanehub 转发）：
 

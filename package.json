@@ -8,6 +8,8 @@
   },
   "scripts": {
     "test:payments": "node --test test/payments.test.mjs test/payments-integration.test.mjs",
+    "chain:live": "node scripts/chain-live.mjs",
+    "chain:inspect": "node scripts/chain-live.mjs inspect",
     "start": "node src/server.mjs",
     "contracts": "node scripts/export-contracts.mjs",
     "test": "node --test test/captcha.test.mjs test/core.test.mjs test/agent-protocols.test.mjs test/audio.test.mjs test/image-upload.test.mjs test/text-pricing.test.mjs test/model-catalog.test.mjs test/multi-upstream.test.mjs test/media-billing.test.mjs test/lanehub.test.mjs test/lanehub-charges.test.mjs test/lanehub-catalog.test.mjs test/media.test.mjs test/media-thumbs.test.mjs test/studio.test.mjs test/cases.test.mjs test/desktop-releases.test.mjs test/contracts.test.mjs test/admin-ops.test.mjs test/avatar.test.mjs test/check-compose.test.mjs test/payments.test.mjs",
