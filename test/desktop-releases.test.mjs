@@ -21,6 +21,7 @@ const releaseApp = (objects) => { const app = Fastify(); desktopDownloadRoutes(a
 test('desktop-release manifest validation rejects anything the endpoint cannot sign safely', () => {
   const code = (doc) => { try { parseDesktopManifest(doc); return null; } catch (e) { return e.code; } };
   assert.deepEqual(parseDesktopManifest(manifest()), manifest());
+  assert.equal(parseDesktopManifest(manifest({ version: '3.0.0-beta.5' })).version, '3.0.0-beta.5');
   for (const bad of [null, [], 'x', manifest({ version: 'v2.0.8' }), manifest({ released_at: 'nope' }), manifest({ files: [] }),
     manifest({ files: [{ platform: 'linux', name: 'a.deb', bytes: 1, sha256: SHA }] }),
     manifest({ files: [{ platform: 'mac', name: '../../secrets/key', bytes: 1, sha256: SHA }] }),

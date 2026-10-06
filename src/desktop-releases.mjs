@@ -33,7 +33,7 @@ export function desktopReleaseRoutes(app,{desktopReleaseFetch=fetch,readDesktopR
 // ── 官网下载（§8）：安装包放私有 R2 的 desktop/<version>/，网关下发时间切片签名 URL ──
 // 桶里两份 JSON 形状相同：desktop/latest.json（指向最新正式版）与 desktop/<version>/manifest.json（历史版本）。
 export const DESKTOP_PLATFORMS = ['mac', 'mac-intel', 'windows'];
-export const DESKTOP_VERSION = /^\d+\.\d+\.\d+$/;
+export const DESKTOP_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$/;
 const FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$/; // 不含 '/'：名字只能落在自己的 desktop/<version>/ 前缀下
 
 /** 形状不对就当「没有发布」，不把存储/解析细节透给客户端。 */
