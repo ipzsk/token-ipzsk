@@ -43,6 +43,8 @@ export function adminAccountRoutes(app,{db,lanehub=null}){
     return {rows:(await db.query(`SELECT l.*,u.name AS user_name FROM (
       SELECT id,user_id,amount_cny,balance_after_cny,created_at,'recharge' AS kind,NULL::uuid AS request_id FROM wallet_entries
       UNION ALL ${consumption}
+      UNION ALL SELECT p.id,p.user_id,-f.balance_deduction_cny,NULL::numeric,f.created_at,'payment_refund',NULL::uuid
+        FROM commission_payment_refunds f JOIN payment_orders p ON p.id=f.payment_order_id WHERE f.balance_deduction_cny>0
     ) l JOIN users u ON u.id=l.user_id WHERE ($1::uuid IS NULL OR user_id=$1) ORDER BY created_at DESC LIMIT 200`,[user])).rows};
   });
 }

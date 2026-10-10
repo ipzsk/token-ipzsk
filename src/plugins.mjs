@@ -127,7 +127,8 @@ export function pluginRoutes(app,{db,githubFetch}){
       sum(r.cost_cny) AS confirmed_cost_cny,count(*) FILTER(WHERE r.cost_cny IS NULL) AS unknown_cost_requests,
       -- 分成读 plugin_earnings（唯一真源：计提一行、退款一行负数），不在这里按
       -- charged_cny 再算一遍——两份口径只要差一点，打给作者的钱就是错的。
-      sum((SELECT coalesce(sum(pe.amount_cny),0) FROM plugin_earnings pe WHERE pe.request_id=r.id)) AS developer_earnings_cny,
+      sum((SELECT coalesce(sum(pe.amount_cny),0) FROM plugin_earnings pe WHERE pe.request_id=r.id)
+        +(SELECT coalesce(sum(cl.amount_cny),0) FROM commission_ledger cl WHERE cl.request_id=r.id AND cl.kind='developer')) AS developer_earnings_cny,
       sum(b.refunded_cny) FILTER(WHERE b.state='settled') AS refunded_cny,
       sum(b.charged_cny-b.refunded_cny-r.cost_cny) FILTER(WHERE b.state='settled' AND r.cost_cny IS NOT NULL) AS confirmed_margin_cny,
       count(*) FILTER(WHERE b.state='settled' AND r.cost_cny IS NOT NULL) AS margin_known_requests,

@@ -18,6 +18,25 @@ export async function checkDesktopSession(db,credential) {
 export function desktopRoutes(app,options) {
   const {db}=options;
   const limiter=new RateLimiter();
+  app.post('/admin/api/plugins/:id/skill-versions',async req=>{
+    if(req.administrator?.role!=='superadmin')throw httpError(403,'admin_permission_denied');
+    const {skill_ref,content_sha256,enabled,reason}=req.body??{};
+    if(typeof skill_ref!=='string'||!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(skill_ref)||skill_ref.length>128
+      ||typeof content_sha256!=='string'||!/^[a-f0-9]{64}$/.test(content_sha256)||typeof enabled!=='boolean'
+      ||typeof reason!=='string'||reason.trim().length<5||reason.length>500)throw httpError(400,'invalid_skill_version');
+    return db.tx(async c=>{
+      const plugin=(await c.query('SELECT id FROM plugins WHERE id::text=$1 FOR UPDATE',[req.params.id])).rows[0];
+      if(!plugin)throw httpError(404,'plugin_not_found');
+      await c.query('INSERT INTO plugin_skills(skill_ref,plugin_id) VALUES($1,$2) ON CONFLICT DO NOTHING',[skill_ref,plugin.id]);
+      const owner=(await c.query('SELECT plugin_id FROM plugin_skills WHERE skill_ref=$1 FOR UPDATE',[skill_ref])).rows[0];
+      if(owner.plugin_id!==plugin.id)throw httpError(409,'skill_owner_conflict');
+      await c.query(`INSERT INTO commission_skill_versions(skill_ref,content_sha256,enabled) VALUES($1,$2,$3)
+        ON CONFLICT(skill_ref,content_sha256) DO UPDATE SET enabled=EXCLUDED.enabled`,[skill_ref,content_sha256,enabled]);
+      await c.query('INSERT INTO audit_events(action,target_id,administrator_id,details) VALUES($1,$2,$3,$4)',
+        ['commission.skill_version',plugin.id,req.administrator.id,JSON.stringify({skill_ref,content_sha256,enabled,reason:reason.trim()})]);
+      return {skill_ref,content_sha256,enabled};
+    });
+  });
   app.post('/api/me/desktop/bootstrap',async req=>{
     if(!req.apiUser.session_id)throw httpError(403,'customer_login_required');
     limiter.take('desktop:'+req.apiUser.id,20,600000);
@@ -55,7 +74,7 @@ export function desktopRoutes(app,options) {
         [randomUUID(),req.apiUser.id,hash(value),value.slice(0,12),session.expiresAt,req.apiUser.session_id]);
       if(!result.rowCount)throw httpError(403,'desktop_access_revoked');
       await c.query('INSERT INTO audit_events(action,target_id) VALUES($1,$2)',['desktop.bootstrap',result.rows[0].id]);
-      const plugins=(await c.query(`SELECT * FROM plugins WHERE enabled AND runtime_id IS NOT NULL AND allowed_models && $1::text[] ORDER BY slug`,[[...available]])).rows;
+      const plugins=(await c.query(`SELECT p.* FROM plugins p WHERE enabled AND allowed_models && $1::text[] AND runtime_id IS NOT NULL ORDER BY slug`,[[...available]])).rows;
       const plugin_configs=[];
       for(const plugin of plugins){
         const credential=token('ipz_');
@@ -65,7 +84,7 @@ export function desktopRoutes(app,options) {
           WHERE access_tokens.revoked_at IS NULL RETURNING id`,
           [randomUUID(),req.apiUser.id,hash(credential),credential.slice(0,12),'插件：'+plugin.name,session.expiresAt,req.apiUser.session_id,plugin.id]);
         if(!issued.rowCount)continue;
-        plugin_configs.push({package:plugin.package_name,id:plugin.runtime_id,plugin_id:plugin.id,
+        if(plugin.runtime_id)plugin_configs.push({package:plugin.package_name,id:plugin.runtime_id,plugin_id:plugin.id,
           config:plugin.runtime_config,credential_paths:plugin.credential_paths,credential});
       }
       return {token:value,expires_at:session.expiresAt,default_model,models,image_models,video_models,canonical_params,plugin_configs};

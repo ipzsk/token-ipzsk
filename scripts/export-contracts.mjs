@@ -132,7 +132,7 @@ function routeFacts(analysis, key) {
 function authFor(path, facts) {
   const roles = [...(facts.segment ?? '').matchAll(/requireRole\(\s*req\s*,([^)]*)\)/g)].flatMap((m) => [...m[1].matchAll(/'(\w+)'/g)].map((r) => r[1]));
   if (roles.length) return { auth: 'cookie', roles: [...new Set(roles)].sort() };
-  if (facts.calls.has('studio.mjs:me')) return { auth: 'cookie' };
+  if (facts.calls.has('studio.mjs:me') || facts.calls.has('commissions.mjs:login')) return { auth: 'cookie' };
   if (path.startsWith('/api/me/')) return { auth: 'cookie_or_bearer' };
   if (path.startsWith('/v1/') || path.startsWith('/api/videos/')) return { auth: 'bearer' };
   if (path.startsWith('/api/admin/')) return { auth: 'cookie' };

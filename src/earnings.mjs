@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { httpError } from './security.mjs';
 import { uuid } from './validation.mjs';
-import { units, decimal } from './billing.mjs';
+import { units, decimal, wallet } from './billing.mjs';
 import { creditAccount, provisionIfEnabled, lanehubMode } from './lanehub.mjs';
 
 // 插件作者的分成：计提、退款冲销、结算单。
@@ -81,6 +81,7 @@ export async function recordSkillInvocations(c, requestId, skillRefs, windowMinu
     FROM requests r JOIN plugin_skills s ON s.skill_ref = ANY($2::text[])
       JOIN plugins p ON p.id=s.plugin_id
     WHERE r.id=$1 AND p.enabled AND p.owner_user_id IS NOT NULL
+      AND NOT EXISTS(SELECT 1 FROM commission_requests WHERE request_id=r.id AND enabled)
       -- 同一个人、同一个 skill，窗口内只算一次。agent 跑一轮会发好几次请求，
       -- 而 skill 内容一旦加载就留在后续每一次的上下文里——不去重的话，用户说
       -- 一句话会被计成五六次（实测一轮 6 步计了 5 次）。
@@ -123,6 +124,7 @@ export async function accrueEarning(c, requestId) {
            ELSE round((b.charged_cny-b.refunded_cny)*r.plugin_share_bps/10000,8) END
     FROM requests r JOIN request_billing b ON b.request_id=r.id JOIN plugins p ON p.id=r.plugin_id
     WHERE r.id=$1 AND r.plugin_owner_user_id IS NOT NULL AND b.state='settled'
+      AND NOT EXISTS(SELECT 1 FROM commission_requests WHERE request_id=r.id AND enabled)
       AND (p.price_per_call_cny > 0
            OR (coalesce(r.plugin_share_bps,0)>0 AND (b.charged_cny-b.refunded_cny)>0))
     ON CONFLICT DO NOTHING`, [requestId, randomUUID()]);
@@ -171,6 +173,7 @@ export function earningsRoutes(app,options){
       await c.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[found.user_id]);
       const bill=(await c.query('SELECT * FROM request_billing WHERE request_id=$1 FOR UPDATE',[id])).rows[0];
       if(bill.state!=='settled')throw httpError(409,'billing_not_settled');
+      if((await c.query('SELECT 1 FROM commission_allocations WHERE request_id=$1 AND chargeback_cny>0 LIMIT 1',[id])).rowCount)throw httpError(409,'chargeback_requires_manual_resolution');
       const remaining=units(bill.charged_cny)-units(bill.refunded_cny);
       if(units(value)>remaining)throw httpError(409,'refund_exceeds_charge');
       // 每一笔退款有自己的序号；同一笔重试会落回同一个 reference（幂等），不同笔永远不撞。
@@ -181,13 +184,14 @@ export function earningsRoutes(app,options){
           usdCnyRate:rate,quotaPerUnit:options.lanehubQuotaPerUnit,reference:`refund:${id}:${seq}`,remark:'人工退款：'+why});
         if(!credited.applied)throw httpError(409,'refund_reference_conflict');
       }else{
-        const balance=(await c.query(`SELECT coalesce(sum(amount_cny),0)+$2::numeric-coalesce((SELECT sum(amount_cny) FROM wallet_debits WHERE user_id=$1),0) AS amount FROM wallet_entries WHERE user_id=$1`,[found.user_id,value])).rows[0].amount;
-        await c.query('INSERT INTO wallet_entries(id,user_id,amount_cny,balance_after_cny) VALUES($1,$2,$3,$4)',[randomUUID(),found.user_id,value,balance]);
+        const balance=decimal(units((await wallet(c,found.user_id)).balance_cny)+units(value));
+        await c.query("INSERT INTO wallet_entries(id,user_id,amount_cny,balance_after_cny,source) VALUES($1,$2,$3,$4,'service_refund')",[randomUUID(),found.user_id,value,balance]);
       }
       // 作者那边按同样的比例冲回去。没有归属或没配比例的请求本来就没计提，这里也不记。
       const request=(await c.query('SELECT plugin_owner_user_id,plugin_id,plugin_share_bps FROM requests WHERE id=$1',[id])).rows[0];
       let clawback='0';
-      if(request?.plugin_owner_user_id&&Number(request.plugin_share_bps)>0){
+      const profitCommission=(await c.query('SELECT request_id FROM commission_requests WHERE request_id=$1 AND enabled',[id])).rowCount>0;
+      if(!profitCommission&&request?.plugin_owner_user_id&&Number(request.plugin_share_bps)>0){
         clawback=decimal((units(value)*BigInt(request.plugin_share_bps)+5000n)/10000n);
         if(units(clawback)>0n)await c.query(`INSERT INTO plugin_earnings (id,request_id,owner_user_id,plugin_id,kind,amount_cny)
           VALUES ($1,$2,$3,$4,'refund',$5)`,[randomUUID(),id,request.plugin_owner_user_id,request.plugin_id,'-'+clawback]);

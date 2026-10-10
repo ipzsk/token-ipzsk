@@ -334,6 +334,40 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
       assert.equal(mine.json().source,'lanehub');
       assert.equal(mine.json().balance_cny,(357142/QUOTA_PER_UNIT*USD_CNY).toFixed(8));
     });
+    await t.test('profit v1: authenticated plugin and Skill credentials credit BD and author; forged tags cannot select an author', async () => {
+      const remaining=(await db.query('SELECT coalesce(sum(remaining_cny),0)::numeric(20,8) AS amount FROM commission_funds WHERE user_id=$1',[userId])).rows[0].amount;
+      const drain=randomUUID();
+      await db.query("INSERT INTO requests(id,user_id,model,fingerprint,stream,status) VALUES($1,$2,'test-model','drain fixture',false,'succeeded')",[drain,userId]);
+      await db.query("INSERT INTO request_billing(request_id,user_id,state,reserved_cny,charged_cny,price_snapshot) VALUES($1,$2,'settled',$3,$3,'{}')",[drain,userId,remaining]);
+      const bd=randomUUID(),personal=token('ipz_');
+      await db.query("INSERT INTO users(id,name) VALUES($1,'BD fixture')",[bd]);
+      await db.query('INSERT INTO referral_profiles(user_id,bd_active) VALUES($1,true)',[bd]);
+      await db.query('INSERT INTO referrals(user_id,referrer_id) VALUES($1,$2)',[userId,bd]);
+      await db.query('INSERT INTO access_tokens(id,user_id,token_hash,prefix) VALUES($1,$2,$3,$4)',[randomUUID(),userId,hash(personal),personal.slice(0,12)]);
+      for(let i=0;i<3;i++) {
+        const payment=randomUUID();
+        await db.query("INSERT INTO payment_orders(id,user_id,mode,pack_key,product_id,amount_cny,currency,idempotency_key,target,state,credited_at) VALUES($1,$2,'prod','cny_100','fixture',100,'CNY',$1,'local','credited',now())",[payment,userId]);
+        await db.query("INSERT INTO wallet_entries(id,user_id,amount_cny,balance_after_cny,source,payment_order_id) VALUES($1,$2,100,100,'payment',$3)",[randomUUID(),userId,payment]);
+      }
+      await db.query('UPDATE commission_policy SET enabled=true');
+      for(const method of ['plugin','skill','forged']) {
+        const response=await app.inject({url:'/v1/chat/completions',method:'POST',
+          payload:{model:'test-model',messages:[{role:'user',content:'fixture'}]},
+          headers:{authorization:'Bearer '+(method==='plugin'?pluginToken:personal),
+            ...(method==='skill'?{'x-ipzsk-plugin-token':pluginToken}:{}),
+            ...(method==='forged'?{'x-plugin-id':PLUGIN_ID,'x-ipzsk-skill':'ip-workbench-ppt'}:{})}});
+        assert.equal(response.statusCode,200,response.body);
+        const id=response.headers['x-request-id'];
+        assert.ok(id);
+        await db.query('UPDATE requests SET cost_cny=40 WHERE id=$1',[id]);
+        await db.query("INSERT INTO request_billing(request_id,user_id,state,reserved_cny,charged_cny,price_snapshot) VALUES($1,$2,'settled',100,100,'{}')",[id,userId]);
+        const row=(await db.query('SELECT * FROM commission_requests WHERE request_id=$1',[id])).rows[0];
+        assert.equal(row.bd_user_id,bd); assert.equal(row.bd_cny,'12.00000000');
+        assert.equal(row.developer_user_id,method==='forged'?null:ownerId);
+        assert.equal(row.developer_cny,method==='forged'?'0.00000000':'19.20000000');
+        assert.equal((await db.query('SELECT count(*) FROM plugin_earnings WHERE request_id=$1',[id])).rows[0].count,'0');
+      }
+    });
   } finally {
     await app?.close();
     await db.close();

@@ -65,7 +65,7 @@ test('uploads, assets, roles and media cleanup against gateway_test', async t =>
   let app;
   try {
     await db.migrate(); await db.migrate(); // idempotent re-run
-    assert.deepEqual((await db.query('SELECT version FROM schema_version WHERE version>=18 ORDER BY version')).rows.map(r => r.version), [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]);
+    assert.deepEqual((await db.query('SELECT version FROM schema_version WHERE version>=18 ORDER BY version')).rows.map(r => r.version), [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]);
     for (const id of [alice, bob]) {
       await db.query('INSERT INTO users(id,name,email,email_verified) VALUES($1,$2,$3,true)', [id, 'Fixture', id + '@example.com']);
       sessions.set(id, new Date().toISOString());

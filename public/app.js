@@ -1,9 +1,11 @@
 import { setupPlugins } from '/admin/plugins.js';
 import { setupAccounts } from '/admin/accounts.js';
 import { setupWallet } from '/admin/wallet.js';
+import { setupCommissions } from '/admin/commissions.js';
 const $ = (s) => document.querySelector(s);
 const state = { page:'overview',accounts:[],keys:[],users:[],providerTypes:[],requestPage:1,filter:{},edit:null };
 const titles = { plugins:['插件市场与用量','PLUGIN MARKET'], management:['账户与账单','ACCOUNTS & BILLING'], wallet:['入账流水','WALLET'], overview:['服务总览','OVERVIEW'],pool:['API 号池','UPSTREAM POOL'],users:['用户管理','USERS'],requests:['调用记录','REQUEST LOG'] };
+titles.commissions=['分佣与提现','COMMISSIONS'];
 const number = (v) => v === null || v === undefined ? '—' : Number(v).toLocaleString('zh-CN');
 const money = (v) => v === null || v === undefined ? '未同步' : Number(v).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2})+' 元';
 const charge = (v) => v === null || v === undefined ? '待核实' : Number(v).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:8})+' 元';
@@ -103,7 +105,7 @@ async function loadRequests(){
 }
 async function refresh(){
   $('#refresh').disabled=true;
-  try{await ({plugins:pluginUi.refresh,overview, pool:loadPool,users:loadUsers,requests:loadRequests,wallet:walletUi.refresh,management:accountUi.refresh}[state.page])();$('#sync-label').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});}
+  try{await ({commissions:commissionUi.refresh,plugins:pluginUi.refresh,overview, pool:loadPool,users:loadUsers,requests:loadRequests,wallet:walletUi.refresh,management:accountUi.refresh}[state.page])();$('#sync-label').textContent='更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});}
   finally{$('#refresh').disabled=false;}
 }
 async function go(page){state.page=page;document.querySelectorAll('.page').forEach((n)=>n.hidden=n.id!=='page-'+page);document.querySelectorAll('[data-page]').forEach((b)=>b.classList.toggle('active',b.dataset.page===page));$('#page-title').textContent=titles[page][0];$('#breadcrumb').textContent=titles[page][1];if(page==='requests'){state.users=(await api('/users')).rows;const selected=$('#filter-user').value;$('#filter-user').replaceChildren(new Option('全部用户',''),...state.users.map((u)=>new Option(u.name,u.id)));$('#filter-user').value=selected;}await refresh();}
@@ -121,6 +123,7 @@ function modelList(value){return value.split(/[,，\n]/).map((x)=>x.trim()).filt
 async function submit(form,path,body,done){const b=form.querySelector('button.primary');b.disabled=true;try{const result=await api(path,'POST',body);form.closest('dialog')?.close();form.reset();await done(result);}finally{b.disabled=false;}}
 const pluginUi=setupPlugins({api,action,el,table,cell,button,rowActions,charge,time,number,notice});
 const accountUi=setupAccounts({api,action,el,table,cell,button,rowActions,charge,time,showToken});
+const commissionUi=setupCommissions({api,action,el,table,cell,button,charge,time,notice});
 $('#login-form').addEventListener('submit',async(e)=>{e.preventDefault();const b=e.currentTarget.querySelector('button');b.disabled=true;$('#login-error').textContent='';try{await api('/login','POST',formData(e.currentTarget));e.target.reset();$('#login-view').hidden=true;$('#console-view').hidden=false;await enterConsole();}catch(err){$('#login-error').textContent=err.message;}finally{b.disabled=false;}});
 document.querySelectorAll('[data-page]').forEach((b)=>b.addEventListener('click',action(()=>go(b.dataset.page))));
 document.querySelectorAll('[data-go]').forEach((b)=>b.addEventListener('click',action(()=>go(b.dataset.go))));

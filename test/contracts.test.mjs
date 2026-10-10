@@ -28,6 +28,12 @@ test('validator catches drift', () => {
   assert.equal(validate(schemas.GenerationBody, { model: 'm', batch_position: 12 }).length, 1, 'batch_position is 0..11');
 });
 
+test('earnings contracts require a customer session for every own-account route', async () => {
+  const routes = JSON.parse((await buildContracts()).json).endpoints.filter(route => route.path.startsWith('/api/me/commissions'));
+  assert.equal(routes.length, 3);
+  for (const route of routes) assert.equal(route.auth, 'cookie');
+});
+
 // ── 真实 handler（假 db / 假存储 / 假会话）的响应对上 schema ──
 const USER = '10000000-0000-4000-8000-000000000001';
 const id = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;

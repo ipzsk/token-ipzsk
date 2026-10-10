@@ -8,6 +8,8 @@ import { randomUUID } from 'node:crypto';
 import { hash, httpError, token, RateLimiter } from './security.mjs';
 import { unavailableCaptcha } from './captcha.mjs';
 import { takeAuthLimit, verifyAuthCaptcha } from './auth-abuse.mjs';
+import { bindReferral } from './commissions.mjs';
+import { units, decimal, wallet } from './billing.mjs';
 
 export const customerOrigin = 'https://www.ipzsk.com';
 export const SIGNUP_BONUS_CNY = 5;
@@ -50,15 +52,14 @@ export function createCustomerAuth({db,secret,origin,mailer,captcha=unavailableC
         VALUES($1,$2,$3,$4,true) ON CONFLICT(auth_user_id) DO NOTHING RETURNING id`,
         [randomUUID(),(user.name||user.email).slice(0,100),user.id,user.email.toLowerCase()]);
       const row=(await c.query('SELECT id,name,rpm,enabled,auth_user_id,email FROM users WHERE auth_user_id=$1',[user.id])).rows[0];
+      if(result.rowCount)await bindReferral(c,user.id,row.id);
       // 新人赠额：lanehub 模式下由 provisionCustomer 在对面发（¥5 → quota），这里不再发本地的，
       // 否则同一个新用户拿两份。没接 lanehub 时照旧发本地钱包。
       if(result.rowCount&&!localSignupBonus){
         await c.query('INSERT INTO audit_events(action,target_id) VALUES($1,$2)',['customer.register',row.id]);
       }else if(result.rowCount){
         const amount=SIGNUP_BONUS_CNY.toFixed(8),ledgerId=randomUUID();
-        const balance=(await c.query(`SELECT coalesce(sum(amount_cny),0)+$2::numeric-
-          coalesce((SELECT sum(amount_cny) FROM wallet_debits WHERE user_id=$1),0) AS amount
-          FROM wallet_entries WHERE user_id=$1`,[row.id,amount])).rows[0].amount;
+        const balance=decimal(units((await wallet(c,row.id)).balance_cny)+units(amount));
         await c.query(`INSERT INTO wallet_entries(id,user_id,amount_cny,balance_after_cny,source)
           VALUES($1,$2,$3,$4,'signup_bonus') ON CONFLICT DO NOTHING`,[ledgerId,row.id,amount,balance]);
         await c.query('INSERT INTO audit_events(action,target_id,details) VALUES($1,$2,$3)',
@@ -134,6 +135,12 @@ export function customerAuthRoutes(app,options) {
     const result=await customerAuth.auth.handler(new Request(origin+req.url,{method:req.method,headers,
       ...(req.body?{body:JSON.stringify(req.body)}:{})}));
     const body=await result.text();
+    if(path==='/sign-up/email'&&result.ok){
+      const code=String(req.headers.cookie??'').match(/(?:^|;\s*)ipzsk_referral=([a-f0-9]{32})(?:;|$)/)?.[1];
+      const authId=JSON.parse(body)?.user?.id;
+      if(code&&typeof authId==='string')await db.query(`INSERT INTO referral_registrations(auth_user_id,referrer_id)
+        SELECT $1,user_id FROM referral_profiles WHERE code=$2 ON CONFLICT DO NOTHING`,[authId,code]);
+    }
     if(['/sign-in/email','/email-otp/verify-email'].includes(path)&&result.ok){
       const data=JSON.parse(body);
       const customer=await customerAuth.ensureCustomer(data.user);

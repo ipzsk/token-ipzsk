@@ -21,6 +21,7 @@ import { listRequests } from './admin.mjs';
 import { audioRequest } from './audio.mjs';
 import { imageUpload } from './image-upload.mjs';
 import { avatarSubmitError } from './avatar-contract.mjs';
+import { resolveSkillCalls } from './skill-attribution.mjs';
 
 async function boundedJson(response, max = 8_000_000) {
   const chunks = []; let size = 0;
@@ -78,7 +79,7 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
   app.get('/api/me/usage', async (req) => {
     const records = await listRequests(db, req.query, req.apiUser.id);
     // Public user responses do not expose the upstream pool's identity.
-    records.rows = records.rows.map(({ key_name, upstream_id, cost_cny, cost_reference, cost_recorded_at, estimated_cost_cny, pricing_details, ...row }) => ({...row,charged_points:points(row.charged_cny)}));
+    records.rows = records.rows.map(({ key_name, upstream_id, cost_cny, cost_reference, cost_recorded_at, estimated_cost_cny, pricing_details, skill_calls, skill_attribution_state, ...row }) => ({...row,charged_points:points(row.charged_cny)}));
     const summary = (await db.query(`SELECT count(*) AS requests,coalesce(sum(input_tokens),0) AS input_tokens,
       coalesce(sum(output_tokens),0) AS output_tokens,coalesce(sum(total_tokens),0) AS total_tokens,
       count(*) FILTER(WHERE usage_state='unknown') AS unknown FROM requests WHERE user_id=$1`, [req.apiUser.id])).rows[0];
@@ -198,10 +199,19 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       if(!claim)throw httpError(403,'plugin_token_denied');
       pluginId=claim.plugin_id;
     }
+    const skillCalls=await resolveSkillCalls(db,req.headers['x-ipzsk-skill-calls'],body.model,pluginId);
+    pluginId=skillCalls.pluginId;
     let plugin;
     if(pluginId){
       plugin=(await db.query('SELECT id,publisher_ref,allowed_models,owner_user_id,revenue_share_bps FROM plugins WHERE id=$1 AND enabled',[pluginId])).rows[0];
       if(!plugin || !plugin.allowed_models.includes(body.model))throw httpError(403,'plugin_model_denied');
+    }
+    const skillVersion=req.headers['x-ipzsk-skill-version'];
+    if(skillVersion!==undefined){
+      const match=typeof skillVersion==='string'&&/^([a-z0-9]+(?:-[a-z0-9]+)*):([a-f0-9]{64})$/.exec(skillVersion);
+      if(!match||!pluginId||!(await db.query(`SELECT 1 FROM commission_skill_versions v JOIN plugin_skills s USING(skill_ref)
+        WHERE s.plugin_id=$1 AND v.skill_ref=$2 AND v.content_sha256=$3 AND v.enabled`,[pluginId,match[1],match[2]])).rowCount)
+        throw httpError(403,'skill_version_denied');
     }
     const protocolHeaders=agentHeaders(path,req.headers);
     if(audio)protocolHeaders['Content-Type']=audio.contentType;
@@ -210,10 +220,10 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     if (idempotency !== null && (typeof idempotency !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(idempotency))) {
       throw httpError(400,'invalid_idempotency_key');
     }
-    const fingerprint = hash(JSON.stringify(stable({path,body:studio?clientBody:body,...(plugin?{plugin_id:plugin.id}:{})})));
-    const insertRequest = (c) => c.query(`INSERT INTO requests (id,user_id,model,idempotency_key,fingerprint,stream,access_token_id,plugin_id,plugin_publisher_ref,plugin_owner_user_id,plugin_share_bps)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(user_id,idempotency_key) DO NOTHING RETURNING id`,
-    [id,req.apiUser.id,body.model,idempotency,fingerprint,body.stream,req.apiUser.token_id,plugin?.id??null,plugin?.publisher_ref??null,plugin?.owner_user_id??null,plugin?.revenue_share_bps??null]);
+    const fingerprint = hash(JSON.stringify(stable({path,body:studio?clientBody:body,...(plugin?{plugin_id:plugin.id}:{}),...(skillCalls.calls.length?{skill_calls:skillCalls.calls}:{})})));
+    const insertRequest = (c) => c.query(`INSERT INTO requests (id,user_id,model,idempotency_key,fingerprint,stream,access_token_id,plugin_id,plugin_publisher_ref,plugin_owner_user_id,plugin_share_bps,skill_calls,skill_attribution_state)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(user_id,idempotency_key) DO NOTHING RETURNING id`,
+    [id,req.apiUser.id,body.model,idempotency,fingerprint,body.stream,req.apiUser.token_id,plugin?.id??null,plugin?.publisher_ref??null,plugin?.owner_user_id??null,plugin?.revenue_share_bps??null,JSON.stringify(skillCalls.calls),skillCalls.state]);
     // 生成记录与 requests 同一事务：进行中超限（429）会连同 requests 一起回滚。
     const inserted = studio
       ? await db.tx(async (c) => { const r = await insertRequest(c); if (r.rowCount) await insertGenerationRecord(c,id,req.apiUser.id,studio.record); return r; })

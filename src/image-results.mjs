@@ -9,8 +9,25 @@ export function imageUrls(task) {
   return images.flatMap(image=>Array.isArray(image?.url)?image.url:[image?.url]).filter(url=>typeof url==='string');
 }
 export function publicImageTask(task,origin) {
-  if(!imageUrls(task).length)return task;
-  return {...task,result:{...task.result,images:imageUrls(task).map((_,i)=>({url:[`${origin}/v1/tasks/${task.id}/image/${i}`]}))}};
+  const output={id:task.id,status:task.status,progress:typeof task.progress==='number'&&Number.isFinite(task.progress)?task.progress:0,result:null};
+  if(task.error)output.error={message:'Media generation failed.'};
+  if(task.result&&typeof task.result==='object'&&!Array.isArray(task.result)){
+    output.result={};
+    for(const key of ['images','videos','thumbnails','subtitles','captioned_videos']){
+      if(!Array.isArray(task.result[key]))continue;
+      output.result[key]=task.result[key].filter(item=>item&&typeof item==='object').map(item=>{
+        const value={};
+        for(const field of ['url','b64_json','revised_prompt','mime_type','width','height','duration']){
+          if(typeof item[field]==='string'||typeof item[field]==='number'&&Number.isFinite(item[field]))value[field]=item[field];
+        }
+        if(Array.isArray(item.url))value.url=item.url.filter(url=>typeof url==='string');
+        return value;
+      });
+    }
+    const images=imageUrls(task);
+    if(images.length)output.result.images=images.map((_,i)=>({url:[`${origin}/v1/tasks/${task.id}/image/${i}`]}));
+  }
+  return output;
 }
 // Public unicast only, either family. CDNs (CloudFront behind HeyGen) resolve to IPv6 as well: rejecting every IPv6
 // address failed each such result as invalid_image_host. Loopback / private / link-local / ULA / multicast stay blocked.

@@ -4,8 +4,8 @@ import { prices, estimateTextCost } from './text-pricing.mjs';
 import { mediaPricing, resolveTier } from './model-catalog.mjs';
 import { accrueEarning } from './earnings.mjs';
 
-export const units=value=>{const [a,b='']=String(value).split('.');return BigInt(a)*100000000n+BigInt(b.padEnd(8,'0').slice(0,8));};
-export const decimal=value=>`${value/100000000n}.${String(value%100000000n).padStart(8,'0')}`;
+export const units=value=>{const raw=String(value),negative=raw.startsWith('-');const [a,b='']=(negative?raw.slice(1):raw).split('.');return (negative?-1n:1n)*(BigInt(a)*100000000n+BigInt(b.padEnd(8,'0').slice(0,8)));};
+export const decimal=value=>{const negative=value<0n,absolute=negative?-value:value;return `${negative?'-':''}${absolute/100000000n}.${String(absolute%100000000n).padStart(8,'0')}`;};
 const multiply=(amount,multiplier)=>decimal((units(amount)*units(multiplier)+50000000n)/100000000n);
 const mediaPaths=['/v1/images/generations','/v1/images/edits','/v1/videos/generations'];
 // The snapshot alone determines the charge: a later catalog, rate or multiplier change cannot reprice a held request.
@@ -43,7 +43,8 @@ export function quoteTextHold(body,policy){
 export async function wallet(c,userId){
   return (await c.query(`SELECT credit-debit AS balance_cny,held AS frozen_cny,credit-debit-held AS available_cny FROM
     (SELECT coalesce((SELECT sum(amount_cny) FROM wallet_entries WHERE user_id=$1),0) AS credit,
-    coalesce((SELECT sum(amount_cny) FROM wallet_debits WHERE user_id=$1),0) AS debit,
+    coalesce((SELECT sum(amount_cny) FROM wallet_debits WHERE user_id=$1),0)
+      +coalesce((SELECT sum(f.balance_deduction_cny) FROM commission_payment_refunds f JOIN payment_orders p ON p.id=f.payment_order_id WHERE p.user_id=$1 AND p.target='local'),0) AS debit,
     coalesce((SELECT sum(reserved_cny) FROM request_billing WHERE user_id=$1 AND state IN ('reserved','pending')),0) AS held) x`,[userId])).rows[0];
 }
 export async function reserveRequest(db,id,userId,body,path,requested=body){

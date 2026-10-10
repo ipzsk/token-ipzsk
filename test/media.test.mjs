@@ -110,7 +110,7 @@ test('CORS preflight covers public/admin/bearer prefixes and write methods; admi
         const r = await preflight(prefix, 'https://www.ipzsk.com', method);
         assert.equal(r.statusCode, 204, prefix + method);
         assert.match(r.headers['access-control-allow-methods'], new RegExp(`\\b${method}\\b`));
-        assert.equal(r.headers['access-control-allow-headers'], 'Authorization, Content-Type, Idempotency-Key');
+        assert.equal(r.headers['access-control-allow-headers'], 'Authorization, Content-Type, Idempotency-Key, X-IPZSK-Plugin-Token, X-IPZSK-Skill-Version, X-IPZSK-Skill-Calls');
         assert.equal(r.headers['access-control-allow-origin'], 'https://www.ipzsk.com');
         assert.equal((await preflight(prefix, 'https://evil.example', method)).statusCode, 403);
       }

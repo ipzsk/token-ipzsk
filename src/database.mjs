@@ -28,7 +28,10 @@ export function database(config) {
       catch (e) { await c.query('ROLLBACK'); throw e; }
       finally { c.release(); }
     },
-    async migrate() { await pool.query(await readFile(new URL('./schema.sql', import.meta.url), 'utf8')); },
+    async migrate() {
+      const statements = await Promise.all(['schema.sql','commissions.sql'].map(file => readFile(new URL(file,import.meta.url),'utf8')));
+      await this.tx(async c => { for (const sql of statements) await c.query(sql); });
+    },
     async recover() {
       await pool.query(`UPDATE requests SET status='uncertain',usage_state='unknown',
         error_code='process_restarted',completed_at=now() WHERE status IN ('queued','running')`);

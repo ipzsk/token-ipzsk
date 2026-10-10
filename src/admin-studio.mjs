@@ -12,7 +12,7 @@ import { requireRole, grantRole, revokeRole, loadRoles, ROLES } from './roles.mj
 import { refreshMediaTask } from './media-task-sync.mjs';
 import { recordLanehubCharge, syncChargedPoints, lanehubBalance } from './lanehub-charges.mjs';
 import { creditAccount, lanehubMode, provisionIfEnabled } from './lanehub.mjs';
-import { wallet, points } from './billing.mjs';
+import { wallet, points, units, decimal } from './billing.mjs';
 
 const STATUSES = ['draft', 'published', 'hidden'];
 const GEN_STATUSES = ['queued', 'running', 'succeeded', 'failed', 'cancelled'];
@@ -707,8 +707,7 @@ export function adminStudioRoutes(app, options) {
     }
     await db.tx(async (c) => {
       await c.query('SELECT id FROM users WHERE id=$1 FOR UPDATE', [u.id]);
-      const balance = (await c.query(`SELECT coalesce(sum(amount_cny),0)+$2::numeric-coalesce((SELECT sum(amount_cny) FROM wallet_debits WHERE user_id=$1),0) AS amount
-        FROM wallet_entries WHERE user_id=$1`, [u.id, value])).rows[0].amount;
+      const balance = decimal(units((await wallet(c,u.id)).balance_cny)+units(value));
       const added = await c.query(`INSERT INTO wallet_entries(id,user_id,amount_cny,balance_after_cny,source,note,granted_by)
         VALUES($1,$2,$3,$4,'admin_grant',$5,$6) ON CONFLICT (id) DO NOTHING`, [grantId, u.id, value, balance, reason, actor]);
       if (added.rowCount) await audit(c, req, 'wallet.grant', u.id, { grant_id: grantId, amount_cny: value, reason });

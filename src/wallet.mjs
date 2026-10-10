@@ -26,15 +26,20 @@ export function walletRoutes(app, options) {
       // lanehub 模式下这一侧不写 wallet_debits（钱是对面扣的），消费来自 request_billing。
       // 不并进去的话，「余额变动」只看得见充值、看不见消费，用户会以为钱凭空少了。
       ? (await db.query(`SELECT id,amount_cny,balance_after_cny,created_at,
-          CASE WHEN source IN ('signup_bonus','admin_grant') THEN source ELSE 'recharge' END AS kind
+          CASE WHEN source IN ('signup_bonus','admin_grant','earnings_conversion','service_refund') THEN source ELSE 'recharge' END AS kind
           FROM wallet_entries WHERE user_id=$1
-          UNION ALL SELECT b.request_id,-b.charged_cny,NULL::numeric,coalesce(b.resolved_at,b.created_at),'consumption'
+          UNION ALL SELECT b.request_id,-(b.charged_cny-b.refunded_cny),NULL::numeric,coalesce(b.resolved_at,b.created_at),'consumption'
           FROM request_billing b WHERE b.user_id=$1 AND b.state='settled' AND b.charged_cny>0
+          UNION ALL SELECT p.id,-f.balance_deduction_cny,NULL::numeric,f.created_at,'payment_refund'
+          FROM commission_payment_refunds f JOIN payment_orders p ON p.id=f.payment_order_id WHERE p.user_id=$1 AND f.balance_deduction_cny>0
           ORDER BY created_at DESC,id LIMIT 30`, [req.apiUser.id])).rows
       : (await db.query(`SELECT id,amount_cny,balance_after_cny,created_at,
-          CASE WHEN source IN ('signup_bonus','admin_grant') THEN source ELSE 'recharge' END AS kind
+          CASE WHEN source IN ('signup_bonus','admin_grant','earnings_conversion','service_refund') THEN source ELSE 'recharge' END AS kind
           FROM wallet_entries WHERE user_id=$1 UNION ALL SELECT id,-amount_cny,balance_after_cny,created_at,'consumption' AS kind
-          FROM wallet_debits WHERE user_id=$1 ORDER BY created_at DESC,id LIMIT 30`, [req.apiUser.id])).rows;
+          FROM wallet_debits WHERE user_id=$1
+          UNION ALL SELECT p.id,-f.balance_deduction_cny,NULL::numeric,f.created_at,'payment_refund'
+          FROM commission_payment_refunds f JOIN payment_orders p ON p.id=f.payment_order_id WHERE p.user_id=$1 AND p.target='local' AND f.balance_deduction_cny>0
+          ORDER BY created_at DESC,id LIMIT 30`, [req.apiUser.id])).rows;
     return { user: { id: req.apiUser.id, name: req.apiUser.name }, ...balances,
       balance_points: points(balances.balance_cny), frozen_points: points(balances.frozen_cny), available_points: points(balances.available_cny),
       currency: 'CNY', source: account ? 'lanehub' : 'local',

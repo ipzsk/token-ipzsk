@@ -178,7 +178,8 @@ export function adminRoutes(app, { db, upstream, scheduler, origin, secureCookie
       count(*) FILTER(WHERE auth_user_id IS NULL) AS manual_users FROM users`)).rows[0];
   });
   app.get('/admin/api/users', async () => ({ rows: (await db.query(`SELECT u.*,
-    (SELECT coalesce(sum(amount_cny),0) FROM wallet_entries w WHERE w.user_id=u.id)-(SELECT coalesce(sum(amount_cny),0) FROM wallet_debits w WHERE w.user_id=u.id) AS wallet_balance_cny,
+    (SELECT coalesce(sum(amount_cny),0) FROM wallet_entries w WHERE w.user_id=u.id)-(SELECT coalesce(sum(amount_cny),0) FROM wallet_debits w WHERE w.user_id=u.id)
+      -(SELECT coalesce(sum(f.balance_deduction_cny),0) FROM commission_payment_refunds f JOIN payment_orders p ON p.id=f.payment_order_id WHERE p.user_id=u.id AND p.target='local') AS wallet_balance_cny,
     (SELECT count(*) FROM access_tokens t WHERE t.user_id=u.id AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>now())) AS access_key_count,
     (SELECT prefix FROM access_tokens t WHERE t.user_id=u.id AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1) AS token_prefix,
     (SELECT coalesce(sum(total_tokens),0) FROM requests r WHERE r.user_id=u.id) AS total_tokens,

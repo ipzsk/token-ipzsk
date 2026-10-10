@@ -24,6 +24,7 @@ import { caseRoutes } from './cases.mjs';
 import { adminStudioRoutes } from './admin-studio.mjs';
 import { adminOpsRoutes } from './admin-ops.mjs';
 import { paymentRoutes } from './payments.mjs';
+import { commissionRoutes } from './commissions.mjs';
 
 export async function createApp(options) {
   const app = Fastify({ logger: options.logger ?? false, logController:new LogController({ disableRequestLogging:true }),
@@ -45,7 +46,7 @@ export async function createApp(options) {
         .header('Access-Control-Allow-Credentials', 'true');
       if (req.method === 'OPTIONS') return reply.code(204)
         .header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS')
-        .header('Access-Control-Allow-Headers', 'Authorization, Content-Type, Idempotency-Key').send();
+        .header('Access-Control-Allow-Headers', 'Authorization, Content-Type, Idempotency-Key, X-IPZSK-Plugin-Token, X-IPZSK-Skill-Version, X-IPZSK-Skill-Calls').send();
     } else if (req.method === 'OPTIONS') return reply.code(403).send();
   });
   app.options('/api/*', async (_req, reply) => reply.code(403).send());
@@ -82,7 +83,7 @@ export async function createApp(options) {
   app.get('/', async (_req, reply) => reply.redirect('/admin'));
   for (const [path, file, type] of [['/admin','index.html','text/html'],['/admin/','index.html','text/html'],
     ['/admin/pricing.html','pricing.html','text/html'],
-    ['/admin/plugins.js','plugins.js','text/javascript'],['/admin/accounts.js','accounts.js','text/javascript'],['/admin/style.css','style.css','text/css'],['/admin/app.js','app.js','text/javascript'],['/admin/wallet.js','wallet.js','text/javascript']]) {
+    ['/admin/commissions.js','commissions.js','text/javascript'],['/admin/plugins.js','plugins.js','text/javascript'],['/admin/accounts.js','accounts.js','text/javascript'],['/admin/style.css','style.css','text/css'],['/admin/app.js','app.js','text/javascript'],['/admin/wallet.js','wallet.js','text/javascript']]) {
     const content = await readFile(new URL(`../public/${file}`,import.meta.url));
     app.get(path, async (_req, reply) => reply.type(type + '; charset=utf-8').send(content));
   }
@@ -98,6 +99,7 @@ export async function createApp(options) {
   desktopRoutes(app,options);
   billingRoutes(app,options);
   earningsRoutes(app,options);
+  commissionRoutes(app,options);
   adminAccountRoutes(app,options);
   pluginRoutes(app,options);
   developerRoutes(app,options);

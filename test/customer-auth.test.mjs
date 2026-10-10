@@ -201,5 +201,23 @@ test('password login, verified registration and recovery',async t=>{
       assert.equal((await send('/api/me/profile',undefined,bobCookie)).statusCode,403);
       const c=await register('logout@example.com');assert.equal((await auth('/sign-out',{},c)).statusCode,200);assert.equal((await send('/api/me/profile',undefined,c)).statusCode,401);
     });
+    await t.test('last valid invitation link binds only at first registration, with verified auth',async()=>{
+      const inviter=await db.query('INSERT INTO users(id,name) VALUES($1,$2) RETURNING id',[randomUUID(),'Referrer fixture']);
+      const referrer=inviter.rows[0].id;
+      await db.query('INSERT INTO referral_profiles(user_id) VALUES($1)',[referrer]);
+      const code=(await db.query('SELECT code FROM referral_profiles WHERE user_id=$1',[referrer])).rows[0].code;
+      const landing=await send('/api/account/referral/'+code);
+      const invitationCookie=cookies(landing);
+      const email='invited-fixture@example.com';
+      const signupResult=await auth('/sign-up/email',{email,name:'Invited fixture',password},invitationCookie);
+      assert.equal(signupResult.statusCode,200,signupResult.body);
+      const authId=signupResult.json().user.id;
+      assert.equal((await db.query('SELECT referrer_id FROM referral_registrations WHERE auth_user_id=$1',[authId])).rows[0].referrer_id,referrer);
+      assert.equal((await verify(email)).statusCode,200);
+      const user=(await db.query('SELECT id FROM users WHERE auth_user_id=$1',[authId])).rows[0];
+      assert.equal((await db.query('SELECT referrer_id FROM referrals WHERE user_id=$1',[user.id])).rows[0].referrer_id,referrer);
+      await auth('/sign-in/email',{email,password},invitationCookie);
+      assert.equal((await db.query('SELECT count(*) FROM referrals WHERE user_id=$1',[user.id])).rows[0].count,'1');
+    });
   }finally{await app?.close();await db.close();await setup.query(`DROP SCHEMA ${schema} CASCADE`);await setup.close();}
 });
