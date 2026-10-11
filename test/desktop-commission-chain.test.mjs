@@ -146,11 +146,15 @@ test('desktop Skill call → gateway receipt → BD and developer balances', { t
     assert.equal(JSON.parse((await headers({}))['X-IPZSK-Skill-Calls']).length,2,'Client reports all calls without choosing a payee');
     ctx.emit('agent/disposed', { agent });
     assert.deepEqual(await headers({}), {});
-    const lanehub = { async call() { return { data: [{ type: 2, quota: 100 }] }; }, async usdRate() { return 1; } };
+    // The image fixture already supplied APIMart actual cost; text receipts now arrive via LaneHub.
+    await db.query("UPDATE upstream_accounts SET provider_type='lanehub' WHERE id=$1", [account]);
+    await db.query('INSERT INTO lanehub_accounts(user_id,lanehub_user_id,key_id) VALUES($1,40000,$2)', [ids.buyer,key]);
+    let receiptId=1;
+    const lanehub = { async call(path) { return { data: [{ id:receiptId++, type:2, user_id:40000, quota:100,
+      cost_quota:40, cost_source:'real', request_id:new URL(path,'http://fixture.invalid').searchParams.get('request_id') }] }; }, async usdRate() { return 1; } };
     for (const row of requests) {
       await recordLanehubCharge(db, lanehub, row, { usdCnyRate: 1, quotaPerUnit: 1 });
-      if(row.cost_cny===null)assert.equal((await db.query('SELECT state FROM commission_requests WHERE request_id=$1', [row.id])).rows[0].state, 'pending_cost');
-      await db.query('UPDATE requests SET cost_cny=40 WHERE id=$1', [row.id]);
+      assert.equal(units((await db.query('SELECT cost_cny FROM requests WHERE id=$1',[row.id])).rows[0].cost_cny),units('40'));
       await recordLanehubCharge(db, lanehub, row, { usdCnyRate: 1, quotaPerUnit: 1 });
     }
     const snapshots = (await db.query('SELECT bd_cny,developer_cny FROM commission_requests ORDER BY created_at,request_id')).rows;

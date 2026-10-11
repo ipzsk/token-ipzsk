@@ -7,6 +7,7 @@ import { accrueEarning, recordSkillInvocations } from '../src/earnings.mjs';
 import { bindReferral, reconcileInvitation, commissionBalance, reconcileCommissions, deliverConversions } from '../src/commissions.mjs';
 import { units, decimal, wallet } from '../src/billing.mjs';
 import { hash, httpError } from '../src/security.mjs';
+import { recordLanehubCharge, reconcileLanehubCharges } from '../src/lanehub-charges.mjs';
 
 test('signed financial amounts round-trip without changing fractional sign', () => {
   for (const value of ['-0.00000001', '-5.50000000', '0.00000000', '19.20000000']) assert.equal(decimal(units(value)), value);
@@ -208,6 +209,115 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       assert.equal((await snapshot(rid)).developer_cny, '24.00000000');
       assert.equal((await adminPost('opening-balance/' + buyer, body)).statusCode, 409);
     });
+    await t.test('unconfirmed historical consumption is isolated from a new checkpoint, including disabled-policy usage', async () => {
+      const buyer = await user(), payment = await credit(buyer, '100');
+      await db.query('UPDATE commission_accounts SET sources_confirmed=false WHERE user_id=$1', [buyer]);
+      const old = await request(buyer, '20', '8');
+      assert.equal((await snapshot(old)).state, 'pending_sources');
+      await db.query('UPDATE commission_policy SET enabled=false');
+      const disabled = await request(buyer, '10', '4');
+      await db.query(`INSERT INTO wallet_debits(id,user_id,request_id,amount_cny,balance_after_cny) VALUES($4,$1,$2,20,80),($5,$1,$3,10,70)`, [buyer,old,disabled,randomUUID(),randomUUID()]);
+      const enable = await adminPost('policy', { enabled: true, reason: 'must confirm historical sources' });
+      assert.equal(enable.statusCode, 409, enable.body);
+      assert.equal(enable.json().error.code, 'commission_sources_migration_required');
+      const body = { reference: 'verified remaining historical balance', paid_lots: [{ payment_order_id: payment, amount_cny: '70' }] };
+      const invalid = await adminPost('opening-balance/' + buyer, { ...body, paid_lots: [{ payment_order_id: payment, amount_cny: '100' }] });
+      assert.equal(invalid.statusCode, 409);
+      assert.equal((await snapshot(old)).state, 'pending_sources', 'failed migration rolls back');
+      const migrated = await adminPost('opening-balance/' + buyer, body);
+      assert.equal(migrated.statusCode, 200, migrated.body);
+      assert.equal(migrated.json().historical_review_count, 2);
+      for (const rid of [old,disabled]) {
+        assert.equal((await snapshot(rid)).state, 'historical_sources_review');
+        await db.query('UPDATE requests SET cost_cny=0 WHERE id=$1', [rid]);
+        await db.query('SELECT commission_reconcile($1)', [rid]);
+        assert.equal((await snapshot(rid)).state, 'historical_sources_review');
+      }
+      await reconcileCommissions(db);
+      assert.equal((await db.query('SELECT sum(remaining_cny)::numeric(20,8) AS amount FROM commission_funds WHERE user_id=$1', [buyer])).rows[0].amount, '70.00000000');
+      assert.equal((await adminPost('policy', { enabled: true, reason: 'all sources now confirmed' })).statusCode, 200);
+      const fresh = await request(buyer, '70', '28');
+      assert.equal((await snapshot(fresh)).developer_cny, '16.80000000');
+      assert.equal((await db.query('SELECT count(*) FROM commission_allocations WHERE request_id=ANY($1::uuid[])', [[old,disabled]])).rows[0].count, '0');
+      await db.query('UPDATE commission_policy SET enabled=false');
+      assert.equal((await adminPost('opening-balance/' + buyer, body)).statusCode, 409, 'cannot erase real allocations');
+      const missing = await user();
+      await db.query(`INSERT INTO requests(id,user_id,model,fingerprint,status,stream) VALUES($1,$2,'test','no bill','queued',false)`, [randomUUID(), missing]);
+      assert.equal((await adminPost('opening-balance/' + missing, { reference: 'inflight request must remain blocked', paid_lots: [] })).statusCode, 409);
+      await db.query("UPDATE requests SET status='succeeded' WHERE user_id=$1",[missing]);
+      assert.equal((await adminPost('opening-balance/' + missing, { reference: 'no bill must remain blocked', paid_lots: [] })).statusCode, 409);
+      await db.query('UPDATE commission_policy SET enabled=true');
+    });
+    await t.test('LaneHub receipts backfill delayed real cost exactly once, preserve FX and reject unsafe attribution', async () => {
+      const account = randomUUID(), key = randomUUID();
+      await db.query("INSERT INTO upstream_accounts(id,name,provider_type) VALUES($1,'Cost fixture','lanehub')", [account]);
+      await db.query("INSERT INTO upstream_keys(id,account_id,name,fingerprint,suffix,secret_ref) VALUES($1,$2,'Cost','cost-fixture','fixture','cost-fixture')", [key, account]);
+      let upstreamUser = 20000;
+      async function laneRequest() {
+        const buyer = await user(), rid = randomUUID(); await credit(buyer, '100');
+        const laneUser = ++upstreamUser;
+        await db.query('INSERT INTO lanehub_accounts(user_id,lanehub_user_id,key_id) VALUES($1,$2,$3)', [buyer,laneUser,key]);
+        await db.query('INSERT INTO referrals(user_id,referrer_id) VALUES($1,$2)', [buyer,bd]);
+        return (await db.query(`INSERT INTO requests(id,user_id,key_id,model,fingerprint,status,stream,upstream_id,completed_at,plugin_id,plugin_owner_user_id)
+          VALUES($1,$2,$3,'test','receipt','succeeded',false,$4,now()-interval '1 hour',$5,$6) RETURNING *`, [rid,buyer,key,'receipt-'+rid,plugin,developer])).rows[0];
+      }
+      const row = await laneRequest(), laneUser = upstreamUser;
+      const log = { id: 101, type: 2, quota: 100, cost_quota: 40, cost_source: 'estimated', request_id: row.upstream_id, user_id: laneUser };
+      let current = [log], fx = 1;
+      const lanehub = { call: async () => ({ data: current, total_count: current.length }), usdRate: async () => fx };
+      const options = { usdCnyRate: 1, quotaPerUnit: 1 };
+      await recordLanehubCharge(db,lanehub,row,options);
+      assert.equal((await snapshot(row.id)).state, 'pending_cost');
+      current = [{ ...log, cost_source: 'real' }]; fx = 7;
+      const result = await reconcileLanehubCharges(db,lanehub,options);
+      assert.equal(result.failed, 0);
+      assert.equal((await db.query('SELECT cost_cny FROM requests WHERE id=$1', [row.id])).rows[0].cost_cny, '40.00000000', 'delayed receipt retains original FX');
+      assert.equal((await snapshot(row.id)).bd_cny, '12.00000000');
+      assert.equal((await snapshot(row.id)).developer_cny, '19.20000000');
+      await Promise.all(Array.from({ length: 8 }, () => recordLanehubCharge(db,lanehub,row,options)));
+      assert.equal((await db.query('SELECT count(*) FROM commission_ledger WHERE request_id=$1', [row.id])).rows[0].count, '2');
+      assert.equal((await db.query("SELECT count(*) FROM audit_events WHERE target_id=$1 AND action='request.cost.sync'", [row.id])).rows[0].count, '1');
+      for (const bad of [ { cost_source: 'estimated' }, { cost_quota: -1 }, { cost_quota: null }, { cost_quota: 0.1 }, { cost_quota: Number.MAX_SAFE_INTEGER+1 }, { user_id: -1 }, { request_id: 'wrong' } ]) {
+        const candidate = await laneRequest(); fx = 1;
+        current = [{ ...log, cost_source: 'real', request_id: candidate.upstream_id, user_id: upstreamUser, ...bad }];
+        try { await recordLanehubCharge(db,lanehub,candidate,options); } catch (error) { assert.match(error.message, /receipt/); }
+        assert.equal((await db.query('SELECT cost_cny FROM requests WHERE id=$1', [candidate.id])).rows[0].cost_cny, null);
+        assert.equal((await snapshot(candidate.id)).developer_cny, '0.00000000');
+      }
+      const mixed = await laneRequest();
+      current = [{ ...log, id: 201, quota: 50, cost_source: 'real', request_id: mixed.upstream_id, user_id: upstreamUser },
+        { ...log, id: 202, quota: 50, request_id: mixed.upstream_id, user_id: upstreamUser }];
+      await recordLanehubCharge(db,lanehub,mixed,options);
+      assert.equal((await snapshot(mixed.id)).state, 'pending_cost', 'partial actual cost cannot stand for the whole request');
+      current = current.map(item => ({ ...item, quota: 60, cost_source: 'real' }));
+      await recordLanehubCharge(db,lanehub,mixed,options);
+      assert.equal((await snapshot(mixed.id)).state, 'pending_cost', 'changed sales receipt must be reviewed');
+      assert.equal((await db.query('SELECT reason,charged_cny FROM request_billing WHERE request_id=$1', [mixed.id])).rows[0].reason, 'lanehub_receipt_changed');
+      const zero = await laneRequest();
+      current = [{ ...log, request_id: zero.upstream_id, user_id: upstreamUser, cost_source: 'real', cost_quota: 0 }];
+      await recordLanehubCharge(db,lanehub,zero,options);
+      assert.equal((await snapshot(zero.id)).bd_cny, '20.00000000');
+      assert.equal((await snapshot(zero.id)).developer_cny, '32.00000000');
+      const stale = await laneRequest();
+      current = [];
+      assert.equal(await recordLanehubCharge(db,lanehub,stale,options), 'pending');
+      await db.query(`INSERT INTO request_billing(request_id,user_id,state,reserved_cny,charged_cny,price_snapshot,reason)
+        VALUES($1,$2,'released',0,0,'{}','lanehub_no_charge')`, [stale.id,stale.user_id]);
+      await db.query(`INSERT INTO generation_records(user_id,request_id,kind,model,prompt,status,charged_points)
+        VALUES($1,$2,'image','test','fixture','succeeded',0)`,[stale.user_id,stale.id]);
+      current = [{ ...log, request_id: stale.upstream_id, user_id: upstreamUser, cost_source: 'real' }];
+      await recordLanehubCharge(db,lanehub,stale,options);
+      assert.equal((await snapshot(stale.id)).bd_cny, '12.00000000', 'recover historical timeout releases without double allocation');
+      assert.equal((await snapshot(stale.id)).developer_cny, '19.20000000');
+      assert.equal((await db.query('SELECT charged_points FROM generation_records WHERE request_id=$1',[stale.id])).rows[0].charged_points,'10000.00000000','late charge replaces the historical zero shown in Studio');
+      const scanned=[];
+      const waiting={call:async path=>{scanned.push(new URL(path,'http://fixture.invalid').searchParams.get('request_id'));return {data:[]};},usdRate:async()=>1};
+      for(let i=0;i<3;i++) {
+        const batch=await reconcileLanehubCharges(db,waiting,options,{batchSize:100,maxRows:1});
+        assert.equal(batch.scanned,1,'configured scan budget is a hard limit');
+      }
+      assert.equal(new Set(scanned).size,3,'unknown receipts rotate instead of starving the backlog');
+    });
     await t.test('parallel LaneHub billing imports allocate each principal unit once without a foreign-key lock deadlock', async () => {
       const buyer = await user(); await credit(buyer, '100');
       const ids = Array.from({ length: 10 }, () => randomUUID());
@@ -365,6 +475,122 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
         assert.equal((await db.query('SELECT sum(remaining_cny)::numeric(20,8) AS amount FROM commission_funds WHERE user_id=$1', [buyer])).rows[0].amount, refunded);
       }
       assert.equal((await snapshot(rid)).developer_cny, '0.00000000');
+    });
+    await t.test('100 parallel settlements, 50 refunds and loss corrections conserve funds and recipient earnings', async () => {
+      const buyer=await user(); await credit(buyer,'100');
+      await db.query('INSERT INTO referrals(user_id,referrer_id) VALUES($1,$2)',[buyer,bd]);
+      const ids=Array.from({length:100},()=>randomUUID());
+      await Promise.all(ids.map(id=>db.query(`INSERT INTO requests(id,user_id,model,fingerprint,status,stream,plugin_id,plugin_owner_user_id,cost_cny)
+        VALUES($1,$2,'test','100-parallel','succeeded',false,$3,$4,0.4)`,[id,buyer,plugin,developer])));
+      await Promise.all(ids.map(id=>db.query(`INSERT INTO request_billing(request_id,user_id,state,reserved_cny,charged_cny,price_snapshot)
+        VALUES($1,$2,'settled',1,1,'{}')`,[id,buyer])));
+      const total=async()=> (await db.query('SELECT sum(bd_cny)::numeric(20,8) AS bd,sum(developer_cny)::numeric(20,8) AS dev FROM commission_requests WHERE request_id=ANY($1::uuid[])',[ids])).rows[0];
+      assert.deepEqual(await total(),{bd:'12.00000000',dev:'19.20000000'});
+      await Promise.all(ids.slice(0,50).map(id=>db.query('UPDATE request_billing SET refunded_cny=1 WHERE request_id=$1',[id])));
+      assert.deepEqual(await total(),{bd:'6.00000000',dev:'9.60000000'});
+      await Promise.all(ids.slice(50).map(id=>db.query('UPDATE requests SET cost_cny=2 WHERE id=$1',[id])));
+      assert.deepEqual(await total(),{bd:'0.00000000',dev:'0.00000000'});
+      assert.equal((await db.query('SELECT sum(remaining_cny)::numeric(20,8) AS amount FROM commission_funds WHERE user_id=$1',[buyer])).rows[0].amount,'50.00000000');
+      await Promise.all(ids.map(id=>db.query('SELECT commission_reconcile($1)',[id])));
+      assert.deepEqual(await total(),{bd:'0.00000000',dev:'0.00000000'});
+    });
+    await t.test('deterministic mixed-source refund simulations match an independent integer oracle', async () => {
+      let seed=20261011;
+      for(let trial=0;trial<16;trial++) {
+        seed=(seed*1664525+1013904223)>>>0;
+        const cost=seed%121, buyer=await user();
+        await credit(buyer,'100'); await request(buyer,'20','0',null); await credit(buyer,'20',false);
+        await db.query('INSERT INTO referrals(user_id,referrer_id) VALUES($1,$2)',[buyer,bd]);
+        const rid=await request(buyer,'100',String(cost));
+        for(const refund of [0,1,17,49,83,99,100]) {
+          await db.query('UPDATE request_billing SET refunded_cny=$2 WHERE request_id=$1',[rid,refund]);
+          const profit=BigInt(Math.max(100-refund-cost,0))*80000000n;
+          const expectedBd=profit/5n, expectedDev=(profit-expectedBd)*2n/5n;
+          const actual=await snapshot(rid);
+          assert.equal(actual.bd_cny,decimal(expectedBd),`trial ${trial}, refund ${refund}`);
+          assert.equal(actual.developer_cny,decimal(expectedDev),`trial ${trial}, refund ${refund}`);
+          const remaining=(await db.query('SELECT sum(remaining_cny)::numeric(20,8) AS amount FROM commission_funds WHERE user_id=$1',[buyer])).rows[0].amount;
+          assert.equal(remaining,decimal(units(String(refund))));
+        }
+      }
+    });
+    await t.test('pending remote conversion respects later freeze, debt and concurrent workers', async () => {
+      const recipient = await user(), account = randomUUID(), key = randomUUID(), conversion = randomUUID();
+      await db.query("INSERT INTO upstream_accounts(id,name) VALUES($1,'Freeze fixture')", [account]);
+      await db.query("INSERT INTO upstream_keys(id,account_id,name,fingerprint,suffix,secret_ref) VALUES($1,$2,'Freeze','freeze-fixture','fixture','freeze-fixture')", [key,account]);
+      await db.query('INSERT INTO lanehub_accounts(user_id,lanehub_user_id,key_id) VALUES($1,30000,$2)', [recipient,key]);
+      await db.query('INSERT INTO referral_profiles(user_id,frozen) VALUES($1,true)', [recipient]);
+      await db.query(`INSERT INTO commission_ledger(user_id,kind,amount_cny,available_at,reference) VALUES
+        ($1,'bd',100,now()-interval '40 days',$2),($1,'conversion',-10,now(),$3)`, [recipient,'seed:'+conversion,'convert:'+conversion]);
+      await db.query('INSERT INTO commission_conversions(id,user_id,amount_cny) VALUES($1,$2,10)', [conversion,recipient]);
+      await db.query("INSERT INTO app_settings(key,value) VALUES('lanehub_mode','on') ON CONFLICT(key) DO UPDATE SET value='on'");
+      let calls = 0, unblock, started;
+      const gate = new Promise(resolve => { unblock = resolve; }), begun = new Promise(resolve => { started = resolve; });
+      const options = { lanehub: { usdRate: async () => 7, addQuota: async () => { calls++; started(); await gate; } }, lanehubQuotaPerUnit: 500000 };
+      await deliverConversions(db,options);
+      assert.equal(calls,0); assert.equal((await db.query('SELECT state FROM commission_conversions WHERE id=$1',[conversion])).rows[0].state,'pending');
+      assert.equal((await adminPost('profiles/'+recipient,{bd_active:false,frozen:false,reason:'verified release from review'})).statusCode,200);
+      await db.query("INSERT INTO commission_ledger(user_id,kind,amount_cny,available_at,reference) VALUES($1,'bd',-100,now(),$2)",[recipient,'debt:'+conversion]);
+      await deliverConversions(db,options); assert.equal(calls,0);
+      await db.query("INSERT INTO commission_ledger(user_id,kind,amount_cny,available_at,reference) VALUES($1,'bd',100,now(),$2)",[recipient,'restore:'+conversion]);
+      let ready, releaseRate;
+      const rateReady=new Promise(resolve=>{ready=resolve;}), rateGate=new Promise(resolve=>{releaseRate=resolve;});
+      options.lanehub.usdRate=async()=>{ready();await rateGate;return 7;};
+      const racing=deliverConversions(db,options);
+      await rateReady;
+      try {
+        assert.equal((await adminPost('profiles/'+recipient,{bd_active:false,frozen:true,reason:'freeze while worker prepares credit'})).statusCode,200);
+      } finally {releaseRate();await racing;}
+      assert.equal(calls,0,'freeze committed before claim prevents the external credit');
+      assert.equal((await adminPost('profiles/'+recipient,{bd_active:false,frozen:false,reason:'verified unfreeze after race'})).statusCode,200);
+      options.lanehub.usdRate=async()=>7;
+      const worker = deliverConversions(db,options);
+      await begun;
+      try {
+        await deliverConversions(db,options);
+        assert.equal(calls,1,'only the worker that claims pending may call upstream');
+      } finally { unblock(); await worker; }
+      assert.equal((await db.query('SELECT state FROM commission_conversions WHERE id=$1',[conversion])).rows[0].state,'applied');
+      assert.equal((await db.query('SELECT count(*) FROM wallet_entries WHERE id=$1',[conversion])).rows[0].count,'1');
+      assert.equal((await db.query('SELECT paid FROM commission_funds WHERE id=$1',['wallet:'+conversion])).rows[0].paid,false);
+      await db.query("UPDATE app_settings SET value='off' WHERE key='lanehub_mode'");
+    });
+    await t.test('extreme conversion amount rounds upward exactly without floating-point loss', async () => {
+      const recipient=await user(),account=randomUUID(),key=randomUUID(),conversion=randomUUID(),value='99999999.99999801';
+      await db.query("INSERT INTO upstream_accounts(id,name) VALUES($1,'Extreme fixture')",[account]);
+      await db.query("INSERT INTO upstream_keys(id,account_id,name,fingerprint,suffix,secret_ref) VALUES($1,$2,'Extreme','extreme-fixture','fixture','extreme-fixture')",[key,account]);
+      await db.query('INSERT INTO lanehub_accounts(user_id,lanehub_user_id,key_id) VALUES($1,30001,$2)',[recipient,key]);
+      await db.query("INSERT INTO commission_ledger(user_id,kind,amount_cny,available_at,reference) VALUES($1,'bd',$2,now()-interval '40 days',$3),($1,'conversion',-$2::numeric,now(),$4)",[recipient,value,'seed:'+conversion,'convert:'+conversion]);
+      await db.query('INSERT INTO commission_conversions(id,user_id,amount_cny) VALUES($1,$2,$3)',[conversion,recipient,value]);
+      await db.query("UPDATE app_settings SET value='on' WHERE key='lanehub_mode'");
+      const credits=[];
+      const options={lanehub:{usdRate:async()=>7,addQuota:async(id,quota)=>{credits.push({id,quota});}},lanehubQuotaPerUnit:500000};
+      await deliverConversions(db,options);
+      assert.deepEqual(credits,[{id:30001,quota:7142857142858}]);
+      assert.equal((await wallet(db,recipient)).balance_cny,value);
+      assert.equal((await commissionBalance(db,recipient)).available_cny,'0.00000000');
+      await db.query("UPDATE app_settings SET value='off' WHERE key='lanehub_mode'");
+    });
+    await t.test('a queue of frozen conversions does not starve another recipient', async () => {
+      const account = randomUUID(), key = randomUUID();
+      await db.query("INSERT INTO upstream_accounts(id,name) VALUES($1,'Queue fixture')",[account]);
+      await db.query("INSERT INTO upstream_keys(id,account_id,name,fingerprint,suffix,secret_ref) VALUES($1,$2,'Queue','queue-fixture','fixture','queue-fixture')",[key,account]);
+      let active;
+      for(let i=0;i<21;i++) {
+        const recipient = await user(), conversion = randomUUID();
+        if(i===20) active=conversion;
+        await db.query('INSERT INTO lanehub_accounts(user_id,lanehub_user_id,key_id) VALUES($1,$2,$3)',[recipient,31000+i,key]);
+        await db.query('INSERT INTO referral_profiles(user_id,frozen) VALUES($1,$2)',[recipient,i<20]);
+        await db.query("INSERT INTO commission_ledger(user_id,kind,amount_cny,available_at,reference) VALUES($1,'bd',1,now()-interval '40 days',$2),($1,'conversion',-1,now(),$3)",[recipient,'seed:'+conversion,'convert:'+conversion]);
+        await db.query("INSERT INTO commission_conversions(id,user_id,amount_cny,updated_at) VALUES($1,$2,1,now()-interval '1 day'+$3*interval '1 second')",[conversion,recipient,i]);
+      }
+      await db.query("UPDATE app_settings SET value='on' WHERE key='lanehub_mode'");
+      let calls=0;
+      const options={lanehub:{usdRate:async()=>7,addQuota:async()=>{calls++;}},lanehubQuotaPerUnit:500000};
+      await deliverConversions(db,options); await deliverConversions(db,options);
+      assert.equal(calls,1);
+      assert.equal((await db.query('SELECT state FROM commission_conversions WHERE id=$1',[active])).rows[0].state,'applied');
+      await db.query("UPDATE app_settings SET value='off' WHERE key='lanehub_mode'");
     });
     await t.test('ambiguous LaneHub conversion is held for review and never replayed', async () => {
       const account = randomUUID(), key = randomUUID(), conversion = randomUUID();

@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS commission_policy (
 INSERT INTO commission_policy(id) VALUES(1) ON CONFLICT DO NOTHING;
 ALTER TABLE requests ADD COLUMN IF NOT EXISTS skill_calls jsonb NOT NULL DEFAULT '[]';
 ALTER TABLE requests ADD COLUMN IF NOT EXISTS skill_attribution_state text NOT NULL DEFAULT 'none';
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS lanehub_reconciled_at timestamptz;
 CREATE TABLE IF NOT EXISTS commission_skill_versions (
   skill_ref text NOT NULL REFERENCES plugin_skills(skill_ref),
   content_sha256 text NOT NULL CHECK(content_sha256 ~ '^[a-f0-9]{64}$'),
@@ -66,6 +67,9 @@ CREATE TABLE IF NOT EXISTS commission_requests (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE commission_requests ADD COLUMN IF NOT EXISTS enabled boolean NOT NULL DEFAULT false;
+ALTER TABLE commission_requests DROP CONSTRAINT commission_requests_state_check;
+ALTER TABLE commission_requests ADD CONSTRAINT commission_requests_state_check
+  CHECK(state IN ('pending_billing','pending_sources','pending_cost','accrued','disputed','historical_sources_review'));
 CREATE TABLE IF NOT EXISTS commission_accounts (
   user_id uuid PRIMARY KEY REFERENCES users(id), sources_confirmed boolean NOT NULL DEFAULT false
 );
@@ -131,7 +135,7 @@ BEGIN
   SELECT * INTO r FROM requests WHERE id=rid;
   PERFORM 1 FROM users WHERE id=r.user_id FOR NO KEY UPDATE;
   SELECT * INTO s FROM commission_requests WHERE request_id=rid FOR UPDATE;
-  IF NOT FOUND OR s.state='disputed' THEN RETURN; END IF;
+  IF NOT FOUND OR s.state IN ('disputed','historical_sources_review') THEN RETURN; END IF;
   SELECT * INTO b FROM request_billing WHERE request_id=rid;
   IF NOT FOUND OR b.state NOT IN ('settled','released') THEN RETURN; END IF;
   IF NOT (SELECT sources_confirmed FROM commission_accounts WHERE user_id=r.user_id) THEN
@@ -235,3 +239,4 @@ DO $$ BEGIN
   END IF;
 END $$;
 INSERT INTO schema_version(version) VALUES(29) ON CONFLICT DO NOTHING;
+INSERT INTO schema_version(version) VALUES(30) ON CONFLICT DO NOTHING;

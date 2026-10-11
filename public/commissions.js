@@ -2,7 +2,7 @@ export function setupCommissions({api,action,el,table,cell,button,charge,time,no
   const section=el('section',undefined,'page');section.id='page-commissions';section.hidden=true;
   document.querySelector('main').append(section);
   const nav=el('button','分佣与提现');nav.dataset.page='commissions';document.querySelector('nav').append(nav);
-  const states={pending_billing:'待扣费回传',pending_sources:'待核对余额来源',pending_cost:'待实际成本',accrued:'已计提',disputed:'争议冻结',requested:'待审核',approved:'待转账',paid:'已打款',cancelled:'已取消',pending:'待转入',applying:'正在转入',review:'待人工核对'};
+  const states={pending_billing:'待扣费回传',pending_sources:'待核对余额来源',historical_sources_review:'历史来源待人工核对',pending_cost:'待实际成本',accrued:'已计提',disputed:'争议冻结',requested:'待审核',approved:'待转账',paid:'已打款',cancelled:'已取消',pending:'待转入',applying:'正在转入',review:'待人工核对'};
   function panel(title) {
     const box=el('article',undefined,'panel');box.append(el('h2',title));section.append(box);return box;
   }
@@ -41,7 +41,7 @@ export function setupCommissions({api,action,el,table,cell,button,charge,time,no
     table(conversionList,['用户 / 申请','金额','状态','操作'],data.conversions.map(p=>[cell(p.user_id,p.id),charge(p.amount_cny),states[p.state],(()=>{const actions=el('div');if(p.state==='review')for(const [result,label] of [['applied','确认上游已入账'],['not_applied','确认未入账并退回收益']])actions.append(button(label,()=>ask(label,receipt,b=>api('/commissions/conversions/'+p.id+'/resolve','POST',{...b,result}))));return actions;})()]));
     const requests=panel('逐请求计提');const requestList=el('div');requests.append(requestList);
     table(requestList,['请求','扣款 / 本金','BD','开发者','状态'],data.requests.map(p=>[p.request_id,cell(charge(p.charged_cny),charge(p.paid_cny)),charge(p.bd_cny),charge(p.developer_cny),states[p.state]]));
-    const opening=panel('历史账户余额来源');opening.append(el('p','先暂停新请求计佣并确认账户没有在途请求，再核对剩余本金。已验证充值订单之外的余额保守按不分佣余额导入。'));
+    const opening=panel('历史账户余额来源');opening.append(el('p','先暂停新请求计佣并确认账户没有在途请求或缺失账单，再核对剩余本金。全部历史账户确认来源后才能开启计佣。迁移前尚未分配来源的消费保留为历史待核对，不从当前余额重复扣除；已分配的账目禁止重置。已验证充值订单之外的余额按不分佣余额导入。'));
     const accountList=el('div');opening.append(accountList);
     table(accountList,['用户','来源状态','操作'],data.accounts.map(p=>[cell(p.name,p.user_id),p.sources_confirmed?'已确认':'待迁移',button('核对期初余额',()=>ask('核对余额来源',[['paid_lots','已核实的剩余本金 JSON：[{"payment_order_id":"订单 ID","amount_cny":"10"}]','text','[]'],...receipt],b=>api('/commissions/opening-balance/'+p.user_id,'POST',{reference:b.reference,paid_lots:JSON.parse(b.paid_lots)})))]));
     const refunds=panel('已完成的充值退款 / 拒付回执');refunds.append(el('p','仅登记支付平台已确认的退款。此处不会执行银行退款；确认金额、回执和余额已扣回后再提交。拒付会追溯消费并冲回相关分佣。'));

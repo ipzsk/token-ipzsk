@@ -70,7 +70,7 @@ export async function reconcileInvitation(c, userId) {
 export async function reconcileCommissions(db) {
   const rows = (await db.query(`SELECT s.request_id FROM commission_requests s JOIN requests r ON r.id=s.request_id
     JOIN commission_accounts a ON a.user_id=r.user_id JOIN request_billing b ON b.request_id=r.id
-    WHERE s.state NOT IN ('disputed','accrued') AND a.sources_confirmed AND b.state IN ('settled','released')
+    WHERE s.state NOT IN ('disputed','accrued','historical_sources_review') AND a.sources_confirmed AND b.state IN ('settled','released')
       AND (s.state<>'pending_cost' OR r.cost_cny IS NOT NULL OR b.charged_cny=b.refunded_cny)
       AND (s.state<>'pending_sources' OR (SELECT coalesce(sum(remaining_cny),0) FROM commission_funds WHERE user_id=r.user_id)>=b.charged_cny)
     ORDER BY s.created_at LIMIT 200`)).rows;
@@ -101,14 +101,28 @@ async function appendConversionCredit(c, conversion) {
 export async function deliverConversions(db, options) {
   if (!options.lanehub || !await lanehubMode(db)) return;
   await db.query("UPDATE commission_conversions SET state='review',updated_at=now() WHERE state='applying' AND updated_at<now()-interval '5 minutes'");
-  const pending = (await db.query("SELECT * FROM commission_conversions WHERE state='pending' ORDER BY created_at LIMIT 20")).rows;
+  const pending = (await db.query("SELECT * FROM commission_conversions WHERE state='pending' ORDER BY updated_at,id LIMIT 20")).rows;
   for (const item of pending) {
     const account = await provisionIfEnabled(db, options, { userId: item.user_id });
     if (!account) continue;
     const rate = await options.lanehub.usdRate();
-    const quota = Math.ceil(Number(item.amount_cny) / Number(rate) * Number(options.lanehubQuotaPerUnit ?? 500000));
-    if (!Number.isSafeInteger(quota) || quota <= 0) continue;
-    const claim = await db.query("UPDATE commission_conversions SET state='applying',updated_at=now() WHERE id=$1 AND state='pending' RETURNING id", [item.id]);
+    const perUnit = options.lanehubQuotaPerUnit ?? 500000;
+    if (!Number.isSafeInteger(perUnit) || perUnit <= 0 || !/^(0|[1-9]\d*)(\.\d{1,8})?$/.test(String(rate))) continue;
+    const rateUnits = units(String(rate));
+    if (rateUnits <= 0n) continue;
+    const exactQuota = (units(item.amount_cny) * BigInt(perUnit) + rateUnits - 1n) / rateUnits;
+    if (exactQuota <= 0n || exactQuota > BigInt(Number.MAX_SAFE_INTEGER)) continue;
+    const quota = Number(exactQuota);
+    const claim = await db.tx(async c => {
+      await c.query('SELECT pg_advisory_xact_lock(hashtextextended($1,1))', [item.user_id]);
+      const balance = await commissionBalance(c, item.user_id);
+      // The reservation already debited earnings; a reversal must not release an unfunded credit.
+      if (balance.frozen || units(balance.available_cny) < 0n) {
+        await c.query("UPDATE commission_conversions SET updated_at=now() WHERE id=$1 AND state='pending'", [item.id]);
+        return { rowCount: 0 };
+      }
+      return c.query("UPDATE commission_conversions SET state='applying',updated_at=now() WHERE id=$1 AND state='pending' RETURNING id", [item.id]);
+    });
     if (!claim.rowCount) continue;
     try {
       await options.lanehub.addQuota(account.lanehub_user_id, quota, '收益转余额 ' + item.id);
@@ -191,6 +205,9 @@ export function commissionRoutes(app, options) {
     if (typeof req.body?.enabled !== 'boolean') throw httpError(400, 'invalid_policy');
     const why = note(req.body.reason);
     await db.tx(async c => {
+      await c.query('SELECT id FROM commission_policy WHERE id=1 FOR UPDATE');
+      if (req.body.enabled && (await c.query('SELECT 1 FROM commission_accounts WHERE NOT sources_confirmed LIMIT 1')).rowCount)
+        throw httpError(409, 'commission_sources_migration_required');
       await c.query('UPDATE commission_policy SET enabled=$1 WHERE id=1', [req.body.enabled]);
       await audit(c, req, 'commission.policy', null, { enabled: req.body.enabled, reason: why });
     });
@@ -201,6 +218,7 @@ export function commissionRoutes(app, options) {
     const id = uuid(req.params.id), why = note(req.body?.reason);
     if (typeof req.body.bd_active !== 'boolean' || typeof req.body.frozen !== 'boolean') throw httpError(400, 'invalid_profile');
     await db.tx(async c => {
+      await c.query('SELECT pg_advisory_xact_lock(hashtextextended($1,1))', [id]);
       await profile(c, id);
       await c.query('UPDATE referral_profiles SET bd_active=$2,frozen=$3 WHERE user_id=$1', [id, req.body.bd_active, req.body.frozen]);
       await audit(c, req, 'commission.profile', id, { ...req.body, reason: why });
@@ -221,10 +239,13 @@ export function commissionRoutes(app, options) {
     if (remote && (!options.lanehub || !account)) throw httpError(409, 'lanehub_account_missing');
     return db.tx(async c => {
       await c.query('SELECT id FROM users WHERE id=$1 FOR UPDATE', [id]);
-      if ((await c.query('SELECT enabled FROM commission_policy WHERE id=1')).rows[0].enabled) throw httpError(409, 'pause_commissions_before_source_migration');
+      if ((await c.query('SELECT enabled FROM commission_policy WHERE id=1 FOR UPDATE')).rows[0].enabled) throw httpError(409, 'pause_commissions_before_source_migration');
       if ((await c.query(`SELECT 1 FROM requests WHERE user_id=$1 AND status IN ('queued','running')
         UNION ALL SELECT 1 FROM request_billing WHERE user_id=$1 AND state IN ('reserved','pending')
-        UNION ALL SELECT 1 FROM commission_requests s JOIN requests r ON r.id=s.request_id WHERE r.user_id=$1 AND s.enabled LIMIT 1`, [id])).rowCount)
+        UNION ALL SELECT 1 FROM commission_requests s JOIN requests r ON r.id=s.request_id
+          LEFT JOIN request_billing b ON b.request_id=r.id WHERE r.user_id=$1 AND
+          (b.request_id IS NULL OR s.charged_cny IS NOT NULL OR EXISTS(SELECT 1 FROM commission_allocations WHERE request_id=r.id)
+            OR EXISTS(SELECT 1 FROM commission_ledger WHERE request_id=r.id)) LIMIT 1`, [id])).rowCount)
         throw httpError(409, 'opening_balance_requires_idle_account');
       const actual = remote ? await lanehubBalance(options.lanehub, account, { usdCnyRate: options.lanehubUsdCny, quotaPerUnit: options.lanehubQuotaPerUnit ?? 500000 }) : await wallet(c, id);
       const available = units(actual.balance_cny);
@@ -236,6 +257,10 @@ export function commissionRoutes(app, options) {
           FROM payment_orders p WHERE p.id=$1 AND p.user_id=$2 AND p.mode='prod' AND p.credited_at IS NOT NULL`, [lot.id, id])).rows[0];
         if (!payment || units(payment.remaining) < units(lot.amount)) throw httpError(409, 'unverified_payment_source');
       }
+      // Current remaining balance cannot prove the funding sources of earlier consumption.
+      const held = await c.query(`UPDATE commission_requests s SET state='historical_sources_review'
+        FROM requests r WHERE r.id=s.request_id AND r.user_id=$1 AND s.charged_cny IS NULL
+        AND s.state<>'historical_sources_review' RETURNING s.request_id`, [id]);
       await c.query('UPDATE commission_funds SET remaining_cny=0 WHERE user_id=$1', [id]);
       const checkpoint = randomUUID();
       for (const lot of paidLots) await c.query(`INSERT INTO commission_funds(id,user_id,payment_order_id,paid,amount_cny,remaining_cny)
@@ -243,8 +268,8 @@ export function commissionRoutes(app, options) {
       if (available > paidTotal) await c.query(`INSERT INTO commission_funds(id,user_id,paid,amount_cny,remaining_cny)
         VALUES($1,$2,false,$3,$3)`, ['opening:' + checkpoint, id, decimal(available - paidTotal)]);
       await c.query('UPDATE commission_accounts SET sources_confirmed=true WHERE user_id=$1', [id]);
-      await audit(c, req, 'commission.opening_balance', id, { balance_cny: decimal(available), paid_lots: paidLots, reference: why });
-      return { ok: true, balance_cny: decimal(available) };
+      await audit(c, req, 'commission.opening_balance', id, { balance_cny: decimal(available), paid_lots: paidLots, historical_requests: held.rows.map(row => row.request_id), reference: why });
+      return { ok: true, balance_cny: decimal(available), historical_review_count: held.rowCount };
     });
   });
   app.post('/admin/api/commissions/payment-refunds/:id', async req => {

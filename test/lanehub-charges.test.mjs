@@ -62,16 +62,41 @@ test('多条消费日志按总和计，非消费类型不计', async () => {
   assert.equal(db.billing[0].amount, quotaToCny(150, 7, 500000));
 });
 
-// 查不到日志的两种情况必须分开：刚完成的等下一轮，超时的落成 released 终止重试，
-// 否则失败的请求会被永远重查，把每轮的 20 个名额占满。
-test('日志还没落库时不写行，超时之后写 released 终止重试', async () => {
+test('missing logs remain unknown even after an hour; late charges must remain recoverable', async () => {
   const fresh = fakeDb(), old = fakeDb(), empty = () => fakeLanehub([]);
   assert.equal(await recordLanehubCharge(fresh, empty(), request, RATES), 'pending');
   assert.equal(fresh.billing.length, 0);
 
   const stale = { ...request, completed_at: new Date(Date.now() - 3600_000) };
-  assert.equal(await recordLanehubCharge(old, empty(), stale, RATES), 'released');
-  assert.equal(old.billing[0].state, 'released');
+  assert.equal(await recordLanehubCharge(old, empty(), stale, RATES), 'pending');
+  assert.equal(old.billing.length, 0);
+  await recordLanehubCharge(old, fakeLanehub([{ type: 2, quota: 100 }]), stale, RATES);
+  assert.equal(old.billing[0].state, 'settled');
+});
+
+test('invalid, overflowing, duplicated, mismatched and truncated receipts cannot create charges', async () => {
+  for (const logs of [
+    [{ type: 2, quota: -1 }], [{ type: 2, quota: 0.5 }], [{ type: 2, quota: '100' }],
+    [{ type: 2, quota: Number.MAX_SAFE_INTEGER + 1 }],
+    [{ type: 2, quota: Number.MAX_SAFE_INTEGER }, { type: 2, quota: 1 }],
+    [{ type: 2, quota: 100, request_id: 'other-request' }],
+    [{ type: 2, quota: 100, id: 1 }, { type: 2, quota: 100, id: 1 }],
+    Array.from({ length: 20 }, (_, id) => ({ type: 2, quota: 1, id })),
+  ]) {
+    const db = fakeDb();
+    await assert.rejects(recordLanehubCharge(db, fakeLanehub(logs), request, RATES));
+    assert.equal(db.billing.length, 0);
+  }
+  const db = fakeDb(), lanehub = fakeLanehub([]);
+  for(const total_count of [2,-1,NaN,'1']) {
+    lanehub.call = async () => ({ data: [{ type: 2, quota: 1 }], total_count });
+    await assert.rejects(recordLanehubCharge(db, lanehub, request, RATES), /incomplete/);
+  }
+  lanehub.call = async () => ({ data: Array.from({length:20},(_,id)=>({type:2,quota:1,id})), total_count:20 });
+  assert.equal(await recordLanehubCharge(db,lanehub,request,RATES),'settled','explicit total proves a full page is complete');
+  assert.equal(db.billing[0].amount,quotaToCny(20,7,500000));
+  for (const [quota, rate, perUnit] of [[-1,7,1], [1,0,1], [1,7,0], [1,Infinity,1], [1,'1e-8',1]])
+    assert.throws(() => quotaToCny(quota,rate,perUnit), /invalid_lanehub_money/);
 });
 
 // 折算汇率必须取对面的：拿配置里那个去折，实测差 4%（配 7 / 对面 6.7078），
