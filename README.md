@@ -1,12 +1,57 @@
-# IPZSK API 网关
+# IPZSK Token
 
-IPZSK 平台后端：号池调度、统一账户、模型代理、钱包计费、插件审核与开发者用量归属。
+IPZSK 的统一账户、号池、模型网关、钱包计费、插件审核和开发者用量服务。Web、桌面端和需要模型的插件都通过这一层访问模型与账单能力。
 
-源码仓库：`JayceHuang/ipzsk-api-gateway`。本地目录：`/Users/jaycehuang/Projects/ipzsk-api-gateway`。服务器目录仍为 `/home/ubuntu/api-gateway`。
+## 在线地址
 
-Codex 分工与操作步骤见 [Codex 开发执行手册](docs/CODEX-DEVELOPMENT.md)，开发入口见 [开发指南](docs/DEVELOPMENT.md)，AI 协作规则见 [AGENTS.md](AGENTS.md)。下文包含历史追加记录，当前行为请结合较新的专门文档和源码核对。
+| 入口 | URL | 用途 |
+| --- | --- | --- |
+| 号池与管理后台 | [https://api.ipzsk.com/admin](https://api.ipzsk.com/admin) | 上游账户、模型、路由、用户、账单、插件审核和桌面版本管理 |
+| OpenAI 兼容 API | `https://api.ipzsk.com/v1` | 桌面端、插件和外部客户端的模型调用入口 |
+| 用户账户 | [https://www.ipzsk.com/account](https://www.ipzsk.com/account) | 登录、余额、充值、账单和个人 API 凭证 |
+| 插件开发者中心 | [https://www.ipzsk.com/developer](https://www.ipzsk.com/developer) | 插件登记、Release 提交、版本状态和用量 |
 
-独立仓库中的 Node.js 服务，管理 APIMart 号池、账户余额、用户访问凭证和文本调用用量。前端使用原生 HTML/CSS/JavaScript，后端模块为原生 ESM，避免增加前端构建链。数据库使用 PostgreSQL，入口使用 Caddy。
+## 运作逻辑
+
+1. 用户从 Web 或桌面端登录。桌面端调用 `/api/me/desktop/bootstrap`，取得当前会话可用的模型目录、主客户端凭证和已安装插件的独立凭证。
+2. 请求进入 `https://api.ipzsk.com/v1` 后，服务端校验用户、会话、凭证归属、模型白名单、幂等键和并发限制。
+3. 号池根据已启用模型和渠道配置选择上游。LaneHub 模式下，每位用户对应独立 LaneHub 账号和令牌，LaneHub 保存权威余额、价格和消费日志。
+4. Token 服务保存请求 ID、原始模型、实际路由模型、渠道、输入/输出 token、状态和上游请求 ID。上游没有返回可靠用量时保持“待核实”。
+5. 完成后的 LaneHub 消费日志按请求 ID 回填 `request_billing`。用户实扣、上游成本和开发者应计分成分别记录，重复补记由幂等约束拦截。
+6. Web 账户中心读取余额和流水；桌面端显示模型与单次消耗；插件使用自己的凭证形成独立用量归属。
+7. 插件开发者提交 GitHub Release 后，管理员在后台审核包名、版本、大小、SHA-256 和兼容性。确认上架的版本进入 `/api/me/plugin-market`，供桌面端安装或更新。
+
+```mermaid
+sequenceDiagram
+  participant C as Web / Desktop / Plugin
+  participant T as token-ipzsk
+  participant L as LaneHub / 上游
+  C->>T: 登录、bootstrap 或模型请求
+  T->>T: 鉴权、模型权限、幂等与并发检查
+  T->>L: 使用用户对应渠道转发
+  L-->>T: 响应、usage、请求 ID 与消费日志
+  T->>T: 记录请求、回填扣费和插件归属
+  T-->>C: 结果、任务状态、余额与用量
+```
+
+## 六个仓库如何协作
+
+| 仓库 | 职责 | 与 Token 的关系 |
+| --- | --- | --- |
+| [web-ipzsk](https://github.com/ipzsk/web-ipzsk) | 官网、创作工作台、账户和开发者页面 | 调用本服务完成登录、生成、充值和插件管理 |
+| [desktop-ipzsk](https://github.com/ipzsk/desktop-ipzsk) | IPZSK 桌面客户端和插件市场 | 通过 bootstrap 获取模型、凭证和插件配置 |
+| [token-ipzsk](https://github.com/ipzsk/token-ipzsk) | 当前仓库 | 统一后端与数据归属中心 |
+| [plugin-dsh-imagegen](https://github.com/ipzsk/plugin-dsh-imagegen) | AI 生图与改图 | 使用插件独立凭证调用图片模型并记录用量 |
+| [plugin-dsh-doc-to-excel](https://github.com/ipzsk/plugin-dsh-doc-to-excel) | 文档提取与 Excel 输出 | 本地解析；选择模型时通过宿主和本服务调用 |
+| [plugin-dsh-swf-studio](https://github.com/ipzsk/plugin-dsh-swf-studio) | FloorLED 与 SWF 制作 | 当前本地生成，不调用模型；版本仍可由插件市场分发 |
+
+三个插件都独立于桌面安装包发布。仓库创建或发布 Release 不会自动上架，最终市场状态以后台审核目录为准。
+
+以下章节保留服务的详细运行、部署和历史演进说明；当前仓库关系、LaneHub 结算和插件市场流程以上述总览为准。
+
+Codex 分工与操作步骤见 [Codex 开发执行手册](docs/CODEX-DEVELOPMENT.md)，开发入口见 [开发指南](docs/DEVELOPMENT.md)，AI 协作规则见 [AGENTS.md](AGENTS.md)。
+
+服务使用 Node.js、原生 ESM、Fastify 和 PostgreSQL，入口由 Caddy 提供。生产工作目录保持 `/home/ubuntu/api-gateway`。
 
 ## 功能
 
