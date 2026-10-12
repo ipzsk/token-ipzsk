@@ -19,20 +19,24 @@ export function developerRoutes(app,{db,githubFetch}){
  }
  const audit=(c,req,action,id)=>c.query('INSERT INTO audit_events(action,target_id,details) VALUES($1,$2,$3)',[action,id,JSON.stringify({actor_user_id:req.apiUser.id})]);
  app.get('/api/me/developer',async req=>({profile:req.developer}));
- app.post('/api/me/developer/apply',async req=>{
-  const name=text(req.body?.display_name);
-  const row=await db.query(`INSERT INTO developer_profiles(user_id,display_name) VALUES($1,$2)
-   ON CONFLICT(user_id) DO UPDATE SET display_name=$2,state='pending',review_note='',reviewed_at=NULL,reviewed_by=NULL
-   WHERE developer_profiles.state='rejected' RETURNING state`,[req.apiUser.id,name]);
-  if(!row.rowCount)throw httpError(409,'developer_application_exists');return {state:'pending'};
- });
+ // Self-application is closed: approval comes only from accepting an administrator invitation (role-invitations.mjs).
+ app.post('/api/me/developer/apply',async()=>{throw httpError(403,'developer_invitation_required');});
  app.get('/admin/api/developers',async()=>({rows:(await db.query(`SELECT d.*,u.name,u.email FROM developer_profiles d JOIN users u ON u.id=d.user_id ORDER BY d.created_at DESC`)).rows}));
  app.post('/admin/api/developers/:id/review',async req=>{
-  const state=req.body?.state;
-  if(!['approved','rejected','disabled'].includes(state))throw httpError(400,'invalid_review_state');
-  const row=await db.query('UPDATE developer_profiles SET state=$2,review_note=$3,reviewed_by=$4,reviewed_at=now() WHERE user_id=$1 RETURNING user_id',
-   [uuid(req.params.id),state,String(req.body.review_note??'').slice(0,500),req.administrator.id]);
-  if(!row.rowCount)throw httpError(404,'developer_not_found');return {ok:true};
+  const state=req.body?.state,id=uuid(req.params.id);
+  // Review can only reject an old application or disable a developer; approval is invitation-only.
+  if(!['rejected','disabled'].includes(state))throw httpError(400,'invalid_review_state');
+  const from=state==='rejected'?'pending':'approved',reviewNote=String(req.body.review_note??'').slice(0,500);
+  await db.tx(async c=>{
+   const row=await c.query('UPDATE developer_profiles SET state=$2,review_note=$3,reviewed_by=$4,reviewed_at=now() WHERE user_id=$1 AND state=$5 RETURNING user_id',
+    [id,state,reviewNote,req.administrator.id,from]);
+   if(!row.rowCount){
+    if(!(await c.query('SELECT 1 FROM developer_profiles WHERE user_id=$1',[id])).rowCount)throw httpError(404,'developer_not_found');
+    throw httpError(409,'invalid_review_transition');
+   }
+   await c.query('INSERT INTO audit_events(action,target_id,administrator_id,details) VALUES($1,$2,$3,$4)',
+    ['developer.review',id,req.administrator.id,JSON.stringify({previous:from,next:state,review_note:reviewNote})]);
+  });return {ok:true};
  });
  app.post('/admin/api/plugins/:id/owner',async req=>{
   const id=uuid(req.params.id),owner=uuid(req.body?.owner_user_id),bps=req.body?.revenue_share_bps??null;

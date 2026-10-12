@@ -12,7 +12,7 @@ test('three roles isolate administration, plugin ownership, usage and customer r
  const alice=randomUUID(),bob=randomUUID(),customer=randomUUID();
  try{
   await db.migrate();await db.migrate();
-  for(const id of [alice,bob,customer])await db.query('INSERT INTO users(id,name,email,email_verified) VALUES($1,$2,$3,true)',[id,'Fixture '+id,id+'@example.com']);
+  for(const id of [alice,bob,customer])await db.query('INSERT INTO users(id,name,email,email_verified,auth_user_id) VALUES($1,$2,$3,true,$4)',[id,'Fixture '+id,id+'@example.com','auth-'+id]);
   for(const [id,role] of [[1,'superadmin'],[2,'operator'],[3,'viewer']])await db.query('INSERT INTO administrators(id,username,role,password_hash) VALUES($1,$2,$3,$4)',[id,role,role,await passwordHash('fixture-role-password')]);
   const customerAuth={async identify(headers){const user=headers.cookie?.replace('fixture=','');if(![alice,bob,customer].includes(user))throw httpError(401,'customer_login_required');return {id:user,session_id:'fixture-session',auth_user_id:user};}};
   app=await createApp({db,customerAuth,upstream:{},scheduler:{keys:new Map(),accounts:new Map()},origin:'https://api.ipzsk.com',secureCookies:true});
@@ -20,20 +20,27 @@ test('three roles isolate administration, plugin ownership, usage and customer r
   const cookies={};for(const role of ['superadmin','operator','viewer']){const r=await app.inject({url:'/admin/api/login',method:'POST',payload:{username:role,password:'fixture-role-password'},headers:{origin:'https://api.ipzsk.com'}});assert.equal(r.statusCode,200,r.body);cookies[role]=[].concat(r.headers['set-cookie']).map(v=>v.split(';')[0]).join('; ');}
   const admin=(path,payload,role='superadmin')=>app.inject({url:'/admin/api'+path,method:payload?'POST':'GET',payload,headers:{cookie:cookies[role],origin:'https://api.ipzsk.com'}});
   const path='/api/me/developer';let aPlugin,bPlugin;
-  await t.test('normal users may apply, cannot self-approve or use API tokens as developer sessions',async()=>{
+  await t.test('normal users cannot self-apply, self-approve or use API tokens as developer sessions',async()=>{
    assert.equal((await call(customer,path+'/plugins')).statusCode,403);
-   for(const user of [alice,bob])assert.equal((await call(user,path+'/apply',{display_name:'Developer '+user,state:'approved'})).json().state,'pending');
+   for(const user of [alice,bob]){const r=await call(user,path+'/apply',{display_name:'Developer '+user,state:'approved'});assert.equal(r.statusCode,403);assert.equal(r.json().error.code,'developer_invitation_required');}
+   assert.equal((await db.query('SELECT count(*) FROM developer_profiles')).rows[0].count,'0');
    assert.equal((await call(alice,path+'/plugins',{slug:'bad'})).statusCode,403);
    assert.equal((await call(alice,'/admin/api/developers/'+alice+'/review',{state:'approved'},{origin:'https://api.ipzsk.com'})).statusCode,401);
    const secret=token('ipz_');await db.query('INSERT INTO access_tokens(id,user_id,token_hash,prefix) VALUES($1,$2,$3,$4)',[randomUUID(),alice,hash(secret),secret.slice(0,12)]);
    assert.equal((await call(alice,path,undefined,{authorization:'Bearer '+secret})).statusCode,403);
    assert.equal((await call(alice,path+'/apply',{display_name:'Again'},{origin:'https://evil.example'})).statusCode,403);
   });
-  await t.test('only superadmin can review developers, publish plugins, inspect profit or inspect wallet entries',async()=>{
-   for(const role of ['operator','viewer'])for(const route of ['/developers','/plugins','/plugin-usage','/wallet/entries','/ledger','/overview','/requests'])assert.equal((await admin(route,undefined,role)).statusCode,403,role+route);
-   assert.equal((await admin('/developers/'+alice+'/review',{state:'approved'},'operator')).statusCode,403);
-   for(const user of [alice,bob])assert.equal((await admin('/developers/'+user+'/review',{state:'approved'})).statusCode,200);
+  await t.test('only superadmin can invite developers, publish plugins, inspect profit or inspect wallet entries',async()=>{
+   for(const role of ['operator','viewer'])for(const route of ['/developers','/plugins','/plugin-usage','/wallet/entries','/ledger','/overview','/requests','/commissions/invitations'])assert.equal((await admin(route,undefined,role)).statusCode,403,role+route);
+   assert.equal((await admin('/commissions/invitations',{role:'developer',target:alice,reason:'operator fixture'},'operator')).statusCode,403);
+   assert.equal((await admin('/developers/'+alice+'/review',{state:'approved'})).statusCode,400,'review can no longer approve');
+   for(const user of [alice,bob]){
+    const invite=await admin('/commissions/invitations',{role:'developer',target:user+'@example.com',reason:'invite fixture developer',display_name:'Developer '+user});assert.equal(invite.statusCode,200,invite.body);
+    const secret=new URL(invite.json().invitation_url).hash.slice('#invite='.length);
+    const accepted=await call(user,'/api/me/role-invitations/accept',{token:secret});assert.equal(accepted.statusCode,200,accepted.body);
+   }
    assert.equal((await call(alice,path)).json().profile.state,'approved');
+   assert.equal((await call(alice,path)).json().profile.display_name,'Developer '+alice);
   });
   await t.test('ownership is assigned from the session; developers cannot edit runtime, owner or share rate',async()=>{
    const body={slug:'alice-plugin',name:'Alice plugin',repository:'Fixture/plugin',package_name:'fixture-plugin',owner_user_id:bob,revenue_share_bps:10000,allowed_models:['gpt-image-2'],runtime_config:{secret:'no'}};
@@ -77,10 +84,13 @@ test('three roles isolate administration, plugin ownership, usage and customer r
    assert.equal((await call(alice,path+'/plugins/'+aPlugin+'/releases')).statusCode,404);
   });
   await t.test('disabled developer loses portal access immediately but retains ordinary account access',async()=>{
-   await admin('/developers/'+bob+'/review',{state:'disabled'});
+   assert.equal((await admin('/developers/'+bob+'/review',{state:'disabled'})).statusCode,200);
    assert.equal((await call(bob,path+'/plugins')).statusCode,403);
    assert.equal((await call(bob,'/api/me/profile')).statusCode,200);
-   assert.equal((await call(bob,path+'/apply',{display_name:'Bypass'})).statusCode,409);
+   assert.equal((await call(bob,path+'/apply',{display_name:'Bypass'})).statusCode,403);
+   assert.equal((await admin('/developers/'+bob+'/review',{state:'rejected'})).statusCode,409,'disabled cannot be rewritten as a rejected application');
+   const review=(await db.query("SELECT details FROM audit_events WHERE action='developer.review' AND target_id=$1",[bob])).rows;
+   assert.deepEqual(review.map(r=>[r.details.previous,r.details.next]),[['approved','disabled']]);
   });
  }finally{await app?.close();await db.close();await setup.query(`DROP SCHEMA ${schema} CASCADE`);await setup.close();}
 });

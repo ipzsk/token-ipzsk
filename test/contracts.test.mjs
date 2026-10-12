@@ -76,6 +76,9 @@ const ROWS = [
   [/FROM user_roles/, () => [{ role: 'admin' }]],
   [/app_settings/, () => [{ value: 'on' }]],
   [/FROM lanehub_accounts/, () => [{ user_id: USER, secret_ref: 'x', key_id: 1 }]],
+  [/SELECT id,role,created_at,expires_at FROM role_invitations/, () => [{ id: id(13), role: 'developer', created_at: now, expires_at: now }]],
+  [/UPDATE role_invitations SET state='accepted'/, () => [{ id: id(13), role: 'developer', user_id: USER, display_name: null, created_by: 1 }]],
+  [/SELECT state FROM developer_profiles/, () => [{ state: 'pending' }]],
 ];
 const db = {
   async query(sql, args = []) {
@@ -246,6 +249,20 @@ test('ops (lanehub proxy) GET responses match contracts-schema', async () => {
     await check('GET /api/admin/ops/logs/stat', '/api/admin/ops/logs/stat');
     const failed = await check('PUT /api/admin/ops/lane-matrix', '/api/admin/ops/lane-matrix', { body: { changes: [{ channel_id: 1, status: 2 }] }, status: 502, shape: 'ApiErrorBody' });
     assert.equal(failed.json().error.detail, 'boom');
+  } finally { await app.close(); }
+});
+
+test('role invitation responses match contracts-schema and never echo a token', async () => {
+  const app = await createApp({ db, upstream: {}, scheduler: { keys: new Map(), accounts: new Map() }, origin: 'https://api.ipzsk.com',
+    customerAuth: { identify: async () => ({ id: USER, name: 'u', token_id: null, session_id: 's1', session_created_at: new Date().toISOString() }) } });
+  const check = await checker(app);
+  try {
+    const mine = (await check('GET /api/me/role-invitations', '/api/me/role-invitations')).json();
+    assert.equal(mine.pending[0].role, 'developer');
+    assert.doesNotMatch(JSON.stringify(mine), /token/);
+    await check('POST /api/me/role-invitations/accept', '/api/me/role-invitations/accept', { body: { token: 'short' }, status: 400, shape: 'ApiErrorBody' });
+    assert.deepEqual((await check('POST /api/me/role-invitations/accept', '/api/me/role-invitations/accept', { body: { token: 'a'.repeat(43) } })).json(),
+      { role: 'developer', state: 'accepted' });
   } finally { await app.close(); }
 });
 

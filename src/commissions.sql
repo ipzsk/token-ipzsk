@@ -1,16 +1,17 @@
--- Paid API consumption commission. Historical requests/earnings stay in the legacy ledger.
+-- Permanent API consumption commission. Historical requests/earnings stay in the legacy ledger.
+-- bd_share_bps applies to net paid consumption; developer_share_bps applies to the remaining profit
+-- after the paid share of actual upstream cost and the BD commission. enabled is the only switch.
 CREATE TABLE IF NOT EXISTS commission_policy (
   id integer PRIMARY KEY CHECK(id=1), enabled boolean NOT NULL DEFAULT false,
   bd_share_bps integer NOT NULL DEFAULT 2000 CHECK(bd_share_bps BETWEEN 0 AND 10000),
-  developer_share_bps integer NOT NULL DEFAULT 3500 CHECK(developer_share_bps BETWEEN 0 AND 10000),
-  started_at timestamptz, ends_at timestamptz
+  developer_share_bps integer NOT NULL DEFAULT 4000 CHECK(developer_share_bps BETWEEN 0 AND 10000)
 );
 INSERT INTO commission_policy(id) VALUES(1) ON CONFLICT DO NOTHING;
 ALTER TABLE commission_policy ADD COLUMN IF NOT EXISTS bd_share_bps integer NOT NULL DEFAULT 2000 CHECK(bd_share_bps BETWEEN 0 AND 10000);
-ALTER TABLE commission_policy ADD COLUMN IF NOT EXISTS developer_share_bps integer NOT NULL DEFAULT 3500 CHECK(developer_share_bps BETWEEN 0 AND 10000);
-ALTER TABLE commission_policy ADD COLUMN IF NOT EXISTS started_at timestamptz;
-ALTER TABLE commission_policy ADD COLUMN IF NOT EXISTS ends_at timestamptz;
-UPDATE commission_policy SET bd_share_bps=2000,developer_share_bps=3500 WHERE id=1 AND started_at IS NULL;
+ALTER TABLE commission_policy ADD COLUMN IF NOT EXISTS developer_share_bps integer NOT NULL DEFAULT 4000 CHECK(developer_share_bps BETWEEN 0 AND 10000);
+ALTER TABLE commission_policy ALTER COLUMN developer_share_bps SET DEFAULT 4000;
+ALTER TABLE commission_policy DROP COLUMN IF EXISTS started_at, DROP COLUMN IF EXISTS ends_at;
+UPDATE commission_policy SET bd_share_bps=2000,developer_share_bps=4000 WHERE id=1;
 ALTER TABLE requests ADD COLUMN IF NOT EXISTS skill_calls jsonb NOT NULL DEFAULT '[]';
 ALTER TABLE requests ADD COLUMN IF NOT EXISTS skill_attribution_state text NOT NULL DEFAULT 'none';
 ALTER TABLE requests ADD COLUMN IF NOT EXISTS lanehub_reconciled_at timestamptz;
@@ -70,8 +71,10 @@ CREATE TABLE IF NOT EXISTS commission_requests (
   developer_user_id uuid REFERENCES users(id), charged_cny numeric(20,8),
   paid_cny numeric(20,8), refunded_cny numeric(20,8) NOT NULL DEFAULT 0,
   bd_share_bps integer NOT NULL DEFAULT 2000 CHECK(bd_share_bps BETWEEN 0 AND 10000),
-  developer_share_bps integer NOT NULL DEFAULT 3500 CHECK(developer_share_bps BETWEEN 0 AND 10000),
-  campaign_ends_at timestamptz,
+  developer_share_bps integer NOT NULL DEFAULT 4000 CHECK(developer_share_bps BETWEEN 0 AND 10000),
+  -- Formula snapshot: profit (current rule), consumption (schema 31, 35% of paid consumption),
+  -- legacy_profit (schema 30, BD and developer both from profit after cost).
+  developer_basis text NOT NULL DEFAULT 'profit' CHECK(developer_basis IN ('legacy_profit','consumption','profit')),
   bd_cny numeric(20,8) NOT NULL DEFAULT 0, developer_cny numeric(20,8) NOT NULL DEFAULT 0,
   revision integer NOT NULL DEFAULT 0,
   state text NOT NULL DEFAULT 'pending_billing' CHECK(state IN ('pending_billing','pending_sources','pending_cost','accrued','disputed')),
@@ -79,8 +82,21 @@ CREATE TABLE IF NOT EXISTS commission_requests (
 );
 ALTER TABLE commission_requests ADD COLUMN IF NOT EXISTS enabled boolean NOT NULL DEFAULT false;
 ALTER TABLE commission_requests ADD COLUMN IF NOT EXISTS bd_share_bps integer NOT NULL DEFAULT 2000 CHECK(bd_share_bps BETWEEN 0 AND 10000);
-ALTER TABLE commission_requests ADD COLUMN IF NOT EXISTS developer_share_bps integer NOT NULL DEFAULT 3500 CHECK(developer_share_bps BETWEEN 0 AND 10000);
-ALTER TABLE commission_requests ADD COLUMN IF NOT EXISTS campaign_ends_at timestamptz;
+ALTER TABLE commission_requests ADD COLUMN IF NOT EXISTS developer_share_bps integer NOT NULL DEFAULT 4000 CHECK(developer_share_bps BETWEEN 0 AND 10000);
+ALTER TABLE commission_requests ALTER COLUMN developer_share_bps SET DEFAULT 4000;
+-- Existing rows keep the formula they were created under; schema 31 already stamped its 20%/35% rates.
+DO $$ BEGIN
+  IF NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema()
+      AND table_name='commission_requests' AND column_name='developer_basis') THEN
+    ALTER TABLE commission_requests ADD COLUMN developer_basis text NOT NULL DEFAULT 'legacy_profit'
+      CHECK(developer_basis IN ('legacy_profit','consumption','profit'));
+    IF EXISTS(SELECT 1 FROM schema_version WHERE version=31) THEN
+      UPDATE commission_requests SET developer_basis='consumption';
+    END IF;
+    ALTER TABLE commission_requests ALTER COLUMN developer_basis SET DEFAULT 'profit';
+  END IF;
+END $$;
+ALTER TABLE commission_requests DROP COLUMN IF EXISTS campaign_ends_at;
 ALTER TABLE commission_requests DROP CONSTRAINT commission_requests_state_check;
 ALTER TABLE commission_requests ADD CONSTRAINT commission_requests_state_check
   CHECK(state IN ('pending_billing','pending_sources','pending_cost','accrued','disputed','historical_sources_review'));
@@ -127,14 +143,14 @@ CREATE TRIGGER commission_signup_credit AFTER INSERT OR UPDATE OF applied_at ON 
 CREATE OR REPLACE FUNCTION commission_snapshot() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     PERFORM 1 FROM users WHERE id=NEW.user_id FOR NO KEY UPDATE;
-    INSERT INTO commission_requests(request_id,enabled,bd_user_id,developer_user_id,bd_share_bps,developer_share_bps,campaign_ends_at)
-      SELECT NEW.id,p.enabled AND p.started_at IS NOT NULL AND now()>=p.started_at AND now()<p.ends_at,
+    INSERT INTO commission_requests(request_id,enabled,bd_user_id,developer_user_id,bd_share_bps,developer_share_bps,developer_basis)
+      SELECT NEW.id,p.enabled,
         (SELECT f.referrer_id FROM referrals f JOIN referral_profiles profile ON profile.user_id=f.referrer_id
           WHERE f.user_id=NEW.user_id AND profile.bd_active AND f.referrer_id<>NEW.user_id),
         CASE WHEN NEW.plugin_owner_user_id<>NEW.user_id AND EXISTS(
           SELECT 1 FROM developer_profiles WHERE user_id=NEW.plugin_owner_user_id AND state='approved')
           THEN NEW.plugin_owner_user_id END,
-        p.bd_share_bps,p.developer_share_bps,p.ends_at
+        p.bd_share_bps,p.developer_share_bps,'profit'
       FROM commission_policy p WHERE p.id=1;
   RETURN NEW;
 END $$;
@@ -145,7 +161,8 @@ CREATE OR REPLACE FUNCTION commission_reconcile(rid uuid) RETURNS void LANGUAGE 
 DECLARE
   r requests%ROWTYPE; b request_billing%ROWTYPE; s commission_requests%ROWTYPE; f commission_funds%ROWTYPE;
   a record; need numeric(20,8); take numeric(20,8); refund_remaining numeric(20,8);
-  net_paid numeric(20,8); bd numeric(20,8); dev numeric(20,8);
+  net_paid numeric(20,8); paid_cost numeric; profit numeric; waiting boolean;
+  bd numeric(20,8); dev numeric(20,8);
 BEGIN
   -- All source allocation and refunds serialize on the consumer, including parallel model requests.
   SELECT * INTO r FROM requests WHERE id=rid;
@@ -201,8 +218,21 @@ BEGIN
   END IF;
   SELECT coalesce(sum(allocation.amount_cny-allocation.returned_cny-allocation.chargeback_cny) FILTER(WHERE fund.paid),0) INTO net_paid
     FROM commission_allocations allocation JOIN commission_funds fund ON fund.id=allocation.fund_id WHERE allocation.request_id=rid;
-  bd:=CASE WHEN s.bd_user_id IS NOT NULL THEN trunc(net_paid*s.bd_share_bps/10000,8) ELSE 0 END;
-  dev:=CASE WHEN s.developer_user_id IS NOT NULL THEN trunc(net_paid*s.developer_share_bps/10000,8) ELSE 0 END;
+  -- The paid ratio is fixed at allocation; refunds do not return upstream cost. NULL means cost unknown.
+  paid_cost:=CASE WHEN s.charged_cny>0 THEN r.cost_cny*s.paid_cny/s.charged_cny ELSE 0 END;
+  waiting:=paid_cost IS NULL AND net_paid>0;
+  IF s.developer_basis='legacy_profit' THEN
+    waiting:=waiting AND (s.bd_user_id IS NOT NULL OR s.developer_user_id IS NOT NULL);
+    profit:=greatest(net_paid-coalesce(paid_cost,0),0);
+    bd:=CASE WHEN waiting THEN s.bd_cny WHEN s.bd_user_id IS NOT NULL THEN trunc(profit*s.bd_share_bps/10000,8) ELSE 0 END;
+    dev:=CASE WHEN waiting THEN s.developer_cny WHEN s.developer_user_id IS NOT NULL THEN trunc((profit-bd)*s.developer_share_bps/10000,8) ELSE 0 END;
+  ELSE
+    -- BD never waits for cost. The developer share waits for trusted actual cost and absorbs later cost corrections.
+    bd:=CASE WHEN s.bd_user_id IS NOT NULL THEN trunc(net_paid*s.bd_share_bps/10000,8) ELSE 0 END;
+    waiting:=waiting AND s.developer_basis='profit' AND s.developer_user_id IS NOT NULL;
+    profit:=CASE WHEN s.developer_basis='consumption' THEN net_paid ELSE greatest(net_paid-coalesce(paid_cost,0)-bd,0) END;
+    dev:=CASE WHEN waiting THEN s.developer_cny WHEN s.developer_user_id IS NOT NULL THEN trunc(profit*s.developer_share_bps/10000,8) ELSE 0 END;
+  END IF;
   IF bd<>s.bd_cny THEN
     INSERT INTO commission_ledger(user_id,request_id,kind,amount_cny,available_at,reference)
       VALUES(s.bd_user_id,rid,'bd',bd-s.bd_cny,CASE WHEN bd<s.bd_cny THEN greatest(now(),coalesce((SELECT min(available_at) FROM commission_ledger WHERE request_id=rid AND kind='bd'),now())) ELSE now()+interval '30 days' END,
@@ -213,7 +243,9 @@ BEGIN
       VALUES(s.developer_user_id,rid,'developer',dev-s.developer_cny,CASE WHEN dev<s.developer_cny THEN greatest(now(),coalesce((SELECT min(available_at) FROM commission_ledger WHERE request_id=rid AND kind='developer'),now())) ELSE now()+interval '30 days' END,
         'developer:'||rid||':'||(s.revision+1));
   END IF;
-  UPDATE commission_requests SET bd_cny=bd,developer_cny=dev,revision=revision+1,state='accrued' WHERE request_id=rid;
+  UPDATE commission_requests SET bd_cny=bd,developer_cny=dev,
+    revision=revision+CASE WHEN bd<>s.bd_cny OR dev<>s.developer_cny THEN 1 ELSE 0 END,
+    state=CASE WHEN waiting THEN 'pending_cost' ELSE 'accrued' END WHERE request_id=rid;
 END $$;
 CREATE OR REPLACE FUNCTION commission_bill_changed() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -253,3 +285,29 @@ END $$;
 INSERT INTO schema_version(version) VALUES(29) ON CONFLICT DO NOTHING;
 INSERT INTO schema_version(version) VALUES(30) ON CONFLICT DO NOTHING;
 INSERT INTO schema_version(version) VALUES(31) ON CONFLICT DO NOTHING;
+INSERT INTO schema_version(version) VALUES(32) ON CONFLICT DO NOTHING;
+
+-- v33: BD and plugin developer identities come only from an administrator invitation accepted by the bound account.
+-- token_hash is SHA-256 of a 256-bit single-use token; the plaintext is never stored. Existing BD and approved
+-- developer rows stay valid. A pending row past expires_at is treated as expired and materialised on the next write.
+-- Audit events reference the invitation through audit_events.target_id = id.
+CREATE TABLE IF NOT EXISTS role_invitations (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  role text NOT NULL CHECK(role IN ('bd','developer')),
+  user_id uuid NOT NULL REFERENCES users(id),
+  email text NOT NULL CHECK(email=lower(email)),
+  display_name text CHECK(display_name IS NULL OR char_length(display_name) BETWEEN 1 AND 100),
+  token_hash text NOT NULL UNIQUE CHECK(token_hash ~ '^[a-f0-9]{64}$'),
+  reason text NOT NULL CHECK(char_length(reason) BETWEEN 5 AND 500),
+  state text NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','accepted','revoked','expired')),
+  created_by integer NOT NULL REFERENCES administrators(id),
+  created_at timestamptz NOT NULL DEFAULT now(), expires_at timestamptz NOT NULL,
+  accepted_at timestamptz, revoked_at timestamptz, revoked_by integer REFERENCES administrators(id),
+  previous_id uuid REFERENCES role_invitations(id),
+  CHECK(expires_at>created_at),
+  CHECK((state='accepted')=(accepted_at IS NOT NULL) AND (accepted_at IS NULL OR accepted_at<expires_at)),
+  CHECK((state='revoked')=(revoked_at IS NOT NULL AND revoked_by IS NOT NULL))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS role_invitations_one_pending ON role_invitations(user_id,role) WHERE state='pending';
+CREATE INDEX IF NOT EXISTS role_invitations_recent ON role_invitations(created_at DESC);
+INSERT INTO schema_version(version) VALUES(33) ON CONFLICT DO NOTHING;

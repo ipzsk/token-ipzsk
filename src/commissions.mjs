@@ -10,18 +10,18 @@ const amount = value => {
     throw httpError(400, 'invalid_amount');
   return value;
 };
-const note = value => {
+export const note = value => {
   if (typeof value !== 'string' || value.trim().length < 5 || value.length > 500) throw httpError(400, 'invalid_reason');
   return value.trim();
 };
-const login = req => {
+export const login = req => {
   if (!req.apiUser?.session_id) throw httpError(401, 'customer_login_required');
   return req.apiUser.id;
 };
-const admin = req => {
+export const admin = req => {
   if (req.administrator?.role !== 'superadmin') throw httpError(403, 'admin_permission_denied');
 };
-const audit = (c, req, action, id, details) => c.query(
+export const audit = (c, req, action, id, details) => c.query(
   'INSERT INTO audit_events(action,target_id,administrator_id,actor_user_id,details) VALUES($1,$2,$3,$4,$5)',
   [action, id, req.administrator?.id ?? null, req.apiUser?.id ?? null, JSON.stringify(details)]);
 
@@ -71,13 +71,12 @@ export async function reconcileCommissions(db) {
   const rows = (await db.query(`SELECT s.request_id FROM commission_requests s JOIN requests r ON r.id=s.request_id
     JOIN commission_accounts a ON a.user_id=r.user_id JOIN request_billing b ON b.request_id=r.id
     WHERE s.state NOT IN ('disputed','accrued','historical_sources_review') AND a.sources_confirmed AND b.state IN ('settled','released')
+      AND (s.state<>'pending_cost' OR r.cost_cny IS NOT NULL)
       AND (s.state<>'pending_sources' OR (SELECT coalesce(sum(remaining_cny),0) FROM commission_funds WHERE user_id=r.user_id)>=b.charged_cny)
     ORDER BY s.created_at LIMIT 200`)).rows;
   for (const row of rows) await db.tx(c => c.query('SELECT commission_reconcile($1)', [row.request_id]));
-  const policy = (await db.query(`UPDATE commission_policy SET enabled=false
-    WHERE id=1 AND enabled AND ends_at IS NOT NULL AND ends_at<=now() RETURNING *`)).rows[0]
-    ?? (await db.query('SELECT * FROM commission_policy WHERE id=1')).rows[0];
-  if (!policy?.enabled || !policy.started_at || !policy.ends_at) return;
+  const policy = (await db.query('SELECT enabled FROM commission_policy WHERE id=1')).rows[0];
+  if (!policy?.enabled) return;
   const users = (await db.query(`SELECT f.user_id FROM referrals f WHERE
     (CASE WHEN coalesce((SELECT sum(p.amount_cny) FROM payment_orders p WHERE p.user_id=f.user_id AND p.mode='prod' AND p.credited_at IS NOT NULL),0)
       -coalesce((SELECT sum(x.amount_cny) FROM commission_payment_refunds x JOIN payment_orders p ON p.id=x.payment_order_id WHERE p.user_id=f.user_id),0)>10 THEN 5 ELSE 0 END)
@@ -148,10 +147,16 @@ export function commissionRoutes(app, options) {
     return reply.redirect('https://www.ipzsk.com/account?mode=register');
   });
   app.get('/api/me/commissions', async req => {
-    const id = login(req), p = await profile(db, id), policy = (await db.query(`SELECT bd_share_bps,developer_share_bps,started_at,ends_at,
-      enabled AND started_at IS NOT NULL AND now()>=started_at AND now()<ends_at AS active FROM commission_policy WHERE id=1`)).rows[0];
-    return { profile: p, policy, invitation_url: `${options.origin}/api/account/referral/${p.code}`, balance: await commissionBalance(db, id),
-      ledger: (await db.query('SELECT kind,amount_cny,available_at,created_at,request_id FROM commission_ledger WHERE user_id=$1 ORDER BY id DESC LIMIT 100', [id])).rows,
+    const id = login(req), p = await profile(db, id), policy = (await db.query(`SELECT bd_share_bps,developer_share_bps,
+      'remaining_profit' AS developer_basis,enabled AS active FROM commission_policy WHERE id=1`)).rows[0];
+    const developer = (await db.query('SELECT state,display_name FROM developer_profiles WHERE user_id=$1', [id])).rows[0] ?? null;
+    return { profile: p, developer, policy, invitation_url: `${options.origin}/api/account/referral/${p.code}`, balance: await commissionBalance(db, id),
+      earned: Object.fromEntries((await db.query(`SELECT kind,sum(amount_cny)::numeric(20,8) AS amount_cny FROM commission_ledger
+        WHERE user_id=$1 AND kind IN ('bd','developer','invitation') GROUP BY kind`, [id])).rows.map(row => [row.kind, row.amount_cny])),
+      // Plugin names only on the caller's own developer rows; BD rows stay at request level.
+      ledger: (await db.query(`SELECT l.kind,l.amount_cny,l.available_at,l.created_at,l.request_id,p.name AS plugin_name FROM commission_ledger l
+        LEFT JOIN requests r ON r.id=l.request_id AND l.kind='developer' AND r.plugin_owner_user_id=l.user_id
+        LEFT JOIN plugins p ON p.id=r.plugin_id WHERE l.user_id=$1 ORDER BY l.id DESC LIMIT 100`, [id])).rows,
       referrals: (await db.query('SELECT count(*)::integer AS count FROM referrals WHERE referrer_id=$1', [id])).rows[0].count,
       payouts: (await db.query('SELECT * FROM commission_payouts WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50', [id])).rows,
       conversions: (await db.query('SELECT * FROM commission_conversions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50', [id])).rows };
@@ -208,18 +213,12 @@ export function commissionRoutes(app, options) {
     if (typeof req.body?.enabled !== 'boolean') throw httpError(400, 'invalid_policy');
     const why = note(req.body.reason);
     await db.tx(async c => {
-      const policy = (await c.query('SELECT * FROM commission_policy WHERE id=1 FOR UPDATE')).rows[0];
+      await c.query('SELECT id FROM commission_policy WHERE id=1 FOR UPDATE');
       if (req.body.enabled && (await c.query('SELECT 1 FROM commission_accounts WHERE NOT sources_confirmed LIMIT 1')).rowCount)
         throw httpError(409, 'commission_sources_migration_required');
-      if (req.body.enabled && policy.ends_at && (await c.query('SELECT $1::timestamptz<=now() AS expired', [policy.ends_at])).rows[0].expired)
-        throw httpError(409, 'commission_campaign_expired');
-      const saved = (await c.query(`UPDATE commission_policy SET enabled=$1,
-        started_at=CASE WHEN $1 AND started_at IS NULL THEN now() ELSE started_at END,
-        ends_at=CASE WHEN $1 AND ends_at IS NULL THEN now()+interval '1 year' ELSE ends_at END
-        WHERE id=1 RETURNING *`, [req.body.enabled])).rows[0];
+      const saved = (await c.query('UPDATE commission_policy SET enabled=$1 WHERE id=1 RETURNING *', [req.body.enabled])).rows[0];
       await audit(c, req, 'commission.policy', null, { enabled: req.body.enabled, reason: why,
-        bd_share_bps: saved.bd_share_bps, developer_share_bps: saved.developer_share_bps,
-        started_at: saved.started_at, ends_at: saved.ends_at });
+        bd_share_bps: saved.bd_share_bps, developer_share_bps: saved.developer_share_bps });
     });
     return { ok: true };
   });
@@ -229,9 +228,13 @@ export function commissionRoutes(app, options) {
     if (typeof req.body.bd_active !== 'boolean' || typeof req.body.frozen !== 'boolean') throw httpError(400, 'invalid_profile');
     await db.tx(async c => {
       await c.query('SELECT pg_advisory_xact_lock(hashtextextended($1,1))', [id]);
-      await profile(c, id);
+      if (!(await c.query('SELECT 1 FROM users WHERE id=$1', [id])).rowCount) throw httpError(404, 'user_not_found');
+      const previous = await profile(c, id);
+      // BD is granted only by the user accepting an administrator invitation (role-invitations.mjs).
+      if (req.body.bd_active && !previous.bd_active) throw httpError(409, 'bd_invitation_required');
       await c.query('UPDATE referral_profiles SET bd_active=$2,frozen=$3 WHERE user_id=$1', [id, req.body.bd_active, req.body.frozen]);
-      await audit(c, req, 'commission.profile', id, { ...req.body, reason: why });
+      await audit(c, req, 'commission.profile', id, { bd_active: req.body.bd_active, frozen: req.body.frozen, reason: why,
+        previous: { bd_active: previous.bd_active, frozen: previous.frozen } });
     });
     return { ok: true };
   });

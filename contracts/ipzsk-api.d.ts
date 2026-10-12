@@ -609,6 +609,7 @@ export interface InspirationCaseDetail {
   references: CaseImage[]
   similar: InspirationCase[] // max 12 items
 }
+export type InvitationRole = "bd" | "developer"
 export interface LaneChange {
   channel_id: number // integer 1..
   priority?: number
@@ -748,6 +749,16 @@ export interface ModelSpec {
   unsupported: Record<string, string>
   mode?: ModelMode
   avatar?: AvatarCapability
+}
+export interface MyRoleInvitations {
+  bd_active: boolean
+  developer_state: ("pending" | "approved" | "rejected" | "disabled") | null
+  pending: {
+    id: Uuid
+    role: InvitationRole
+    created_at: IsoTime
+    expires_at: IsoTime
+  }[]
 }
 export interface OpsChannelPage {
   items: ChannelSummary[]
@@ -904,6 +915,13 @@ export interface RoleGrant {
   role: Role
   granted_at: IsoTime
   granted_by: UserRef | null
+}
+export interface RoleInvitationAccept {
+  token: string
+}
+export interface RoleInvitationAccepted {
+  role: InvitationRole
+  state: "accepted"
 }
 export interface RolesResponse {
   roles: Role[]
@@ -1126,6 +1144,8 @@ export interface Endpoints {
   "POST /api/me/media/quote": { body: QuoteRequest; response: QuoteResponse }
   "GET /api/me/queue": { body: never; response: Queue }
   "PUT /api/me/queue": { body: QueuePut; response: Queue }
+  "GET /api/me/role-invitations": { body: never; response: MyRoleInvitations }
+  "POST /api/me/role-invitations/accept": { body: RoleInvitationAccept; response: RoleInvitationAccepted }
   "GET /api/me/roles": { body: never; response: RolesResponse }
   "GET /api/me/subjects": { body: never; response: Page<Subject> }
   "POST /api/me/subjects": { body: SubjectCreate; response: Subject }

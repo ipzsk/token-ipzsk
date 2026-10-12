@@ -334,7 +334,7 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
       assert.equal(mine.json().source,'lanehub');
       assert.equal(mine.json().balance_cny,(357142/QUOTA_PER_UNIT*USD_CNY).toFixed(8));
     });
-    await t.test('paid-consumption commission: authenticated plugin and Skill credentials credit BD and author; forged tags cannot select an author', async () => {
+    await t.test('permanent commission: authenticated plugin and Skill credentials credit BD and author; forged tags cannot select an author', async () => {
       const remaining=(await db.query('SELECT coalesce(sum(remaining_cny),0)::numeric(20,8) AS amount FROM commission_funds WHERE user_id=$1',[userId])).rows[0].amount;
       const drain=randomUUID();
       await db.query("INSERT INTO requests(id,user_id,model,fingerprint,stream,status) VALUES($1,$2,'test-model','drain fixture',false,'succeeded')",[drain,userId]);
@@ -349,7 +349,7 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
         await db.query("INSERT INTO payment_orders(id,user_id,mode,pack_key,product_id,amount_cny,currency,idempotency_key,target,state,credited_at) VALUES($1,$2,'prod','cny_100','fixture',100,'CNY',$1,'local','credited',now())",[payment,userId]);
         await db.query("INSERT INTO wallet_entries(id,user_id,amount_cny,balance_after_cny,source,payment_order_id) VALUES($1,$2,100,100,'payment',$3)",[randomUUID(),userId,payment]);
       }
-      await db.query("UPDATE commission_policy SET enabled=true,started_at=coalesce(started_at,now()),ends_at=coalesce(ends_at,now()+interval '1 year')");
+      await db.query("UPDATE commission_policy SET enabled=true");
       for(const method of ['plugin','skill','forged']) {
         const response=await app.inject({url:'/v1/chat/completions',method:'POST',
           payload:{model:'test-model',messages:[{role:'user',content:'fixture'}]},
@@ -364,7 +364,7 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
         const row=(await db.query('SELECT * FROM commission_requests WHERE request_id=$1',[id])).rows[0];
         assert.equal(row.bd_user_id,bd); assert.equal(row.bd_cny,'20.00000000');
         assert.equal(row.developer_user_id,method==='forged'?null:ownerId);
-        assert.equal(row.developer_cny,method==='forged'?'0.00000000':'35.00000000');
+        assert.equal(row.developer_cny,method==='forged'?'0.00000000':'16.00000000');
         assert.equal((await db.query('SELECT count(*) FROM plugin_earnings WHERE request_id=$1',[id])).rows[0].count,'0');
       }
     });

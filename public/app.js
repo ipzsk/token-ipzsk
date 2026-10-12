@@ -10,7 +10,11 @@ const number = (v) => v === null || v === undefined ? '—' : Number(v).toLocale
 const money = (v) => v === null || v === undefined ? '未同步' : Number(v).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2})+' 元';
 const charge = (v) => v === null || v === undefined ? '待核实' : Number(v).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:8})+' 元';
 const time = (v) => v ? new Date(v).toLocaleString('zh-CN',{hour12:false}) : '尚无记录';
-const errors = {admin_login_required:'请重新登录。',invalid_password:'密码不正确。',invalid_charge:'请填写非负金额，最多 8 位小数。',charge_not_ready:'请求尚未完成或未发送上游，不能录入扣费。',invalid_api_token:'访问凭证无效。',rate_limited:'操作过于频繁，请稍后再试。',origin_denied:'请求来源不匹配，请使用正式管理台地址。',key_already_exists:'这把 Key 已在号池中。',already_exists:'名称或凭证已存在。',invalid_upstream_key:'请检查 APIMart Key 格式。',internal_error:'服务暂时不可用，请稍后再试。',invalid_models:'请填写至少一个有效模型名称。',invalid_base_url:'上游地址必须是合法的 https 地址，且不带查询参数。',invalid_provider_type:'不支持这个上游类型，请从下拉列表中选择。'};
+const errors = {admin_login_required:'请重新登录。',invalid_password:'密码不正确。',invalid_charge:'请填写非负金额，最多 8 位小数。',charge_not_ready:'请求尚未完成或未发送上游，不能录入扣费。',invalid_api_token:'访问凭证无效。',rate_limited:'操作过于频繁，请稍后再试。',origin_denied:'请求来源不匹配，请使用正式管理台地址。',key_already_exists:'这把 Key 已在号池中。',already_exists:'名称或凭证已存在。',invalid_upstream_key:'请检查 APIMart Key 格式。',internal_error:'服务暂时不可用，请稍后再试。',invalid_models:'请填写至少一个有效模型名称。',invalid_base_url:'上游地址必须是合法的 https 地址，且不带查询参数。',invalid_provider_type:'不支持这个上游类型，请从下拉列表中选择。',
+  invalid_reason:'请填写至少 5 个字的操作依据。',invalid_invitation_target:'请填写被邀请用户的邮箱或用户 ID。',invitation_target_not_found:'找不到这个已验证邮箱的网站账户，请让对方先注册并验证邮箱。',
+  invitation_already_pending:'该用户已有同身份的待接受邀请，请撤销或重发。',role_already_active:'该用户已经拥有这个身份。',invitation_not_pending:'邀请已被接受、撤销或过期。',
+  invitation_already_used:'邀请已被接受，不能重发。',bd_invitation_required:'BD 身份只能通过邀请开通。',invalid_display_name:'开发者名称最多 100 字。',
+  invalid_review_transition:'当前状态不能这样处理，批准开发者请改用邀请。'};
 function el(tag,text,cls) { const n=document.createElement(tag); if(text!==undefined)n.textContent=text; if(cls)n.className=cls;return n; }
 function notice(message,error=false) { const n=$('#notice');n.textContent=message;n.hidden=false;n.className=error?'error':''; }
 function loginView() { $('#login-view').hidden=false;$('#console-view').hidden=true;document.querySelectorAll('dialog[open]').forEach((d)=>d.close()); }

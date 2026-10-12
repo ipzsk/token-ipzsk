@@ -1077,8 +1077,7 @@
     {
       "auth": "cookie_or_bearer",
       "errors": [
-        "developer_application_exists",
-        "invalid_plugin"
+        "developer_invitation_required"
       ],
       "method": "POST",
       "path": "/api/me/developer/apply"
@@ -1767,6 +1766,32 @@
       ],
       "method": "GET",
       "path": "/api/me/requests/:id"
+    },
+    {
+      "auth": "cookie",
+      "errors": [
+        "customer_login_required"
+      ],
+      "method": "GET",
+      "path": "/api/me/role-invitations",
+      "response": "MyRoleInvitations"
+    },
+    {
+      "auth": "cookie",
+      "body": "RoleInvitationAccept",
+      "body_shape": "{ token: string }",
+      "errors": [
+        "customer_login_required",
+        "invalid_invitation_token",
+        "invitation_account_mismatch",
+        "invitation_already_used",
+        "invitation_expired",
+        "invitation_not_found",
+        "invitation_revoked"
+      ],
+      "method": "POST",
+      "path": "/api/me/role-invitations/accept",
+      "response": "RoleInvitationAccepted"
     },
     {
       "auth": "cookie_or_bearer",
@@ -3638,6 +3663,12 @@
       ]
     },
     {
+      "code": "bd_invitation_required",
+      "status": [
+        409
+      ]
+    },
+    {
       "code": "billing_not_pending",
       "status": [
         409
@@ -3788,12 +3819,6 @@
       ]
     },
     {
-      "code": "commission_campaign_expired",
-      "status": [
-        409
-      ]
-    },
-    {
       "code": "commission_sources_migration_required",
       "status": [
         409
@@ -3855,15 +3880,15 @@
       ]
     },
     {
-      "code": "developer_application_exists",
-      "status": [
-        409
-      ]
-    },
-    {
       "code": "developer_approval_required",
       "status": [
         400,
+        403
+      ]
+    },
+    {
+      "code": "developer_invitation_required",
+      "status": [
         403
       ]
     },
@@ -4271,6 +4296,12 @@
       ]
     },
     {
+      "code": "invalid_display_name",
+      "status": [
+        400
+      ]
+    },
+    {
       "code": "invalid_email",
       "status": [
         400
@@ -4368,6 +4399,24 @@
     },
     {
       "code": "invalid_input",
+      "status": [
+        400
+      ]
+    },
+    {
+      "code": "invalid_invitation_role",
+      "status": [
+        400
+      ]
+    },
+    {
+      "code": "invalid_invitation_target",
+      "status": [
+        400
+      ]
+    },
+    {
+      "code": "invalid_invitation_token",
       "status": [
         400
       ]
@@ -4701,6 +4750,12 @@
       ]
     },
     {
+      "code": "invalid_review_transition",
+      "status": [
+        409
+      ]
+    },
+    {
       "code": "invalid_revision",
       "status": [
         400
@@ -4836,6 +4891,54 @@
       "code": "invalid_workspace_prompt",
       "status": [
         400
+      ]
+    },
+    {
+      "code": "invitation_account_mismatch",
+      "status": [
+        403
+      ]
+    },
+    {
+      "code": "invitation_already_pending",
+      "status": [
+        409
+      ]
+    },
+    {
+      "code": "invitation_already_used",
+      "status": [
+        409
+      ]
+    },
+    {
+      "code": "invitation_expired",
+      "status": [
+        410
+      ]
+    },
+    {
+      "code": "invitation_not_found",
+      "status": [
+        404
+      ]
+    },
+    {
+      "code": "invitation_not_pending",
+      "status": [
+        409
+      ]
+    },
+    {
+      "code": "invitation_revoked",
+      "status": [
+        410
+      ]
+    },
+    {
+      "code": "invitation_target_not_found",
+      "status": [
+        404
       ]
     },
     {
@@ -5245,6 +5348,12 @@
       "code": "request_not_found",
       "status": [
         404
+      ]
+    },
+    {
+      "code": "role_already_active",
+      "status": [
+        409
       ]
     },
     {

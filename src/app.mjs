@@ -25,6 +25,7 @@ import { adminStudioRoutes } from './admin-studio.mjs';
 import { adminOpsRoutes } from './admin-ops.mjs';
 import { paymentRoutes } from './payments.mjs';
 import { commissionRoutes } from './commissions.mjs';
+import { roleInvitationRoutes } from './role-invitations.mjs';
 
 export async function createApp(options) {
   const app = Fastify({ logger: options.logger ?? false, logController:new LogController({ disableRequestLogging:true }),
@@ -100,6 +101,7 @@ export async function createApp(options) {
   billingRoutes(app,options);
   earningsRoutes(app,options);
   commissionRoutes(app,options);
+  roleInvitationRoutes(app,options);
   adminAccountRoutes(app,options);
   pluginRoutes(app,options);
   developerRoutes(app,options);

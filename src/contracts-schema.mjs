@@ -251,6 +251,16 @@ export const schemas = {
   // ── 角色 ──
   Role: lit('admin', 'operator', 'viewer'),
   RolesResponse: object({ roles: array(ref('Role')) }),
+  // BD / 插件开发者身份只能接受管理员邀请取得。token 来自邀请链接的 #invite= 片段（不进 URL 查询串与服务端日志），只能被绑定账号使用一次。
+  InvitationRole: lit('bd', 'developer'),
+  RoleInvitationAccept: object({ token: string }),
+  RoleInvitationAccepted: object({ role: ref('InvitationRole'), state: lit('accepted') }),
+  MyRoleInvitations: object({
+    bd_active: boolean,
+    developer_state: nullable(lit('pending', 'approved', 'rejected', 'disabled')),
+    // 仅列出发给本人、仍有效的待接受邀请；不含令牌，接受仍须打开管理员发出的链接。
+    pending: array(object({ id: uuid, role: ref('InvitationRole'), created_at: datetime, expires_at: datetime })),
+  }),
 
   // ── 管理中台（docs/admin-api.md） ──
   UserRef: object({ id: uuid, email: nullable(string), name: opt(nullable(string)) }),

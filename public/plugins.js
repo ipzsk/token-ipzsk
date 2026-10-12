@@ -17,8 +17,8 @@ export function setupPlugins({api,action,el,table,cell,button,rowActions,charge,
       const tab=button(label,async()=>{view=id;await refresh();},view===id?'primary':'secondary');tab.setAttribute('aria-pressed',String(view===id));tabs.append(tab);
     }
     if(view==='review'){
-      section.append(el('h2','开发者申请'));const box=el('div',undefined,'table-wrap');section.append(box);
-      table(box,['申请人','账号','操作'],pending.map(d=>[d.display_name,d.email,rowActions(...[['approved','批准'],['rejected','驳回']].map(([state,label])=>button(label,async()=>{const note=state==='rejected'?prompt('驳回原因'):'';if(note===null)return;await api('/developers/'+d.user_id+'/review','POST',{state,review_note:note});await refresh();})))]));
+      section.append(el('h2','旧版开发者申请'),el('p','开发者改为邀请制，自助申请入口已关闭。确认要开通的申请人，请到「分佣与提现 · BD 与插件开发者邀请」按其邮箱发起邀请；其余可驳回。','footnote'));const box=el('div',undefined,'table-wrap');section.append(box);
+      table(box,['申请人','账号','操作'],pending.map(d=>[d.display_name,d.email,button('驳回',async()=>{const note=prompt('驳回原因');if(note===null)return;await api('/developers/'+d.user_id+'/review','POST',{state:'rejected',review_note:note});await refresh();})]));
       section.append(el('h2','版本申请'));const versions=el('div',undefined,'table-wrap');section.append(versions);
       table(versions,['插件','版本','申请事项','操作'],queue.releases.map(r=>[r.plugin_name,r.version,r.withdrawal_requested?'申请下架':'申请上架',button('审核',()=>openReleases(plugins.find(p=>p.id===r.plugin_id)))]));
       return;
@@ -29,10 +29,9 @@ export function setupPlugins({api,action,el,table,cell,button,rowActions,charge,
         const d=dialog(p.name);d.append(el('p',p.owner_user_id?'管理插件发布、归属与运行设置。':'请先绑定已批准的开发者。','footnote'),rowActions(button('归属与分成',()=>{d.close();return ownership(p,developers);}),button('设置',()=>{d.close();return settings(p);}),button(p.enabled?'停用插件':'启用插件',async()=>{await api('/plugins/'+p.id+'/settings','POST',{...p,enabled:!p.enabled});d.close();await refresh();})));
       }))]));
       const details=el('details'),summary=el('summary','开发者管理');details.append(summary);const devBox=el('div',undefined,'table-wrap');details.append(devBox);section.append(details);
-      table(devBox,['开发者','账号','状态','操作'],developers.map(d=>[d.display_name,d.email,stateName[d.state],button(d.state==='approved'?'停用':'查看',async()=>{
-        if(d.state==='approved'){await api('/developers/'+d.user_id+'/review','POST',{state:'disabled'});await refresh();}
-        else {const modal=dialog(d.display_name);modal.append(el('p',d.review_note||stateName[d.state]),button('批准',async()=>{await api('/developers/'+d.user_id+'/review','POST',{state:'approved'});modal.close();await refresh();}));}
-      })]));
+      table(devBox,['开发者','账号','状态','操作'],developers.map(d=>[d.display_name,d.email,stateName[d.state],d.state==='approved'?button('停用',async()=>{
+        if(!confirm('停用后该开发者立即失去开发者中心权限，恢复需重新邀请。'))return;await api('/developers/'+d.user_id+'/review','POST',{state:'disabled'});await refresh();
+      }):(d.review_note||'恢复需重新邀请')]));
       const create=el('details');create.append(el('summary','手动登记插件'));const form=el('form'),fields={slug:input('插件标识'),name:input('名称'),repository:input('GitHub 仓库（owner/repo）'),package_name:input('npm 包名')};
       for(const f of Object.values(fields)){f.n.required=true;form.append(f.l);}const submit=el('button','登记','primary');submit.type='submit';form.append(submit);
       form.addEventListener('submit',action(async e=>{e.preventDefault();const body=Object.fromEntries(Object.entries(fields).map(([k,f])=>[k,f.n.value]));await api('/plugins','POST',{...body,publisher_ref:body.name,allowed_models:[]});await refresh();}));create.append(form);section.append(create);return;
