@@ -71,11 +71,13 @@ export async function reconcileCommissions(db) {
   const rows = (await db.query(`SELECT s.request_id FROM commission_requests s JOIN requests r ON r.id=s.request_id
     JOIN commission_accounts a ON a.user_id=r.user_id JOIN request_billing b ON b.request_id=r.id
     WHERE s.state NOT IN ('disputed','accrued','historical_sources_review') AND a.sources_confirmed AND b.state IN ('settled','released')
-      AND (s.state<>'pending_cost' OR r.cost_cny IS NOT NULL OR b.charged_cny=b.refunded_cny)
       AND (s.state<>'pending_sources' OR (SELECT coalesce(sum(remaining_cny),0) FROM commission_funds WHERE user_id=r.user_id)>=b.charged_cny)
     ORDER BY s.created_at LIMIT 200`)).rows;
   for (const row of rows) await db.tx(c => c.query('SELECT commission_reconcile($1)', [row.request_id]));
-  if (!(await db.query('SELECT enabled FROM commission_policy WHERE id=1')).rows[0]?.enabled) return;
+  const policy = (await db.query(`UPDATE commission_policy SET enabled=false
+    WHERE id=1 AND enabled AND ends_at IS NOT NULL AND ends_at<=now() RETURNING *`)).rows[0]
+    ?? (await db.query('SELECT * FROM commission_policy WHERE id=1')).rows[0];
+  if (!policy?.enabled || !policy.started_at || !policy.ends_at) return;
   const users = (await db.query(`SELECT f.user_id FROM referrals f WHERE
     (CASE WHEN coalesce((SELECT sum(p.amount_cny) FROM payment_orders p WHERE p.user_id=f.user_id AND p.mode='prod' AND p.credited_at IS NOT NULL),0)
       -coalesce((SELECT sum(x.amount_cny) FROM commission_payment_refunds x JOIN payment_orders p ON p.id=x.payment_order_id WHERE p.user_id=f.user_id),0)>10 THEN 5 ELSE 0 END)
@@ -146,8 +148,9 @@ export function commissionRoutes(app, options) {
     return reply.redirect('https://www.ipzsk.com/account?mode=register');
   });
   app.get('/api/me/commissions', async req => {
-    const id = login(req), p = await profile(db, id);
-    return { profile: p, invitation_url: `${options.origin}/api/account/referral/${p.code}`, balance: await commissionBalance(db, id),
+    const id = login(req), p = await profile(db, id), policy = (await db.query(`SELECT bd_share_bps,developer_share_bps,started_at,ends_at,
+      enabled AND started_at IS NOT NULL AND now()>=started_at AND now()<ends_at AS active FROM commission_policy WHERE id=1`)).rows[0];
+    return { profile: p, policy, invitation_url: `${options.origin}/api/account/referral/${p.code}`, balance: await commissionBalance(db, id),
       ledger: (await db.query('SELECT kind,amount_cny,available_at,created_at,request_id FROM commission_ledger WHERE user_id=$1 ORDER BY id DESC LIMIT 100', [id])).rows,
       referrals: (await db.query('SELECT count(*)::integer AS count FROM referrals WHERE referrer_id=$1', [id])).rows[0].count,
       payouts: (await db.query('SELECT * FROM commission_payouts WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50', [id])).rows,
@@ -205,11 +208,18 @@ export function commissionRoutes(app, options) {
     if (typeof req.body?.enabled !== 'boolean') throw httpError(400, 'invalid_policy');
     const why = note(req.body.reason);
     await db.tx(async c => {
-      await c.query('SELECT id FROM commission_policy WHERE id=1 FOR UPDATE');
+      const policy = (await c.query('SELECT * FROM commission_policy WHERE id=1 FOR UPDATE')).rows[0];
       if (req.body.enabled && (await c.query('SELECT 1 FROM commission_accounts WHERE NOT sources_confirmed LIMIT 1')).rowCount)
         throw httpError(409, 'commission_sources_migration_required');
-      await c.query('UPDATE commission_policy SET enabled=$1 WHERE id=1', [req.body.enabled]);
-      await audit(c, req, 'commission.policy', null, { enabled: req.body.enabled, reason: why });
+      if (req.body.enabled && policy.ends_at && (await c.query('SELECT $1::timestamptz<=now() AS expired', [policy.ends_at])).rows[0].expired)
+        throw httpError(409, 'commission_campaign_expired');
+      const saved = (await c.query(`UPDATE commission_policy SET enabled=$1,
+        started_at=CASE WHEN $1 AND started_at IS NULL THEN now() ELSE started_at END,
+        ends_at=CASE WHEN $1 AND ends_at IS NULL THEN now()+interval '1 year' ELSE ends_at END
+        WHERE id=1 RETURNING *`, [req.body.enabled])).rows[0];
+      await audit(c, req, 'commission.policy', null, { enabled: req.body.enabled, reason: why,
+        bd_share_bps: saved.bd_share_bps, developer_share_bps: saved.developer_share_bps,
+        started_at: saved.started_at, ends_at: saved.ends_at });
     });
     return { ok: true };
   });
@@ -321,7 +331,7 @@ export function commissionRoutes(app, options) {
       for (const rid of affected) {
         if ((await c.query(`SELECT 1 FROM commission_allocations a JOIN commission_funds f ON f.id=a.fund_id
           JOIN payment_orders p ON p.id=f.payment_order_id WHERE a.request_id=$1 AND p.state='refund_review' LIMIT 1`, [rid])).rowCount) continue;
-        await c.query("UPDATE commission_requests SET state='pending_cost' WHERE request_id=$1 AND state='disputed'", [rid]);
+        await c.query("UPDATE commission_requests SET state='pending_billing' WHERE request_id=$1 AND state='disputed'", [rid]);
         await c.query('SELECT commission_reconcile($1)', [rid]);
       }
       await reconcileInvitation(c, order.user_id);

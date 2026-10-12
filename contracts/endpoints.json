@@ -3788,6 +3788,12 @@
       ]
     },
     {
+      "code": "commission_campaign_expired",
+      "status": [
+        409
+      ]
+    },
+    {
       "code": "commission_sources_migration_required",
       "status": [
         409

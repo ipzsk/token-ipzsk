@@ -47,7 +47,7 @@ test('desktop Skill call → gateway receipt → BD and developer balances', { t
       VALUES($1,'chain-plugin','Plugin','fixture/plugin','fixture-runtime','fixture',$2,ARRAY['gpt-5.6-sol','gpt-image-2'],'fixture-runtime','{"endpoint":"https://api.ipzsk.com/v1"}','[["apiKey"]]')`, [runtimePlugin, ids.developer]);
     await db.query('INSERT INTO referral_profiles(user_id,bd_active) VALUES($1,true)', [ids.bd]);
     await db.query('INSERT INTO referrals(user_id,referrer_id) VALUES($1,$2)', [ids.buyer, ids.bd]);
-    await db.query('UPDATE commission_policy SET enabled=true');
+    await db.query("UPDATE commission_policy SET enabled=true,started_at=coalesce(started_at,now()),ends_at=coalesce(ends_at,now()+interval '1 year')");
     for (let i = 0; i < 5; i++) {
       const payment = randomUUID();
       await db.query("INSERT INTO payment_orders(id,user_id,mode,pack_key,product_id,amount_cny,currency,idempotency_key,target,state,credited_at) VALUES($1,$2,'prod','cny_100','fixture',100,'CNY',$1,'local','credited',now())", [payment, ids.buyer]);
@@ -158,8 +158,8 @@ test('desktop Skill call → gateway receipt → BD and developer balances', { t
       await recordLanehubCharge(db, lanehub, row, { usdCnyRate: 1, quotaPerUnit: 1 });
     }
     const snapshots = (await db.query('SELECT bd_cny,developer_cny FROM commission_requests ORDER BY created_at,request_id')).rows;
-    assert.deepEqual(snapshots.map(r => r.bd_cny), Array(5).fill('12.00000000'));
-    assert.deepEqual(snapshots.map(r => r.developer_cny).sort(), ['0.00000000', '0.00000000', '19.20000000', '19.20000000', '19.20000000']);
+    assert.deepEqual(snapshots.map(r => r.bd_cny), Array(5).fill('20.00000000'));
+    assert.deepEqual(snapshots.map(r => r.developer_cny).sort(), ['0.00000000', '0.00000000', '35.00000000', '35.00000000', '35.00000000']);
     assert.equal((await db.query('SELECT count(*) FROM commission_ledger')).rows[0].count, '8');
     assert.equal((await db.query('SELECT count(*) FROM commission_ledger WHERE user_id=$1',[otherDeveloper])).rows[0].count,'0');
     for (const [role, total, kind] of [['bd', '60.00000000', 'bd'], ['developer', '57.60000000', 'developer']]) {

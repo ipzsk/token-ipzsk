@@ -26,7 +26,9 @@ export function setupCommissions({api,action,el,table,cell,button,charge,time,no
   const receipt=[['reference','核对依据或银行流水号（至少 5 字）']];
   async function refresh() {
     const data=await api('/commissions');section.replaceChildren();
-    const policy=panel('利润分佣');policy.append(el('p',`当前${data.policy.enabled?'已启用':'未启用'}。仅新请求使用新规则。BD 先分利润 20%，作者再分剩余利润 40%。未知成本或来源挂起。`));
+    const percent=value=>`${Number(value)/100}%`;
+    const period=data.policy.started_at&&data.policy.ends_at?`${new Date(data.policy.started_at).toLocaleDateString('zh-CN')} 至 ${new Date(data.policy.ends_at).toLocaleDateString('zh-CN')}`:'首次启用后持续一年';
+    const policy=panel('API 消费分佣');policy.append(el('p',`当前${data.policy.enabled?'已启用':'未启用'}。有效付费 API 消费中，BD 分 ${percent(data.policy.bd_share_bps)}，插件开发者分 ${percent(data.policy.developer_share_bps)}；赠送额度不分佣。活动期：${period}。`));
     policy.append(button(data.policy.enabled?'暂停新请求计佣':'启用新请求计佣',()=>ask('确认切换计佣规则',reason,b=>api('/commissions/policy','POST',{...b,enabled:!data.policy.enabled}))),button('重新核对待处理账目',action(async()=>{await api('/commissions/reconcile','POST',{});await refresh();})));
     const profiles=panel('邀请人、BD 与收益冻结');const list=el('div');profiles.append(list);
     table(list,['用户','邀请身份','收益状态','操作'],data.profiles.map(p=>[cell(p.name,p.user_id),p.bd_active?'BD':'普通邀请人',p.frozen?'冻结':'正常',(()=>{const actions=el('div');actions.append(

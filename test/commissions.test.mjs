@@ -10,10 +10,10 @@ import { hash, httpError } from '../src/security.mjs';
 import { recordLanehubCharge, reconcileLanehubCharges } from '../src/lanehub-charges.mjs';
 
 test('signed financial amounts round-trip without changing fractional sign', () => {
-  for (const value of ['-0.00000001', '-5.50000000', '0.00000000', '19.20000000']) assert.equal(decimal(units(value)), value);
+  for (const value of ['-0.00000001', '-5.50000000', '0.00000000', '35.00000000']) assert.equal(decimal(units(value)), value);
 });
 
-test('profit commission lifecycle in isolated PostgreSQL', async t => {
+test('paid API consumption commission lifecycle in isolated PostgreSQL', async t => {
   assert.ok(process.env.TEST_DB_HOST, 'TEST_DB_HOST must select the isolated gateway_test database');
   const config = { host: process.env.TEST_DB_HOST, port: Number(process.env.TEST_DB_PORT ?? 5432), database: 'gateway_test', user: 'gateway', password: process.env.TEST_DB_PASSWORD };
   const setup = database(config), schema = 'commissions_' + randomUUID().replaceAll('-', '');
@@ -50,7 +50,6 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
     await db.query("INSERT INTO plugins(id,slug,name,repository,package_name,publisher_ref,owner_user_id,price_per_call_cny) VALUES($1,'fixture','Fixture','test/test','fixture','fixture',$2,9)", [plugin, developer]);
     await db.query('INSERT INTO referral_profiles(user_id,bd_active) VALUES($1,true)', [bd]);
     await db.query('INSERT INTO referrals(user_id,referrer_id) VALUES($1,$2)', [consumer, bd]);
-    await db.query('UPDATE commission_policy SET enabled=true');
     await db.query("INSERT INTO administrators(id,password_hash) VALUES(1,'fixture')");
     await db.query("INSERT INTO admin_sessions(token_hash,expires_at,administrator_id) VALUES($1,now()+interval '1 hour',1)", [hash('commission-fixture')]);
     app = await createApp({ db, origin: 'https://api.ipzsk.com', upstream: {}, scheduler: {}, customerAuth: {
@@ -61,11 +60,20 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
     } });
     const post = (url, payload, cookie = 'bd') => app.inject({ method: 'POST', url, payload, headers: { cookie, origin: 'https://api.ipzsk.com' } });
     const adminPost = (url, payload) => post('/admin/api/commissions/' + url, payload, 'gateway_session=commission-fixture');
-    await t.test('cost 40, charge 100: BD 12 then author 19.2; idempotent and no fixed Skill fee', async () => {
+    await t.test('first enable starts one calendar year with fixed 20% BD and 35% developer rates', async () => {
+      const response = await adminPost('policy', { enabled: true, reason: 'start one year fixture campaign' });
+      assert.equal(response.statusCode, 200, response.body);
+      const policy = (await db.query(`SELECT enabled,bd_share_bps,developer_share_bps,started_at,ends_at,
+        ends_at=started_at+interval '1 year' AS one_year FROM commission_policy WHERE id=1`)).rows[0];
+      assert.deepEqual({ enabled: policy.enabled, bd: policy.bd_share_bps, developer: policy.developer_share_bps, oneYear: policy.one_year },
+        { enabled: true, bd: 2000, developer: 3500, oneYear: true });
+      assert.ok(policy.started_at); assert.ok(policy.ends_at);
+    });
+    await t.test('paid API consumption gives BD 20% and plugin developer 35%; idempotent and no fixed Skill fee', async () => {
       await credit(consumer, '100');
       const id = await request(consumer, '100', '40');
-      assert.equal((await snapshot(id)).bd_cny, '12.00000000');
-      assert.equal((await snapshot(id)).developer_cny, '19.20000000');
+      assert.equal((await snapshot(id)).bd_cny, '20.00000000');
+      assert.equal((await snapshot(id)).developer_cny, '35.00000000');
       await db.tx(c => accrueEarning(c, id));
       await db.query("INSERT INTO plugin_skills(skill_ref,plugin_id,display_name) VALUES('fixture',$1,'Fixture')", [plugin]);
       await db.tx(c => recordSkillInvocations(c, id, ['fixture']));
@@ -73,10 +81,10 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       assert.equal((await db.query('SELECT count(*) FROM plugin_earnings WHERE request_id=$1', [id])).rows[0].count, '0');
       assert.equal((await db.query('SELECT count(*) FROM commission_ledger WHERE request_id=$1', [id])).rows[0].count, '2');
       await db.query('UPDATE requests SET cost_cny=50 WHERE id=$1', [id]);
-      assert.equal((await snapshot(id)).bd_cny, '10.00000000');
+      assert.equal((await snapshot(id)).bd_cny, '20.00000000');
       await db.query('UPDATE request_billing SET refunded_cny=20 WHERE request_id=$1', [id]);
-      assert.equal((await snapshot(id)).bd_cny, '6.00000000');
-      assert.equal((await snapshot(id)).developer_cny, '9.60000000');
+      assert.equal((await snapshot(id)).bd_cny, '16.00000000');
+      assert.equal((await snapshot(id)).developer_cny, '28.00000000');
       await db.query('UPDATE request_billing SET refunded_cny=100 WHERE request_id=$1', [id]);
       assert.equal((await snapshot(id)).bd_cny, '0.00000000');
       assert.equal((await snapshot(id)).developer_cny, '0.00000000');
@@ -87,20 +95,21 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       await db.query('INSERT INTO referrals(user_id,referrer_id) VALUES($1,$2)', [id, bd]);
       const rid = await request(id, '100', '40');
       assert.equal((await snapshot(rid)).paid_cny, '80.00000000');
-      assert.equal((await snapshot(rid)).bd_cny, '9.60000000');
-      assert.equal((await snapshot(rid)).developer_cny, '15.36000000');
+      assert.equal((await snapshot(rid)).bd_cny, '16.00000000');
+      assert.equal((await snapshot(rid)).developer_cny, '28.00000000');
       await db.query('UPDATE request_billing SET refunded_cny=50 WHERE request_id=$1', [rid]);
-      assert.equal((await snapshot(rid)).bd_cny, '1.60000000');
-      assert.equal((await snapshot(rid)).developer_cny, '2.56000000');
+      assert.equal((await snapshot(rid)).bd_cny, '8.00000000');
+      assert.equal((await snapshot(rid)).developer_cny, '14.00000000');
       const sources = (await db.query('SELECT paid,sum(remaining_cny)::numeric(20,8) AS amount FROM commission_funds WHERE user_id=$1 GROUP BY paid ORDER BY paid', [id])).rows;
       assert.deepEqual(sources.map(r => r.amount), ['10.00000000', '40.00000000']);
     });
-    await t.test('unknown cost stays pending; known zero is valid; bonus consumption and self consumption earn zero', async () => {
+    await t.test('actual upstream cost does not change consumption shares; bonus and self consumption earn zero', async () => {
       const id = await user(); await credit(id, '100');
       const rid = await request(id, '100', null);
-      assert.equal((await snapshot(rid)).state, 'pending_cost');
+      assert.equal((await snapshot(rid)).state, 'accrued');
+      assert.equal((await snapshot(rid)).developer_cny, '35.00000000');
       await db.query('UPDATE requests SET cost_cny=0 WHERE id=$1', [rid]);
-      assert.equal((await snapshot(rid)).developer_cny, '40.00000000');
+      assert.equal((await snapshot(rid)).developer_cny, '35.00000000');
       const bonus = await user(); await credit(bonus, '100', false);
       assert.equal((await snapshot(await request(bonus, '100', null))).developer_cny, '0.00000000');
       await credit(developer, '100');
@@ -149,7 +158,7 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       assert.equal(landing.statusCode, 302); assert.match(landing.headers['set-cookie'], /HttpOnly/);
       assert.equal((await post('/api/me/commissions/payouts', { idempotency_key: randomUUID(), amount_cny: '99' })).statusCode, 400);
     });
-    await t.test('confirmed unused recharge refund deducts wallet once, reverses invitation; consumed chargeback reverses profit', async () => {
+    await t.test('confirmed unused recharge refund deducts wallet once, reverses invitation; consumed chargeback reverses commission', async () => {
       const buyer = await user();
       await db.query('INSERT INTO referrals(user_id,referrer_id) VALUES($1,$2)', [buyer, bd]);
       const payment = await credit(buyer, '100');
@@ -161,7 +170,7 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       assert.equal((await adminPost('payment-refunds/' + payment, unused)).statusCode, 200);
       assert.equal((await wallet(db, buyer)).balance_cny, '90.00000000');
       const rid = await request(buyer, '90', '36');
-      assert.equal((await snapshot(rid)).bd_cny, '10.80000000');
+      assert.equal((await snapshot(rid)).bd_cny, '18.00000000');
       await db.query("UPDATE payment_orders SET state='refund_review' WHERE id=$1", [payment]);
       assert.equal((await snapshot(rid)).state, 'disputed');
       assert.equal((await commissionBalance(db, bd)).frozen, true);
@@ -180,10 +189,10 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       await credit(buyer, '100');
       const before = await request(buyer, '50', '20');
       assert.equal((await snapshot(before)).bd_cny, '0.00000000');
-      assert.equal((await snapshot(before)).developer_cny, '12.00000000');
+      assert.equal((await snapshot(before)).developer_cny, '17.50000000');
       await db.query('UPDATE referral_profiles SET bd_active=true WHERE user_id=$1', [inviter]);
       const after = await request(buyer, '50', '20');
-      assert.equal((await snapshot(after)).bd_cny, '6.00000000');
+      assert.equal((await snapshot(after)).bd_cny, '10.00000000');
       assert.equal((await snapshot(before)).bd_user_id, null);
       await db.query('UPDATE commission_policy SET enabled=false');
       const oldBuyer = await user(); await credit(oldBuyer, '100');
@@ -191,7 +200,7 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       await db.tx(c => accrueEarning(c, legacy));
       assert.equal((await snapshot(legacy)).enabled, false);
       assert.equal((await db.query('SELECT amount_cny FROM plugin_earnings WHERE request_id=$1', [legacy])).rows[0].amount_cny, '9.00000000');
-      await db.query('UPDATE commission_policy SET enabled=true');
+      await db.query("UPDATE commission_policy SET enabled=true,started_at=coalesce(started_at,now()),ends_at=coalesce(ends_at,now()+interval '1 year')");
     });
     await t.test('historical opening balance requires verified paid sources and an idle account', async () => {
       await db.query('UPDATE commission_policy SET enabled=false');
@@ -203,10 +212,10 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       assert.equal(result.statusCode, 200, result.body);
       assert.equal(result.json().balance_cny, '105.00000000');
       assert.equal((await db.query('SELECT sum(remaining_cny)::numeric(20,8) AS amount FROM commission_funds WHERE user_id=$1', [buyer])).rows[0].amount, '105.00000000');
-      await db.query('UPDATE commission_policy SET enabled=true');
+      await db.query("UPDATE commission_policy SET enabled=true,started_at=coalesce(started_at,now()),ends_at=coalesce(ends_at,now()+interval '1 year')");
       const rid = await request(buyer, '105', '42');
       assert.equal((await snapshot(rid)).paid_cny, '100.00000000');
-      assert.equal((await snapshot(rid)).developer_cny, '24.00000000');
+      assert.equal((await snapshot(rid)).developer_cny, '35.00000000');
       assert.equal((await adminPost('opening-balance/' + buyer, body)).statusCode, 409);
     });
     await t.test('unconfirmed historical consumption is isolated from a new checkpoint, including disabled-policy usage', async () => {
@@ -237,7 +246,7 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       assert.equal((await db.query('SELECT sum(remaining_cny)::numeric(20,8) AS amount FROM commission_funds WHERE user_id=$1', [buyer])).rows[0].amount, '70.00000000');
       assert.equal((await adminPost('policy', { enabled: true, reason: 'all sources now confirmed' })).statusCode, 200);
       const fresh = await request(buyer, '70', '28');
-      assert.equal((await snapshot(fresh)).developer_cny, '16.80000000');
+      assert.equal((await snapshot(fresh)).developer_cny, '24.50000000');
       assert.equal((await db.query('SELECT count(*) FROM commission_allocations WHERE request_id=ANY($1::uuid[])', [[old,disabled]])).rows[0].count, '0');
       await db.query('UPDATE commission_policy SET enabled=false');
       assert.equal((await adminPost('opening-balance/' + buyer, body)).statusCode, 409, 'cannot erase real allocations');
@@ -246,7 +255,7 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       assert.equal((await adminPost('opening-balance/' + missing, { reference: 'inflight request must remain blocked', paid_lots: [] })).statusCode, 409);
       await db.query("UPDATE requests SET status='succeeded' WHERE user_id=$1",[missing]);
       assert.equal((await adminPost('opening-balance/' + missing, { reference: 'no bill must remain blocked', paid_lots: [] })).statusCode, 409);
-      await db.query('UPDATE commission_policy SET enabled=true');
+      await db.query("UPDATE commission_policy SET enabled=true,started_at=coalesce(started_at,now()),ends_at=coalesce(ends_at,now()+interval '1 year')");
     });
     await t.test('LaneHub receipts backfill delayed real cost exactly once, preserve FX and reject unsafe attribution', async () => {
       const account = randomUUID(), key = randomUUID();
@@ -267,13 +276,13 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       const lanehub = { call: async () => ({ data: current, total_count: current.length }), usdRate: async () => fx };
       const options = { usdCnyRate: 1, quotaPerUnit: 1 };
       await recordLanehubCharge(db,lanehub,row,options);
-      assert.equal((await snapshot(row.id)).state, 'pending_cost');
+      assert.equal((await snapshot(row.id)).state, 'accrued');
       current = [{ ...log, cost_source: 'real' }]; fx = 7;
       const result = await reconcileLanehubCharges(db,lanehub,options);
       assert.equal(result.failed, 0);
       assert.equal((await db.query('SELECT cost_cny FROM requests WHERE id=$1', [row.id])).rows[0].cost_cny, '40.00000000', 'delayed receipt retains original FX');
-      assert.equal((await snapshot(row.id)).bd_cny, '12.00000000');
-      assert.equal((await snapshot(row.id)).developer_cny, '19.20000000');
+      assert.equal((await snapshot(row.id)).bd_cny, '20.00000000');
+      assert.equal((await snapshot(row.id)).developer_cny, '35.00000000');
       await Promise.all(Array.from({ length: 8 }, () => recordLanehubCharge(db,lanehub,row,options)));
       assert.equal((await db.query('SELECT count(*) FROM commission_ledger WHERE request_id=$1', [row.id])).rows[0].count, '2');
       assert.equal((await db.query("SELECT count(*) FROM audit_events WHERE target_id=$1 AND action='request.cost.sync'", [row.id])).rows[0].count, '1');
@@ -282,22 +291,23 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
         current = [{ ...log, cost_source: 'real', request_id: candidate.upstream_id, user_id: upstreamUser, ...bad }];
         try { await recordLanehubCharge(db,lanehub,candidate,options); } catch (error) { assert.match(error.message, /receipt/); }
         assert.equal((await db.query('SELECT cost_cny FROM requests WHERE id=$1', [candidate.id])).rows[0].cost_cny, null);
-        assert.equal((await snapshot(candidate.id)).developer_cny, '0.00000000');
+        const billed = (await db.query('SELECT 1 FROM request_billing WHERE request_id=$1 AND charged_cny>0', [candidate.id])).rowCount > 0;
+        assert.equal((await snapshot(candidate.id)).developer_cny, billed ? '35.00000000' : '0.00000000');
       }
       const mixed = await laneRequest();
       current = [{ ...log, id: 201, quota: 50, cost_source: 'real', request_id: mixed.upstream_id, user_id: upstreamUser },
         { ...log, id: 202, quota: 50, request_id: mixed.upstream_id, user_id: upstreamUser }];
       await recordLanehubCharge(db,lanehub,mixed,options);
-      assert.equal((await snapshot(mixed.id)).state, 'pending_cost', 'partial actual cost cannot stand for the whole request');
+      assert.equal((await snapshot(mixed.id)).state, 'accrued', 'partial actual cost does not block consumption commission');
       current = current.map(item => ({ ...item, quota: 60, cost_source: 'real' }));
       await recordLanehubCharge(db,lanehub,mixed,options);
-      assert.equal((await snapshot(mixed.id)).state, 'pending_cost', 'changed sales receipt must be reviewed');
+      assert.equal((await snapshot(mixed.id)).state, 'accrued', 'changed sales receipt does not change consumption commission');
       assert.equal((await db.query('SELECT reason,charged_cny FROM request_billing WHERE request_id=$1', [mixed.id])).rows[0].reason, 'lanehub_receipt_changed');
       const zero = await laneRequest();
       current = [{ ...log, request_id: zero.upstream_id, user_id: upstreamUser, cost_source: 'real', cost_quota: 0 }];
       await recordLanehubCharge(db,lanehub,zero,options);
       assert.equal((await snapshot(zero.id)).bd_cny, '20.00000000');
-      assert.equal((await snapshot(zero.id)).developer_cny, '32.00000000');
+      assert.equal((await snapshot(zero.id)).developer_cny, '35.00000000');
       const stale = await laneRequest();
       current = [];
       assert.equal(await recordLanehubCharge(db,lanehub,stale,options), 'pending');
@@ -307,8 +317,8 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
         VALUES($1,$2,'image','test','fixture','succeeded',0)`,[stale.user_id,stale.id]);
       current = [{ ...log, request_id: stale.upstream_id, user_id: upstreamUser, cost_source: 'real' }];
       await recordLanehubCharge(db,lanehub,stale,options);
-      assert.equal((await snapshot(stale.id)).bd_cny, '12.00000000', 'recover historical timeout releases without double allocation');
-      assert.equal((await snapshot(stale.id)).developer_cny, '19.20000000');
+      assert.equal((await snapshot(stale.id)).bd_cny, '20.00000000', 'recover historical timeout releases without double allocation');
+      assert.equal((await snapshot(stale.id)).developer_cny, '35.00000000');
       assert.equal((await db.query('SELECT charged_points FROM generation_records WHERE request_id=$1',[stale.id])).rows[0].charged_points,'10000.00000000','late charge replaces the historical zero shown in Studio');
       const scanned=[];
       const waiting={call:async path=>{scanned.push(new URL(path,'http://fixture.invalid').searchParams.get('request_id'));return {data:[]};},usdRate:async()=>1};
@@ -326,18 +336,18 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       await Promise.all(ids.map(id => db.query(`INSERT INTO request_billing(request_id,user_id,state,reserved_cny,charged_cny,price_snapshot)
         VALUES($1,$2,'settled',10,10,'{}')`, [id, buyer])));
       assert.equal((await db.query('SELECT sum(remaining_cny)::numeric(20,8) AS amount FROM commission_funds WHERE user_id=$1', [buyer])).rows[0].amount, '0.00000000');
-      assert.equal((await db.query('SELECT sum(developer_cny)::numeric(20,8) AS amount FROM commission_requests WHERE request_id=ANY($1::uuid[])', [ids])).rows[0].amount, '24.00000000');
+      assert.equal((await db.query('SELECT sum(developer_cny)::numeric(20,8) AS amount FROM commission_requests WHERE request_id=ANY($1::uuid[])', [ids])).rows[0].amount, '35.00000000');
     });
-    await t.test('simulation matrix: BD and author identities receive only their own eligible profit', async matrix => {
+    await t.test('simulation matrix: BD and author identities receive only their own eligible paid-consumption share', async matrix => {
       const cases = [
-        { name: 'paid with both identities', paid: '100', bonus: '0', cost: '40', bd: true, author: developer, expectedBd: '12', expectedDev: '19.2' },
-        { name: 'author without BD', paid: '100', bonus: '0', cost: '40', bd: false, author: developer, expectedBd: '0', expectedDev: '24' },
-        { name: 'BD without author', paid: '100', bonus: '0', cost: '40', bd: true, author: null, expectedBd: '12', expectedDev: '0' },
-        { name: 'mixed principal and grant', paid: '80', bonus: '20', cost: '40', bd: true, author: developer, expectedBd: '9.6', expectedDev: '15.36' },
+        { name: 'paid with both identities', paid: '100', bonus: '0', cost: '40', bd: true, author: developer, expectedBd: '20', expectedDev: '35' },
+        { name: 'author without BD', paid: '100', bonus: '0', cost: '40', bd: false, author: developer, expectedBd: '0', expectedDev: '35' },
+        { name: 'BD without author', paid: '100', bonus: '0', cost: '40', bd: true, author: null, expectedBd: '20', expectedDev: '0' },
+        { name: 'mixed principal and grant', paid: '80', bonus: '20', cost: '40', bd: true, author: developer, expectedBd: '16', expectedDev: '28' },
         { name: 'grant only', paid: '0', bonus: '100', cost: '40', bd: true, author: developer, expectedBd: '0', expectedDev: '0' },
-        { name: 'upstream loss', paid: '100', bonus: '0', cost: '120', bd: true, author: developer, expectedBd: '0', expectedDev: '0' },
-        { name: 'known free upstream', paid: '100', bonus: '0', cost: '0', bd: true, author: developer, expectedBd: '20', expectedDev: '32' },
-        { name: 'one unit rounding tail', paid: '0.00000005', bonus: '0', cost: '0.00000001', bd: true, author: developer, expectedBd: '0', expectedDev: '0.00000001' },
+        { name: 'upstream loss', paid: '100', bonus: '0', cost: '120', bd: true, author: developer, expectedBd: '20', expectedDev: '35' },
+        { name: 'known free upstream', paid: '100', bonus: '0', cost: '0', bd: true, author: developer, expectedBd: '20', expectedDev: '35' },
+        { name: 'one unit rounding tail', paid: '0.00000005', bonus: '0', cost: '0.00000001', bd: true, author: developer, expectedBd: '0.00000001', expectedDev: '0.00000001' },
       ];
       for (const fixture of cases) await matrix.test(fixture.name, async () => {
         const buyer = await user();
@@ -363,7 +373,7 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       const buyer = await user(); await credit(buyer, '100');
       await db.query('INSERT INTO referrals(user_id,referrer_id) VALUES($1,$2)', [buyer, bd]);
       const rid = await request(buyer, '100', '40');
-      for (const [cookie, kind, expected] of [['bd', 'bd', '12.00000000'], ['developer', 'developer', '19.20000000']]) {
+      for (const [cookie, kind, expected] of [['bd', 'bd', '20.00000000'], ['developer', 'developer', '35.00000000']]) {
         const response = await app.inject({ url: '/api/me/commissions?user_id=' + buyer, headers: { cookie } });
         assert.equal(response.statusCode, 200, response.body);
         const data = response.json();
@@ -388,15 +398,15 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       const after = await request(buyer, '100', '40', successor);
       await db.query('UPDATE requests SET cost_cny=50 WHERE id=$1', [before]);
       assert.equal((await snapshot(before)).developer_user_id, developer);
-      assert.equal((await snapshot(before)).bd_cny, '10.00000000');
+      assert.equal((await snapshot(before)).bd_cny, '20.00000000');
       assert.equal((await snapshot(after)).developer_user_id, successor);
       assert.equal((await snapshot(after)).bd_cny, '0.00000000');
-      assert.equal((await snapshot(after)).developer_cny, '24.00000000');
+      assert.equal((await snapshot(after)).developer_cny, '35.00000000');
       await db.query('UPDATE referral_profiles SET bd_active=true WHERE user_id=$1', [bd]);
       const dual = await request(buyer, '100', '40', bd);
-      assert.equal((await snapshot(dual)).bd_cny, '12.00000000');
-      assert.equal((await snapshot(dual)).developer_cny, '19.20000000');
-      assert.equal((await db.query('SELECT sum(amount_cny)::numeric(20,8) AS amount FROM commission_ledger WHERE request_id=$1 AND user_id=$2', [dual, bd])).rows[0].amount, '31.20000000');
+      assert.equal((await snapshot(dual)).bd_cny, '20.00000000');
+      assert.equal((await snapshot(dual)).developer_cny, '35.00000000');
+      assert.equal((await db.query('SELECT sum(amount_cny)::numeric(20,8) AS amount FROM commission_ledger WHERE request_id=$1 AND user_id=$2', [dual, bd])).rows[0].amount, '55.00000000');
       await db.query('UPDATE plugins SET owner_user_id=$1 WHERE id=$2', [developer, plugin]);
     });
     await t.test('micro-refunds never reclaim a previously returned and spent source unit', async () => {
@@ -424,7 +434,7 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       const resolved = await adminPost('payment-refunds/' + payment, { amount_cny: '1', chargeback: true, reference: 'dispute-before-settlement-fixture' });
       assert.equal(resolved.statusCode, 200, resolved.body);
       assert.equal((await snapshot(rid)).state, 'accrued');
-      assert.equal((await snapshot(rid)).developer_cny, '23.60000000');
+      assert.equal((await snapshot(rid)).developer_cny, '34.65000000');
     });
     await t.test('concurrent payment disputes and settlement serialize on the consumer in either order', async () => {
       for (const disputeFirst of [true, false]) {
@@ -485,14 +495,14 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
       await Promise.all(ids.map(id=>db.query(`INSERT INTO request_billing(request_id,user_id,state,reserved_cny,charged_cny,price_snapshot)
         VALUES($1,$2,'settled',1,1,'{}')`,[id,buyer])));
       const total=async()=> (await db.query('SELECT sum(bd_cny)::numeric(20,8) AS bd,sum(developer_cny)::numeric(20,8) AS dev FROM commission_requests WHERE request_id=ANY($1::uuid[])',[ids])).rows[0];
-      assert.deepEqual(await total(),{bd:'12.00000000',dev:'19.20000000'});
+      assert.deepEqual(await total(),{bd:'20.00000000',dev:'35.00000000'});
       await Promise.all(ids.slice(0,50).map(id=>db.query('UPDATE request_billing SET refunded_cny=1 WHERE request_id=$1',[id])));
-      assert.deepEqual(await total(),{bd:'6.00000000',dev:'9.60000000'});
+      assert.deepEqual(await total(),{bd:'10.00000000',dev:'17.50000000'});
       await Promise.all(ids.slice(50).map(id=>db.query('UPDATE requests SET cost_cny=2 WHERE id=$1',[id])));
-      assert.deepEqual(await total(),{bd:'0.00000000',dev:'0.00000000'});
+      assert.deepEqual(await total(),{bd:'10.00000000',dev:'17.50000000'});
       assert.equal((await db.query('SELECT sum(remaining_cny)::numeric(20,8) AS amount FROM commission_funds WHERE user_id=$1',[buyer])).rows[0].amount,'50.00000000');
       await Promise.all(ids.map(id=>db.query('SELECT commission_reconcile($1)',[id])));
-      assert.deepEqual(await total(),{bd:'0.00000000',dev:'0.00000000'});
+      assert.deepEqual(await total(),{bd:'10.00000000',dev:'17.50000000'});
     });
     await t.test('deterministic mixed-source refund simulations match an independent integer oracle', async () => {
       let seed=20261011;
@@ -504,8 +514,8 @@ test('profit commission lifecycle in isolated PostgreSQL', async t => {
         const rid=await request(buyer,'100',String(cost));
         for(const refund of [0,1,17,49,83,99,100]) {
           await db.query('UPDATE request_billing SET refunded_cny=$2 WHERE request_id=$1',[rid,refund]);
-          const profit=BigInt(Math.max(100-refund-cost,0))*80000000n;
-          const expectedBd=profit/5n, expectedDev=(profit-expectedBd)*2n/5n;
+          const netPaid=BigInt(100-refund)*80000000n;
+          const expectedBd=netPaid*2000n/10000n, expectedDev=netPaid*3500n/10000n;
           const actual=await snapshot(rid);
           assert.equal(actual.bd_cny,decimal(expectedBd),`trial ${trial}, refund ${refund}`);
           assert.equal(actual.developer_cny,decimal(expectedDev),`trial ${trial}, refund ${refund}`);
