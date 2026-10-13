@@ -101,10 +101,12 @@ export function developerRoutes(app,{db,githubFetch}){
    count(*) AS requests,count(*) FILTER(WHERE r.status='failed' OR t.status='failed') AS failed_requests,
    sum(r.input_tokens) AS input_tokens,sum(r.output_tokens) AS output_tokens,sum(r.total_tokens) AS total_tokens,
    count(*) FILTER(WHERE r.total_tokens IS NULL) AS unknown_token_requests,
-   sum(b.charged_cny-b.refunded_cny) FILTER(WHERE b.state='settled') AS billed_revenue_cny,
+   -- Revenue counts only payable attribution: bootstrap-credential requests (credential_unverified) never earn (COMMISSIONS.md).
+   sum(b.charged_cny-b.refunded_cny) FILTER(WHERE b.state='settled' AND r.plugin_attribution_state<>'credential_unverified') AS billed_revenue_cny,
    sum((SELECT coalesce(sum(pe.amount_cny),0) FROM plugin_earnings pe WHERE pe.request_id=r.id)
      +(SELECT coalesce(sum(cl.amount_cny),0) FROM commission_ledger cl WHERE cl.request_id=r.id AND cl.kind='developer' AND cl.user_id=$1)) AS accrued_earnings_cny,
-   count(*) FILTER(WHERE b.state='settled' AND r.plugin_share_bps IS NULL) AS unconfigured_share_requests,
+   count(*) FILTER(WHERE b.state='settled' AND r.plugin_share_bps IS NULL AND r.plugin_attribution_state<>'credential_unverified') AS unconfigured_share_requests,
+   count(*) FILTER(WHERE r.plugin_attribution_state='credential_unverified') AS unverified_attribution_requests,
    count(t.id) AS media_tasks,count(*) FILTER(WHERE t.status='completed') AS completed_media_tasks
    FROM requests r JOIN plugins p ON p.id=r.plugin_id LEFT JOIN request_billing b ON b.request_id=r.id LEFT JOIN media_tasks t ON t.id=r.id
    WHERE r.plugin_owner_user_id=$1 AND r.created_at>=($2::date::timestamp AT TIME ZONE 'Asia/Shanghai')

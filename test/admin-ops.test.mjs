@@ -28,7 +28,7 @@ const MATRIX = {
 };
 
 let userSeq = 0; // roles.mjs caches roles per user id for 30s, so each setup gets its own user.
-function setup({ lanehub = true, role = 'admin', handlers = {} } = {}) {
+function setup({ lanehub = true, role = 'admin', handlers = {}, fallbackRate = 7 } = {}) {
   const calls = [], audits = [], userId = 'u' + ++userSeq;
   const routes = {
     'GET /api/option/': () => ({ success: true, data: [{ key: 'PaymentUSDRate', value: '7' }] }),
@@ -53,7 +53,7 @@ function setup({ lanehub = true, role = 'admin', handlers = {} } = {}) {
   adminOpsRoutes(app, {
     db: { query: async (sql, args) => { audits.push({ action: args[0], target: args[1], details: JSON.parse(args[2]), actor: args[3] }); return { rows: [] }; } },
     lanehub: lanehub ? new Lanehub({ baseUrl: 'http://lanehub.test', adminToken: 't', fetcher }) : null,
-    lanehubUsdCny: 7, lanehubQuotaPerUnit: 500000,
+    lanehubUsdCny: fallbackRate, lanehubQuotaPerUnit: 500000,
   });
   app.decorate('userId', userId);
   return { app, calls, audits };
@@ -96,7 +96,7 @@ test('channels: explicit allowlist, lanes/vendor/balance_supported from matrix c
   assert.deepEqual(leaks(body), []);
   assert.deepEqual(body.items[0], { id: 2, name: 'fal-1', type: 99, status: 1, priority: 5, weight: 3, lanes: ['cheap'], vendor: 'Fal', balance_cny: null,
     balance_checked_at: null, balance_raw: null, balance_unit: 'raw', balance_supported: false, group: 'default,cheap', tag: 't', models_count: 3, used_cny: 14, created_at: 1690000000 });
-  assert.deepEqual([body.items[1].balance_supported, body.items[1].balance_unit], [true, 'raw'], 'unknown type → supported, raw');
+  assert.deepEqual([body.items[1].balance_supported, body.items[1].balance_unit], [false, 'raw'], 'unknown type → unavailable, raw');
   assert.equal(body.total, 2);
 });
 
@@ -138,34 +138,82 @@ test('probe: balance unit from the matrix type map (USD×rate, CNY as is, raw/un
   assert.deepEqual(got, [[70, 10, 'USD'], [10, 10, 'CNY'], [null, 10, 'raw'], [null, 10, 'raw']]);
 });
 
+test('probe: a successful upstream refresh stays successful when metadata or USD rate is unavailable', async () => {
+  const metaDown = setup({ handlers: {
+    'GET /api/channel/update_balance/99': () => ({ success: true, balance: 12 }),
+    'GET /api/lane_matrix': () => ({ success: false, message: 'matrix down' }),
+  } });
+  const a = (await metaDown.app.inject({ method: 'POST', url: '/api/admin/ops/channels/99/probe' })).json();
+  assert.deepEqual([a.state, a.balance_raw, a.balance_cny, a.balance_unit], ['ok', 12, null, 'raw']);
+  assert.match(a.message, /元数据暂时不可用/);
+
+  const rateDown = setup({ fallbackRate: 0, handlers: {
+    'GET /api/option/': () => ({ success: true, data: [] }),
+    'GET /api/channel/update_balance/1': () => ({ success: true, balance: 3 }),
+  } });
+  const b = (await rateDown.app.inject({ method: 'POST', url: '/api/admin/ops/channels/1/probe' })).json();
+  assert.deepEqual([b.state, b.balance_raw, b.balance_cny, b.balance_unit], ['ok', 3, null, 'USD']);
+  assert.match(b.message, /汇率暂时不可用/);
+});
+
 test('lane matrix save: validates, forwards, audits success and failure', async () => {
   let fail = false;
-  const { app, calls, audits } = setup({ handlers: { 'PUT /api/lane_matrix/batch': () => (fail ? { success: false, message: '渠道 #9：record not found' }
+  const { app, calls, audits } = setup({ handlers: { 'PUT /api/lane_matrix/batch': () => (fail ? { success: false, message: '渠道 #3：record not found' }
     : { success: true, data: [{ channel_id: 1, name: 'ch1', before: { group: 'official', priority: 10, status: 1 }, after: { group: 'official,cheap', priority: 20, status: 1 }, key: 'sk' }] }) } });
   const put = (body) => app.inject({ method: 'PUT', url: '/api/admin/ops/lane-matrix', payload: body });
+  const expected = { priority: 10, status: 1, lanes: ['official'] };
 
-  for (const body of [{}, { changes: [] }, { changes: [{ channel_id: 1, status: 3 }] }, { changes: [{ channel_id: 1.5 }] },
-    { changes: [{ channel_id: 1, lanes: [1] }] }, { changes: [{ channel_id: 1, extra: 1 }] }, { changes: Array.from({ length: 201 }, (_, i) => ({ channel_id: i + 1 })) }]) {
+  for (const body of [{}, { changes: [] }, { changes: [{ channel_id: 1, status: 3, expected }] }, { changes: [{ channel_id: 1.5, expected }] },
+    { changes: [{ channel_id: 1, lanes: [1], expected }] }, { changes: [{ channel_id: 1, extra: 1, expected }] },
+    // expected is required: without it a stale draft would silently overwrite someone else's change.
+    { changes: [{ channel_id: 1, priority: 20 }] }, { changes: [{ channel_id: 1, priority: 20, expected: { priority: 10 } }] },
+    { changes: [{ channel_id: 1, expected }] },
+    { changes: Array.from({ length: 201 }, (_, i) => ({ channel_id: i + 1, priority: 1, expected })) }]) {
     const r = await put(body);
     assert.equal(r.statusCode, 400, JSON.stringify(body));
     assert.equal(r.json().error.code, 'invalid_lane_changes');
   }
   assert.equal(calls.filter((c) => c.key.startsWith('PUT')).length, 0);
 
-  const changes = [{ channel_id: 1, priority: 20, lanes: ['official', 'cheap'] }];
+  const changes = [{ channel_id: 1, priority: 20, lanes: ['official', 'cheap'], expected }];
   const ok = await put({ changes });
   assert.equal(ok.statusCode, 200, ok.body);
   shape('LaneMatrixSaveResult', ok.json());
   assert.deepEqual(ok.json().results[0].after, { group: 'official,cheap', priority: 20, status: 1 });
-  assert.deepEqual(calls.find((c) => c.key === 'PUT /api/lane_matrix/batch').body, { changes });
-  assert.deepEqual(audits.at(-1), { action: 'ops.lane_matrix.save', target: null, actor: app.userId, details: { changes, results: ok.json().results } });
+  const sent = [{ channel_id: 1, priority: 20, lanes: ['official', 'cheap'] }];
+  assert.deepEqual(calls.find((c) => c.key === 'PUT /api/lane_matrix/batch').body, { changes: sent }, 'expected is never forwarded to lanehub');
+  assert.deepEqual(audits.at(-1), { action: 'ops.lane_matrix.save', target: null, actor: app.userId, details: { changes: sent, results: ok.json().results, already_applied: [] } });
 
   fail = true;
-  const bad = await put({ changes: [{ channel_id: 9, status: 2 }] });
+  const bad = await put({ changes: [{ channel_id: 3, status: 2, expected }] });
   assert.equal(bad.statusCode, 502);
-  assert.deepEqual(bad.json().error, { code: 'lanehub_api_failed', message: 'lanehub_api_failed', detail: '渠道 #9：record not found' });
-  assert.deepEqual(audits.at(-1).details, { changes: [{ channel_id: 9, status: 2 }], error: 'lanehub_api_failed', detail: '渠道 #9：record not found' });
+  assert.deepEqual(bad.json().error, { code: 'lanehub_api_failed', message: 'lanehub_api_failed', detail: '渠道 #3：record not found' });
+  assert.deepEqual(audits.at(-1).details, { changes: [{ channel_id: 3, status: 2 }], error: 'lanehub_api_failed', detail: '渠道 #3：record not found' });
   assert.equal(audits.length, 2);
+});
+
+test('lane matrix save: a stale draft is refused, a retried save is idempotent, unrelated fields never conflict', async () => {
+  const { app, calls } = setup({ handlers: { 'PUT /api/lane_matrix/batch': () => ({ success: true, data: [] }) } });
+  const put = (changes) => app.inject({ method: 'PUT', url: '/api/admin/ops/lane-matrix', payload: { changes } });
+  const writes = () => calls.filter((c) => c.key === 'PUT /api/lane_matrix/batch').length;
+  // Operator A's draft was based on priority 5; operator B has since set it to 10 (the current matrix).
+  const stale = await put([{ channel_id: 1, priority: 30, expected: { priority: 5, status: 1, lanes: ['official'] } }]);
+  assert.equal(stale.statusCode, 409);
+  assert.equal(stale.json().error.code, 'lane_matrix_conflict');
+  assert.deepEqual(stale.json().error.conflicts, [{ channel_id: 1, reason: 'changed', current: { priority: 10, status: 1, lanes: ['official'] } }]);
+  // A drafted channel that left the matrix is a conflict too (nothing is written).
+  const gone = await put([{ channel_id: 99, status: 2, expected: { priority: 10, status: 1, lanes: ['official'] } }]);
+  assert.equal(gone.json().error.conflicts[0].reason, 'channel_missing');
+  assert.equal(writes(), 0);
+  // The lanes were changed by someone else, but this edit only writes priority: no conflict.
+  const priorityOnly = await put([{ channel_id: 1, priority: 30, expected: { priority: 10, status: 1, lanes: ['cheap'] } }]);
+  assert.equal(priorityOnly.statusCode, 200, priorityOnly.body);
+  assert.equal(writes(), 1);
+  // A retry after a lost response: the matrix already holds the target, so it is reported and not written again.
+  const retried = await put([{ channel_id: 1, priority: 10, expected: { priority: 5, status: 1, lanes: ['official'] } }]);
+  assert.equal(retried.statusCode, 200, retried.body);
+  assert.deepEqual(retried.json().results, [{ channel_id: 1, name: '', before: { group: 'official', priority: 10, status: 1 }, after: { group: 'official', priority: 10, status: 1 } }]);
+  assert.equal(writes(), 1);
 });
 
 test('dashboard: realtime CNY, period Go keys → snake_case', async () => {
@@ -188,6 +236,25 @@ test('dashboard: realtime CNY, period Go keys → snake_case', async () => {
     { date: '2026-09-17', key: 'x', requests: 0, amount_cny: 0, cost_cny: 0, prompt_tokens: 0, completion_tokens: 0, avg_latency_ms: 0 }]);
   assert.equal((await app.inject({ url: '/api/admin/ops/dashboard/period?start=10' })).statusCode, 400);
   assert.equal((await app.inject({ url: '/api/admin/ops/dashboard/period?start=1&end=2&group_by=user' })).statusCode, 400);
+});
+
+test('dashboard and logs keep missing upstream costs unknown', async () => {
+  const log = { id: 8, created_at: 1758000000, type: 2, quota: 500000, model_name: 'm', cost_source: null };
+  const { app } = setup({ handlers: {
+    'GET /api/analytics/rpm': () => ({ success: true, data: { rpm: 1, tpm: 2 } }),
+    'GET /api/analytics/period': () => ({ success: true, data: { channel_statistics: [{ Date: '2026-09-17', RequestCount: 1, Quota: 500000 }] } }),
+    'GET /api/log/': () => ({ success: true, data: { data: [log], page: 1, size: 20, total_count: 1 } }),
+  } });
+  assert.equal((await app.inject({ url: '/api/admin/ops/dashboard/realtime' })).json().cost_per_min_cny, null);
+  assert.equal((await app.inject({ url: '/api/admin/ops/dashboard/period?start=1&end=2' })).json().rows[0].cost_cny, null);
+  assert.equal((await app.inject({ url: '/api/admin/ops/logs' })).json().items[0].cost_cny, null);
+});
+
+test('missing USD rate returns a specific 503 instead of false zero values', async () => {
+  const { app } = setup({ fallbackRate: 0, handlers: { 'GET /api/option/': () => ({ success: true, data: [] }) } });
+  const r = await app.inject({ url: '/api/admin/ops/lane-matrix' });
+  assert.equal(r.statusCode, 503);
+  assert.equal(r.json().error.code, 'lanehub_rate_unavailable');
 });
 
 test('logs: filters mapped, entries allowlisted, stat in CNY', async () => {

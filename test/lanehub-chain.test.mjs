@@ -31,7 +31,7 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
   const PLUGIN_ID='7d8b7d87-b85f-49f1-bde7-a0b1a2f33401';   // schema.sql 里种下的「IPZSK 生图」
   const LANE_BASE='https://lane.test';
   const USD_CNY=6.7078, QUOTA_PER_UNIT=500000, QUOTA_USED=4250;
-  let lanehubRequestId=null, quotaAdded=[], relayCalls=0;
+  let lanehubRequestId=null, quotaAdded=[], relayCalls=0, loseQuotaResponse=false;
 
   // 假 lanehub：只认这条链真的会打的那几个接口。
   const lanehubFetch=async(url,options={})=>{
@@ -41,7 +41,12 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
       return Response.json({success:true,data:{data:created?[{id:42,username:created}]:[]}});
     if(path==='/api/user/'){created=body.username;return Response.json({success:true});}
     if(path==='/api/token/for_user')return Response.json({success:true,data:{key:'a'.repeat(48)}});
-    if(path.startsWith('/api/user/quota/')){quotaAdded.push(body.quota);return Response.json({success:true});}
+    if(path.startsWith('/api/user/quota/')){
+      quotaAdded.push(body.quota);
+      // 对面已经改了额度，响应在回来的路上丢了：这是最危险的情形。
+      if(loseQuotaResponse)throw new Error('socket hang up');
+      return Response.json({success:true});
+    }
     if(path==='/api/user/42')return Response.json({success:true,data:{id:42,quota:357142}});
     if(path==='/api/option/')return Response.json({success:true,data:[{key:'PaymentUSDRate',value:String(USD_CNY)}]});
     if(path.startsWith('/api/log/'))return Response.json({success:true,
@@ -94,6 +99,7 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
       assert.equal(request.plugin_id,PLUGIN_ID);
       assert.equal(request.plugin_owner_user_id,ownerId,'作者归属要落在请求上，之后改归属不影响历史账');
       assert.equal(request.plugin_share_bps,3000,'分成比例按发生时快照，不读当前值');
+      assert.equal(request.plugin_attribution_state,'credential_unverified','插件凭据不证明已安装，归属不可支付');
       assert.equal(Number(request.total_tokens),20,'token 消耗必须记下来——记账口径就是它');
       assert.equal(request.usage_state,'reported');
     });
@@ -109,6 +115,8 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
     await t.test('扣费从 lanehub 的消费日志补回来，金额按对面汇率折算', async () => {
       // 扫描刻意跳过刚完成 30 秒内的请求（对面的日志可能还没落库），这里把时间往前挪。
       await db.query("UPDATE requests SET completed_at=now()-interval '2 minutes'");
+      // 后续几步验证的是可支付归属下的计提、退款冲回与结算单；这里把两单当作已核验归属处理。
+      await db.query("UPDATE requests SET plugin_attribution_state='skill_marker' WHERE plugin_id IS NOT NULL");
       const result=await reconcileLanehubCharges(db,lanehub,{usdCnyRate:999,quotaPerUnit:QUOTA_PER_UNIT});
       assert.equal(result.settled,1,'只有最后那一单能在日志里查到，另一单等超时后作废');
 
@@ -273,6 +281,84 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
       assert.equal(Number((await db.query('SELECT refunded_cny FROM request_billing WHERE request_id=$1',[requestId])).rows[0].refunded_cny),0.5);
     });
 
+    await t.test('退款加额度响应丢失：进入待核对，不重放；人工确认后只落账一次', async () => {
+      const login=await app.inject({url:'/admin/api/login',method:'POST',payload:{password:'test-administrator-password'},
+        headers:{origin:'https://api.ipzsk.com'}});
+      const headers={cookie:login.headers['set-cookie'].split(';')[0],origin:'https://api.ipzsk.com'};
+      const requestId=randomUUID();
+      await db.query(`INSERT INTO requests(id,user_id,model,status,fingerprint,stream) VALUES($1,$2,'test-model','succeeded','fp-lost',false)`,[requestId,userId]);
+      await db.query(`INSERT INTO request_billing(request_id,user_id,state,reserved_cny,charged_cny,price_snapshot) VALUES($1,$2,'settled',1,1,'{}')`,[requestId,userId]);
+      const refunded=async()=>(await db.query('SELECT refunded_cny FROM request_billing WHERE request_id=$1',[requestId])).rows[0].refunded_cny;
+      const refund=()=>app.inject({url:'/admin/api/billing/'+requestId+'/refund',method:'POST',headers,payload:{amount_cny:'0.40000000',reason:'响应丢失回归'}});
+      const before=quotaAdded.length;
+      loseQuotaResponse=true;
+      try {
+        const lost=await refund();
+        assert.equal(lost.statusCode,409,lost.body);
+        assert.equal(lost.json().error.code,'lanehub_adjustment_review');
+      } finally { loseQuotaResponse=false; }
+      assert.equal(quotaAdded.length,before+1);
+      assert.equal(Number(await refunded()),0,'结果未知时账面不动');
+      const again=await refund();
+      assert.equal(again.json().error.code,'refund_in_progress','在途退款期间不能再发起，更不能重放');
+      assert.equal(quotaAdded.length,before+1,'对面只能被调用一次');
+      const listed=(await app.inject({url:'/admin/api/lanehub-adjustments',headers})).json().rows.find(r=>r.payload.request_id===requestId);
+      assert.equal(listed.state,'review');
+      const resolve=(result)=>app.inject({url:'/admin/api/lanehub-adjustments/resolve',method:'POST',headers,
+        payload:{reference:listed.reference,result,reason:'已在 LaneHub 额度日志核对'}});
+      const done=await resolve('applied');
+      assert.equal(done.statusCode,200,done.body);
+      assert.equal(done.json().state,'applied');
+      assert.ok(done.json().booked_at);
+      assert.equal(Number(await refunded()),0.4);
+      assert.equal((await resolve('applied')).json().error.code,'adjustment_not_in_review');
+      assert.equal(Number(await refunded()),0.4,'重复确认不能重复落账');
+      assert.equal(quotaAdded.length,before+1);
+    });
+
+    await t.test('LaneHub 充值退款：扣回对面额度，幂等落账；结果未知进入核对，终止时退回预留本金', async () => {
+      const login=await app.inject({url:'/admin/api/login',method:'POST',payload:{password:'test-administrator-password'},
+        headers:{origin:'https://api.ipzsk.com'}});
+      const headers={cookie:login.headers['set-cookie'].split(';')[0],origin:'https://api.ipzsk.com'};
+      const buyer=randomUUID(),order=randomUUID(),ORDER_QUOTA=745399;
+      await db.query(`INSERT INTO users (id,name,rpm) VALUES ($1,'buyer',60)`,[buyer]);
+      await db.query(`INSERT INTO payment_orders(id,user_id,mode,pack_key,product_id,amount_cny,currency,idempotency_key,target,state,credited_at,lanehub_user_id,quota)
+        VALUES($1,$2,'prod','cny_10','fixture',10,'CNY',$1,'lanehub','credited',now(),42,$3)`,[order,buyer,ORDER_QUOTA]);
+      await db.query(`INSERT INTO commission_funds(id,user_id,payment_order_id,paid,amount_cny,remaining_cny) VALUES($1,$2,$3,true,10,10)`,['fixture:'+order,buyer,order]);
+      const remaining=async()=>(await db.query('SELECT remaining_cny FROM commission_funds WHERE payment_order_id=$1',[order])).rows[0].remaining_cny;
+      const refund=(amount,reference)=>app.inject({url:'/admin/api/commissions/payment-refunds/'+order,method:'POST',headers,
+        payload:{amount_cny:amount,chargeback:false,reference}});
+      const before=quotaAdded.length;
+      const first=await refund('4','Waffo refund R-0001');
+      assert.equal(first.statusCode,200,first.body);
+      assert.equal(quotaAdded.length,before+1);
+      assert.equal(quotaAdded.at(-1),-Math.round(ORDER_QUOTA*4/10),'按订单入账时的折算比例扣回');
+      assert.equal(Number(await remaining()),6);
+      const booked=(await db.query('SELECT * FROM commission_payment_refunds WHERE reference=$1',['Waffo refund R-0001'])).rows[0];
+      assert.equal(Number(booked.balance_deduction_cny),4);
+      assert.equal((await db.query('SELECT state FROM payment_orders WHERE id=$1',[order])).rows[0].state,'credited');
+      assert.equal((await refund('4','Waffo refund R-0001')).statusCode,200,'同一回执重提是幂等的');
+      assert.equal(quotaAdded.length,before+1,'重提不再扣对面');
+
+      loseQuotaResponse=true;
+      try { assert.equal((await refund('1','Waffo refund R-0002')).json().error.code,'lanehub_adjustment_review'); }
+      finally { loseQuotaResponse=false; }
+      assert.equal(Number(await remaining()),5,'本金先预留，防止被后续消费占用');
+      assert.equal((await db.query('SELECT state FROM payment_orders WHERE id=$1',[order])).rows[0].state,'refund_review');
+      assert.equal((await refund('1','Waffo refund R-0002')).json().error.code,'lanehub_adjustment_review','重提只返回现状');
+      assert.equal((await refund('1','Waffo refund R-0003')).json().error.code,'payment_refund_in_progress');
+      assert.equal(quotaAdded.length,before+2,'未知结果绝不自动重复扣减');
+      assert.equal((await db.query('SELECT count(*)::int AS n FROM commission_payment_refunds WHERE payment_order_id=$1',[order])).rows[0].n,1);
+      const cancel=await app.inject({url:'/admin/api/lanehub-adjustments/resolve',method:'POST',headers,
+        payload:{reference:'payment_refund:Waffo refund R-0002',result:'cancel',reason:'LaneHub 日志确认未扣减，不再执行'}});
+      assert.equal(cancel.statusCode,200,cancel.body);
+      assert.equal(cancel.json().state,'cancelled');
+      assert.equal(Number(await remaining()),6,'终止后预留本金退回');
+      assert.equal((await refund('1','Waffo refund R-0002')).json().error.code,'lanehub_adjustment_not_applied','已终止的回执号不能再次预留');
+      assert.equal(Number(await remaining()),6);
+      assert.equal(quotaAdded.length,before+2);
+    });
+
     await t.test('结算单：起草 → 冻结 → 打款；冻结之后的退款落到下一张单', async () => {
       const login=await app.inject({url:'/admin/api/login',method:'POST',payload:{password:'test-administrator-password'},
         headers:{origin:'https://api.ipzsk.com'}});
@@ -334,7 +420,7 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
       assert.equal(mine.json().source,'lanehub');
       assert.equal(mine.json().balance_cny,(357142/QUOTA_PER_UNIT*USD_CNY).toFixed(8));
     });
-    await t.test('permanent commission: authenticated plugin and Skill credentials credit BD and author; forged tags cannot select an author', async () => {
+    await t.test('permanent commission: bootstrap plugin credentials credit BD but never a payable author share; forged tags cannot select an author', async () => {
       const remaining=(await db.query('SELECT coalesce(sum(remaining_cny),0)::numeric(20,8) AS amount FROM commission_funds WHERE user_id=$1',[userId])).rows[0].amount;
       const drain=randomUUID();
       await db.query("INSERT INTO requests(id,user_id,model,fingerprint,stream,status) VALUES($1,$2,'test-model','drain fixture',false,'succeeded')",[drain,userId]);
@@ -363,8 +449,12 @@ test('lanehub 模式下插件请求的 token 与分成链路', async (t) => {
         await db.query("INSERT INTO request_billing(request_id,user_id,state,reserved_cny,charged_cny,price_snapshot) VALUES($1,$2,'settled',100,100,'{}')",[id,userId]);
         const row=(await db.query('SELECT * FROM commission_requests WHERE request_id=$1',[id])).rows[0];
         assert.equal(row.bd_user_id,bd); assert.equal(row.bd_cny,'20.00000000');
-        assert.equal(row.developer_user_id,method==='forged'?null:ownerId);
-        assert.equal(row.developer_cny,method==='forged'?'0.00000000':'16.00000000');
+        // Desktop bootstrap issues plugin credentials without install proof: attribution is recorded, not paid.
+        const request=(await db.query('SELECT plugin_owner_user_id,plugin_attribution_state FROM requests WHERE id=$1',[id])).rows[0];
+        assert.equal(request.plugin_owner_user_id,method==='forged'?null:ownerId);
+        assert.equal(request.plugin_attribution_state,method==='forged'?'none':'credential_unverified');
+        assert.equal(row.developer_user_id,null);
+        assert.equal(row.developer_cny,'0.00000000');
         assert.equal((await db.query('SELECT count(*) FROM plugin_earnings WHERE request_id=$1',[id])).rows[0].count,'0');
       }
     });

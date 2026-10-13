@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { httpError, RateLimiter } from './security.mjs';
 import { uuid } from './validation.mjs';
 import { units, decimal, wallet } from './billing.mjs';
-import { lanehubMode, provisionIfEnabled } from './lanehub.mjs';
+import { lanehubMode, provisionIfEnabled, startAdjustment, applyAdjustment } from './lanehub.mjs';
 import { lanehubBalance } from './lanehub-charges.mjs';
 
 const amount = value => {
@@ -133,6 +133,66 @@ export async function deliverConversions(db, options) {
       await db.query("UPDATE commission_conversions SET state='review',updated_at=now() WHERE id=$1", [item.id]);
     }
   }
+}
+
+// Lands a confirmed payment refund: the part not covered by unused principal (already taken from
+// commission_funds by the caller) is charged back against consumption funded by this order.
+export async function bookPaymentRefund(c, refund) {
+  const { payment_order_id: id, amount_cny: value, chargeback, reference, balance_deduction_cny: balanceDeduction } = refund;
+  const order = (await c.query('SELECT * FROM payment_orders WHERE id=$1 FOR UPDATE', [id])).rows[0];
+  let remaining = units(value) - units(balanceDeduction);
+  const affected = new Set();
+  if (remaining > 0n) {
+    const allocations = (await c.query(`SELECT a.* FROM commission_allocations a JOIN commission_funds f ON f.id=a.fund_id
+      WHERE f.payment_order_id=$1 ORDER BY a.request_id,a.fund_id FOR UPDATE OF a`, [id])).rows;
+    for (const allocation of allocations) {
+      const available = units(allocation.amount_cny) - units(allocation.returned_cny) - units(allocation.chargeback_cny);
+      const take = remaining < available ? remaining : available;
+      if (take <= 0n) continue;
+      await c.query('UPDATE commission_allocations SET chargeback_cny=chargeback_cny+$3 WHERE request_id=$1 AND fund_id=$2', [allocation.request_id, allocation.fund_id, decimal(take)]);
+      affected.add(allocation.request_id); remaining -= take;
+      if (remaining === 0n) break;
+    }
+  }
+  if (remaining > 0n) throw httpError(409, 'payment_sources_unresolved');
+  await c.query('INSERT INTO commission_payment_refunds(reference,payment_order_id,amount_cny,chargeback,balance_deduction_cny) VALUES($1,$2,$3,$4,$5)', [reference, id, value, chargeback, balanceDeduction]);
+  await c.query("UPDATE payment_orders SET state='credited',review_reason=NULL,updated_at=now() WHERE id=$1", [id]);
+  const disputed = (await c.query(`SELECT DISTINCT a.request_id FROM commission_allocations a JOIN commission_funds f ON f.id=a.fund_id
+    WHERE f.payment_order_id=$1`, [id])).rows;
+  for (const row of disputed) affected.add(row.request_id);
+  for (const rid of affected) {
+    if ((await c.query(`SELECT 1 FROM commission_allocations a JOIN commission_funds f ON f.id=a.fund_id
+      JOIN payment_orders p ON p.id=f.payment_order_id WHERE a.request_id=$1 AND p.state='refund_review' LIMIT 1`, [rid])).rowCount) continue;
+    await c.query("UPDATE commission_requests SET state='pending_billing' WHERE request_id=$1 AND state='disputed'", [rid]);
+    await c.query('SELECT commission_reconcile($1)', [rid]);
+  }
+  await reconcileInvitation(c, order.user_id);
+}
+
+// Local booking after LaneHub confirmed the debit. booked_at makes it idempotent across the route,
+// manual resolution and the background finaliser.
+export async function bookPaymentRefundAdjustment(c, reference) {
+  const found = (await c.query(`SELECT user_id,payload FROM lanehub_credits WHERE reference=$1 AND payload->>'booking'='payment_refund'`, [reference])).rows[0];
+  if (!found) return false;
+  // Same lock order as the refund route: order, user, then the adjustment row.
+  await c.query('SELECT id FROM payment_orders WHERE id=$1 FOR UPDATE', [found.payload.payment_order_id]);
+  await c.query('SELECT id FROM users WHERE id=$1 FOR UPDATE', [found.user_id]);
+  const row = (await c.query(`UPDATE lanehub_credits SET booked_at=now(),updated_at=now()
+    WHERE reference=$1 AND state='applied' AND booked_at IS NULL RETURNING *`, [reference])).rows[0];
+  if (!row) return false;
+  await bookPaymentRefund(c, row.payload);
+  await c.query('INSERT INTO audit_events(action,target_id,administrator_id,details) VALUES($1,$2,$3,$4)',
+    ['commission.payment_refund.confirm', row.payload.payment_order_id, row.payload.administrator_id ?? null,
+      JSON.stringify({ amount_cny: row.payload.amount_cny, chargeback: row.payload.chargeback, reference: row.payload.reference, lanehub_reference: reference })]);
+  return true;
+}
+
+// Cancelling an unconfirmed debit returns the reserved principal; the order stays in refund_review for the operator.
+export async function releasePaymentRefundAdjustment(c, row) {
+  for (const fund of row.payload.funds ?? [])
+    await c.query('UPDATE commission_funds SET remaining_cny=remaining_cny+$2 WHERE id=$1', [fund.id, fund.take]);
+  await c.query("UPDATE payment_orders SET review_reason='lanehub_refund_cancelled',updated_at=now() WHERE id=$1 AND state='refund_review'",
+    [row.payload.payment_order_id]);
 }
 
 export function commissionRoutes(app, options) {
@@ -285,62 +345,75 @@ export function commissionRoutes(app, options) {
       return { ok: true, balance_cny: decimal(available), historical_review_count: held.rowCount };
     });
   });
+  // Payment refund. Local-wallet orders book in one transaction. LaneHub orders keep their balance remotely, so
+  // the unused principal (balance_deduction_cny) must also be debited there: the refund is reserved and
+  // committed first (pending), then LaneHub is debited, then bookPaymentRefund lands the local accounts once.
+  // An unknown remote result stays in review and is never debited again automatically.
   app.post('/admin/api/commissions/payment-refunds/:id', async req => {
     admin(req);
     const id = uuid(req.params.id), value = amount(req.body?.amount_cny), reference = note(req.body?.reference);
     if (typeof req.body.chargeback !== 'boolean') throw httpError(400, 'invalid_refund_type');
-    return db.tx(async c => {
+    const adjustment = 'payment_refund:' + reference, chargeback = req.body.chargeback;
+    const plan = await db.tx(async c => {
       const order = (await c.query("SELECT * FROM payment_orders WHERE id=$1 AND mode='prod' AND credited_at IS NOT NULL FOR UPDATE", [id])).rows[0];
       if (!order) throw httpError(404, 'not_found');
       await c.query('SELECT id FROM users WHERE id=$1 FOR UPDATE', [order.user_id]);
-      if (!req.body.chargeback && (await c.query(`SELECT 1 FROM requests WHERE user_id=$1 AND status IN ('queued','running')
-        UNION ALL SELECT 1 FROM request_billing WHERE user_id=$1 AND state IN ('reserved','pending') LIMIT 1`, [order.user_id])).rowCount)
-        throw httpError(409, 'refund_pending_usage');
       const old = (await c.query('SELECT * FROM commission_payment_refunds WHERE reference=$1', [reference])).rows[0];
       if (old) {
-        if (old.payment_order_id !== id || units(old.amount_cny) !== units(value) || old.chargeback !== req.body.chargeback) throw httpError(409, 'idempotency_conflict');
-        return { ok: true };
+        if (old.payment_order_id !== id || units(old.amount_cny) !== units(value) || old.chargeback !== chargeback) throw httpError(409, 'idempotency_conflict');
+        return { done: true };
       }
+      const open = (await c.query(`SELECT * FROM lanehub_credits WHERE payload->>'booking'='payment_refund' AND payload->>'payment_order_id'=$1
+        AND state<>'cancelled' AND (state<>'applied' OR booked_at IS NULL) FOR UPDATE`, [id])).rows[0];
+      if (open) {
+        if (open.reference !== adjustment || units(open.payload.amount_cny) !== units(value) || open.payload.chargeback !== chargeback)
+          throw httpError(409, 'payment_refund_in_progress');
+        return { adjustment };
+      }
+      // A cancelled adjustment keeps its reference; reserving again under it would strand the principal.
+      if ((await c.query('SELECT 1 FROM lanehub_credits WHERE reference=$1', [adjustment])).rowCount)
+        throw httpError(409, 'lanehub_adjustment_not_applied');
+      if (!chargeback && (await c.query(`SELECT 1 FROM requests WHERE user_id=$1 AND status IN ('queued','running')
+        UNION ALL SELECT 1 FROM request_billing WHERE user_id=$1 AND state IN ('reserved','pending') LIMIT 1`, [order.user_id])).rowCount)
+        throw httpError(409, 'refund_pending_usage');
       const refunded = (await c.query('SELECT coalesce(sum(amount_cny),0) AS amount FROM commission_payment_refunds WHERE payment_order_id=$1', [id])).rows[0].amount;
       if (units(refunded) + units(value) > units(order.amount_cny)) throw httpError(409, 'refund_exceeds_payment');
       let remaining = units(value);
-      const funds = (await c.query('SELECT * FROM commission_funds WHERE payment_order_id=$1 ORDER BY id FOR UPDATE', [id])).rows;
+      const funds = (await c.query('SELECT * FROM commission_funds WHERE payment_order_id=$1 ORDER BY id FOR UPDATE', [id])).rows, taken = [];
       for (const fund of funds) {
         const take = remaining < units(fund.remaining_cny) ? remaining : units(fund.remaining_cny);
+        if (take <= 0n) continue;
         await c.query('UPDATE commission_funds SET remaining_cny=remaining_cny-$2 WHERE id=$1', [fund.id, decimal(take)]);
+        taken.push({ id: fund.id, take: decimal(take) });
         remaining -= take;
       }
-      const balanceDeduction = decimal(units(value) - remaining);
-      if (remaining > 0n && !req.body.chargeback) throw httpError(409, 'refund_exceeds_unused_principal');
-      const affected = new Set();
-      if (remaining > 0n) {
-        const allocations = (await c.query(`SELECT a.* FROM commission_allocations a JOIN commission_funds f ON f.id=a.fund_id
-          WHERE f.payment_order_id=$1 ORDER BY a.request_id,a.fund_id FOR UPDATE OF a`, [id])).rows;
-        for (const allocation of allocations) {
-          const available = units(allocation.amount_cny) - units(allocation.returned_cny) - units(allocation.chargeback_cny);
-          const take = remaining < available ? remaining : available;
-          if (take <= 0n) continue;
-          await c.query('UPDATE commission_allocations SET chargeback_cny=chargeback_cny+$3 WHERE request_id=$1 AND fund_id=$2', [allocation.request_id, allocation.fund_id, decimal(take)]);
-          affected.add(allocation.request_id); remaining -= take;
-          if (remaining === 0n) break;
-        }
+      const balanceDeduction = units(value) - remaining;
+      if (remaining > 0n && !chargeback) throw httpError(409, 'refund_exceeds_unused_principal');
+      const refund = { payment_order_id: id, amount_cny: value, chargeback, reference, balance_deduction_cny: decimal(balanceDeduction),
+        administrator_id: req.administrator?.id ?? null };
+      if (order.target !== 'lanehub' || balanceDeduction === 0n) {
+        await bookPaymentRefund(c, refund);
+        await audit(c, req, 'commission.payment_refund.confirm', id, { amount_cny: value, chargeback, reference });
+        return { done: true };
       }
-      if (remaining > 0n) throw httpError(409, 'payment_sources_unresolved');
-      await c.query('INSERT INTO commission_payment_refunds(reference,payment_order_id,amount_cny,chargeback,balance_deduction_cny) VALUES($1,$2,$3,$4,$5)', [reference, id, value, req.body.chargeback, balanceDeduction]);
-      await c.query("UPDATE payment_orders SET state='credited',review_reason=NULL,updated_at=now() WHERE id=$1", [id]);
-      const disputed = (await c.query(`SELECT DISTINCT a.request_id FROM commission_allocations a JOIN commission_funds f ON f.id=a.fund_id
-        WHERE f.payment_order_id=$1`, [id])).rows;
-      for (const row of disputed) affected.add(row.request_id);
-      for (const rid of affected) {
-        if ((await c.query(`SELECT 1 FROM commission_allocations a JOIN commission_funds f ON f.id=a.fund_id
-          JOIN payment_orders p ON p.id=f.payment_order_id WHERE a.request_id=$1 AND p.state='refund_review' LIMIT 1`, [rid])).rowCount) continue;
-        await c.query("UPDATE commission_requests SET state='pending_billing' WHERE request_id=$1 AND state='disputed'", [rid]);
-        await c.query('SELECT commission_reconcile($1)', [rid]);
-      }
-      await reconcileInvitation(c, order.user_id);
-      await audit(c, req, 'commission.payment_refund.confirm', id, { amount_cny: value, chargeback: req.body.chargeback, reference });
-      return { ok: true };
+      if (!options.lanehub || !order.lanehub_user_id || !order.quota) throw httpError(503, 'lanehub_unavailable');
+      // Debit at the order's own credit rate: a full refund removes exactly the quota that was added.
+      const quota = (BigInt(order.quota) * balanceDeduction + units(order.amount_cny) / 2n) / units(order.amount_cny);
+      if (quota <= 0n) throw httpError(409, 'refund_quota_too_small');
+      await startAdjustment(c, { reference: adjustment, userId: order.user_id, lanehubUserId: order.lanehub_user_id, kind: 'debit',
+        amountCny: decimal(balanceDeduction), quota: Number(quota), remark: '充值退款扣回 ' + id,
+        payload: { booking: 'payment_refund', ...refund, funds: taken } });
+      // Keep commissions funded by this order frozen until the debit is confirmed.
+      await c.query("UPDATE payment_orders SET state='refund_review',review_reason='lanehub_refund_pending',updated_at=now() WHERE id=$1", [id]);
+      await audit(c, req, 'commission.payment_refund.requested', id, { amount_cny: value, chargeback, reference, balance_deduction_cny: decimal(balanceDeduction) });
+      return { adjustment };
     });
+    if (plan.done) return { ok: true };
+    const result = await applyAdjustment(db, options.lanehub, plan.adjustment);
+    if (result.state === 'review') throw httpError(409, 'lanehub_adjustment_review');
+    if (result.state !== 'applied') throw httpError(409, 'lanehub_adjustment_not_applied');
+    await db.tx(c => bookPaymentRefundAdjustment(c, plan.adjustment));
+    return { ok: true };
   });
   app.post('/admin/api/commissions/payouts/:id', async req => {
     admin(req);

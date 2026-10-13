@@ -127,7 +127,10 @@ export function paymentRoutes(app, { db, waffo = null, lanehub = null, lanehubQu
   });
   app.get('/api/me/payments/orders', async req => {
     if (!req.apiUser?.session_id) throw httpError(401, 'customer_login_required');
-    return { rows: (await db.query(`SELECT ${orderFields} FROM payment_orders WHERE user_id=$1 ORDER BY created_at DESC LIMIT 30`, [req.apiUser.id])).rows };
+    // 已确认的退款随订单返回：退款落账后订单状态回到 credited，不带这个数用户只看得到「已到账」。
+    return { rows: (await db.query(`SELECT ${orderFields},coalesce((SELECT sum(r.amount_cny) FROM commission_payment_refunds r
+      WHERE r.payment_order_id=payment_orders.id),0)::numeric(20,8) AS refunded_cny
+      FROM payment_orders WHERE user_id=$1 ORDER BY created_at DESC LIMIT 30`, [req.apiUser.id])).rows };
   });
   app.post('/api/me/payments/checkout', async req => {
     if (!await allowed(req)) throw httpError(503, 'online_payment_unavailable');

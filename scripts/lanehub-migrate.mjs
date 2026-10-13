@@ -80,7 +80,8 @@ for (const row of rows) {
     usdCnyRate: usdCny, quotaPerUnit, reference, remark: `IPZSK 余额迁移 ${batch}`,
   });
   if (result.applied) applied += 1; else skipped += 1;
-  console.log(`  ${row.name ?? row.id}  ¥${amount}  ${result.applied ? '已入账 ' + result.quota + ' quota' : '已入过账，跳过'}`);
+  // review = 远程结果未知，必须到后台人工核对；不要重跑来"补"。
+  console.log(`  ${row.name ?? row.id}  ¥${amount}  ${result.applied ? '已入账 ' + result.quota + ' quota' : result.state === 'applied' ? '已入过账，跳过' : '状态 ' + result.state + '，待人工核对'}`);
 }
 
 console.log('');

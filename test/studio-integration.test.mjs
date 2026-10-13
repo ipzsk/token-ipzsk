@@ -52,7 +52,8 @@ test('studio: generation records, quote, threads, queue, templates, subjects, fa
   const dir = await mkdtemp(join(tmpdir(), 'ipzsk-studio-'));
 
   // Fake lanehub: admin API, catalog, quote, relay and task polling. Records which token each relay call used.
-  const users = new Map(), keys = new Map(), quotes = [], generations = [];
+  const users = new Map(), keys = new Map(), quotes = [], generations = []
+  let refusedOnce = false;
   let nextUser = 40, taskStatus = 'processing';
   const lanehubFetch = async (url, options = {}) => {
     const path = url.slice(LANE.length), body = options.body ? JSON.parse(options.body) : null;
@@ -75,6 +76,7 @@ test('studio: generation records, quote, threads, queue, templates, subjects, fa
     }
     if (path === '/v1/images/generations') {
       generations.push({ token, body });
+      if (body.prompt === 'refuse once' && !refusedOnce) { refusedOnce = true; return Response.json({ error: { message: 'bad size' } }, { status: 400 }); }
       return Response.json({ code: 200, data: [{ status: 'submitted', task_id: 'up-' + generations.length }] }, { headers: { 'X-Oneapi-Request-Id': 'lane-' + generations.length } });
     }
     if (path.startsWith('/v1/tasks/')) {
@@ -91,7 +93,7 @@ test('studio: generation records, quote, threads, queue, templates, subjects, fa
   let app;
   try {
     await db.migrate(); await db.migrate();
-    assert.deepEqual((await db.query('SELECT version FROM schema_version WHERE version>=18 ORDER BY version')).rows.map((r) => r.version), [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33]);
+    assert.deepEqual((await db.query('SELECT version FROM schema_version WHERE version>=18 ORDER BY version')).rows.map((r) => r.version), [18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34]);
     const accountId = randomUUID();
     await db.query(`INSERT INTO upstream_accounts (id,name,concurrency,base_url,provider_type) VALUES ($1,'lanehub',50,$2,'lanehub')`, [accountId, LANE]);
     await db.query(`INSERT INTO app_settings (key,value) VALUES ('lanehub_mode','on')`);
@@ -248,6 +250,24 @@ test('studio: generation records, quote, threads, queue, templates, subjects, fa
       assert.equal((await call(bob, 'PATCH', '/api/me/generations/' + record.id, { thread_id: null })).statusCode, 404);
       assert.equal((await call(bob, 'DELETE', '/api/me/generations/' + record.id)).statusCode, 404);
       assert.equal((await call(bob, 'POST', '/api/me/images/generations', { ...payload, batch_id: undefined, batch_position: undefined })).json().error.code, 'record_not_found');
+    });
+
+    await t.test('retry with the same key: re-runs only an attempt that never ran upstream; never replays an uncertain one', async () => {
+      const key = 'q:' + randomUUID(), payload = { model: 'gpt-image-2.5-flare', prompt: 'refuse once', batch_id: randomUUID(), batch_position: 0 };
+      const refused = await call(alice, 'POST', '/api/me/images/generations', payload, { 'idempotency-key': key });
+      assert.equal(refused.json().error.code, 'upstream_http_400');
+      const sent = generations.length;
+      // The composer resends the same item with a new batch_id: the upstream refused the first attempt, so it runs again.
+      const retried = await call(alice, 'POST', '/api/me/images/generations', { ...payload, batch_id: randomUUID() }, { 'idempotency-key': key });
+      assert.equal(retried.statusCode, 200, retried.body);
+      assert.equal(generations.length, sent + 1);
+      assert.equal(await count('SELECT count(*)::int AS n FROM requests WHERE user_id=$1 AND idempotency_key=$2', [alice, key]), 1);
+      assert.equal(await count(`SELECT count(*)::int AS n FROM requests WHERE user_id=$1 AND idempotency_key LIKE $2`, [alice, key + ':retired:%']), 1);
+      // An uncertain attempt is never replayed, whatever the body.
+      await db.query("UPDATE requests SET status='uncertain',usage_state='unknown',error_code='upstream_result_uncertain' WHERE user_id=$1 AND idempotency_key=$2", [alice, key]);
+      const again = await call(alice, 'POST', '/api/me/images/generations', { ...payload, batch_id: randomUUID() }, { 'idempotency-key': key });
+      assert.equal(again.json().error.code, 'idempotency_conflict');
+      assert.equal(generations.length, sent + 1);
     });
 
     await t.test('too_many_active: the 25th active record is refused with no request row', async () => {

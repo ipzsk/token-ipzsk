@@ -108,12 +108,12 @@ export async function settleRequest(c,id,{status,submitted,errorCode,usage,servi
   await debit(c,bill,amount,'automatic');
 }
 // Called from the task-charge transaction: the upstream task is the only proof of what the user owes.
-export async function settleMediaRequest(c,id,status){
+export async function settleMediaRequest(c,id,status,reason='media_task_'+status){
   const found=(await c.query('SELECT user_id FROM request_billing WHERE request_id=$1',[id])).rows[0];if(!found)return;
   await c.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[found.user_id]);
   const bill=(await c.query('SELECT * FROM request_billing WHERE request_id=$1 FOR UPDATE',[id])).rows[0];
   if(bill.state!=='reserved'||!bill.price_snapshot.media)return;
-  if(status!=='completed'){await c.query("UPDATE request_billing SET state='released',charged_cny=0,resolved_at=now(),reason=$2 WHERE request_id=$1",[id,'media_task_'+status]);return;}
+  if(status!=='completed'){await c.query("UPDATE request_billing SET state='released',charged_cny=0,resolved_at=now(),reason=$2 WHERE request_id=$1",[id,reason]);return;}
   const amount=mediaAmount(bill.price_snapshot);
   if(units(amount)>units(bill.reserved_cny)){await c.query("UPDATE request_billing SET state='pending',reason='charge_exceeds_hold' WHERE request_id=$1",[id]);return;}
   await debit(c,bill,amount,'automatic');

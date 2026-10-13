@@ -1,5 +1,6 @@
 import { units, decimal } from './billing.mjs';
 import { accrueEarning } from './earnings.mjs';
+import { httpError } from './security.mjs';
 
 // lanehub 模式下这一侧**不预扣也不扣钱**——钱是 lanehub 从客户自己的额度里扣的。
 // 但「这单收了多少」仍然必须回到这一侧：插件作者的分成口径
@@ -157,9 +158,13 @@ export async function reconcileLanehubCharges(db, lanehub, options, { batchSize 
 
 /** 客户在 lanehub 的余额，折成人民币。lanehub 模式下这才是他真正能花的钱。 */
 export async function lanehubBalance(lanehub, account, { usdCnyRate, quotaPerUnit }) {
-  const quota = Number((await lanehub.balance(account.lanehub_user_id))?.quota ?? 0);
+  // 读不到额度是未知，不是 0；退款扣回（负 delta）后额度可能为负，如实显示欠额。
+  const raw = (await lanehub.balance(account.lanehub_user_id))?.quota;
+  const quota = raw === null || raw === undefined || raw === '' ? NaN : Math.trunc(Number(raw));
+  if (!Number.isSafeInteger(quota)) throw httpError(503, 'billing_unavailable');
   const rate = await lanehub.usdRate().catch(() => usdCnyRate);
-  const amount = quotaToCny(Math.max(0, Math.trunc(quota)), rate, quotaPerUnit);
+  const magnitude = quotaToCny(Math.abs(quota), rate, quotaPerUnit);
+  const amount = quota < 0 && units(magnitude) > 0n ? '-' + magnitude : magnitude;
   // lanehub 不冻结额度（这一侧也不再预扣），所以可用 = 余额。
   return { balance_cny: amount, frozen_cny: '0.00000000', available_cny: amount };
 }

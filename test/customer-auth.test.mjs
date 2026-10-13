@@ -171,6 +171,21 @@ test('password login, verified registration and recovery',async t=>{
       assert.equal((await call(docToExcel.credential)).statusCode,200);
       assert.equal((await call(first.json().token)).statusCode,401);
       assert.equal((await call(desktopAliceToken)).statusCode,200);
+      // 旧客户端不上报 installed_packages：兼容签发全部插件凭证，审计标明是兼容路径（凭证永远不可支付，见 gateway 测试）。
+      const legacyAudit=(await db.query("SELECT details FROM audit_events WHERE action='desktop.bootstrap' ORDER BY id DESC LIMIT 1")).rows[0].details;
+      assert.equal(legacyAudit.installed_declared,false);
+      assert.ok(legacyAudit.plugin_ids.includes('7d8b7d87-b85f-49f1-bde7-a0b1a2f33402'));
+      // 新客户端上报清单：只签发清单内的包，本会话其余插件凭证立即过期。
+      assert.equal((await send('/api/me/desktop/bootstrap',{installed_packages:'@dickpy/dsh-imagegen'},aliceCookie)).statusCode,400);
+      const declared=await send('/api/me/desktop/bootstrap',{installed_packages:['@dickpy/dsh-imagegen']},aliceCookie);
+      assert.equal(declared.statusCode,200,declared.body);
+      assert.deepEqual(declared.json().plugin_configs.map(p=>p.plugin_id),['7d8b7d87-b85f-49f1-bde7-a0b1a2f33401']);
+      assert.equal((await call(docToExcel.credential)).statusCode,401,'未上报的插件凭证在本会话失效');
+      assert.equal((await call(declared.json().plugin_configs[0].credential)).statusCode,200);
+      assert.equal((await db.query("SELECT details FROM audit_events WHERE action='desktop.bootstrap' ORDER BY id DESC LIMIT 1")).rows[0].details.installed_declared,true);
+      // 再次以旧方式 bootstrap 时，同一会话可续签刚才过期的插件凭证（过期不是吊销）。
+      const restored=await send('/api/me/desktop/bootstrap',{},aliceCookie);desktopAliceToken=restored.json().token;
+      assert.equal((await call(pluginOf(restored,'7d8b7d87-b85f-49f1-bde7-a0b1a2f33402').credential)).statusCode,200);
       assert.equal((await db.query('SELECT count(*) FROM access_tokens WHERE user_id=$1 AND auth_session_id IS NOT NULL AND plugin_id IS NULL',[aliceId])).rows[0].count,'1');
       const c=cookies(await login('alice@example.com'));
       const another=(await send('/api/me/desktop/bootstrap',{},c)).json().token;

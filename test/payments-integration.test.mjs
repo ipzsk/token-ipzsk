@@ -63,6 +63,8 @@ test('payment ownership, verification, durable delivery, retries and test isolat
       assert.equal(Number(order.amount_cny),10);assert.equal(order.user_id,alice);
       const own=await app.inject({url:'/api/me/payments/orders',headers:{cookie:'bob'}});
       assert.equal(own.json().rows.length,0);
+      const mine=(await app.inject({url:'/api/me/payments/orders',headers:{cookie:'alice'}})).json().rows.find(row=>row.id===order.id);
+      assert.equal(mine.refunded_cny,'0.00000000','confirmed refunds are returned with the order');
       assert.ok(!JSON.stringify(order).includes('test-token'));
     });
     await t.test('missing checkout email cannot create an order or invoke the provider',async()=>{

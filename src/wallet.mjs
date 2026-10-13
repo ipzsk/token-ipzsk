@@ -1,6 +1,7 @@
 import { wallet } from './billing.mjs';
 import * as v from './validation.mjs';
-import { provisionIfEnabled } from './lanehub.mjs';
+import { provisionIfEnabled, lanehubMode } from './lanehub.mjs';
+import { httpError } from './security.mjs';
 import { lanehubBalance } from './lanehub-charges.mjs';
 
 const points = (cny) => (Number(cny ?? 0) * 100).toFixed(2);
@@ -18,7 +19,10 @@ export function walletRoutes(app, options) {
   });
   app.get('/api/me/wallet', async (req) => {
     // LaneHub 模式保留其权威余额，本地账本保留历史入账与消费记录。
-    const account = lanehub ? await provisionIfEnabled(db, options, { userId: req.apiUser.id, name: req.apiUser.name }).catch(() => null) : null;
+    // 该模式下建号/取号失败只能报不可用：本地账本不含 LaneHub 侧消费，拿它顶替就是一份错误余额。
+    const remote = Boolean(lanehub) && await lanehubMode(db);
+    const account = remote ? await provisionIfEnabled(db, options, { userId: req.apiUser.id, name: req.apiUser.name }).catch(() => null) : null;
+    if (remote && !account) throw httpError(503, 'billing_unavailable');
     const balances = account
       ? await lanehubBalance(lanehub, account, { usdCnyRate: lanehubUsdCny, quotaPerUnit: lanehubQuotaPerUnit })
       : await wallet(db, req.apiUser.id);

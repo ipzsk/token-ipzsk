@@ -1,5 +1,5 @@
 import { refreshMediaTask } from './media-task-sync.mjs';
-import { publicImageTask, imageUrls, fetchResultImage } from './image-results.mjs';
+import { publicImageTask, imageUrls, fetchResultImage, fetchResultVideo, fetchResultMedia, resultEntries } from './image-results.mjs';
 import { adaptModelRequest } from './model-catalog.mjs';
 import { lanehubMode, ensureLanehubKey } from './lanehub.mjs';
 import { prepareStudioGeneration, insertGenerationRecord } from './studio.mjs';
@@ -37,6 +37,43 @@ async function boundedJson(response, max = 8_000_000) {
 const retryableStatus = (status) => [401,402,403,429].includes(status);
 // 连接阶段就失败，说明请求没有到达上游。ECONNRESET 等中途错误不在其列。
 const connectFailed = (error) => ['ECONNREFUSED','ENOTFOUND','EAI_AGAIN'].includes(error?.cause?.code);
+/**
+ * 同一幂等键的上一次网页生成能否安全地再执行一次：只有确定没在上游建出任务的失败才行。
+ *   · usage_state='not_executed'：没发出去（余额不足、参数校验、连接未建立……）
+ *   · upstream_http_4xx：上游明确拒绝，冻结已自动退（billing.mjs settleRequest）
+ * uncertain、5xx、冻结仍在 pending 的都可能已在上游建了任务，重放就是重复生成、重复扣费。
+ */
+export function rerunnableAttempt({ status, usage_state, error_code, billing_state }) {
+  if (status !== 'failed' || !['released', null, undefined].includes(billing_state)) return false;
+  return usage_state === 'not_executed' || /^upstream_http_4\d\d$/.test(error_code ?? '');
+}
+
+/**
+ * 这一单的插件归属能否进入可支付分成。
+ *
+ * 插件凭据由桌面 bootstrap 按会话签发：未上报 installed_packages 的旧客户端拿到全部插件凭据，
+ * 上报了也只是客户端声明。服务端没有可信的安装记录，所以**凭据本身永远不使归属可支付**：
+ * 直接用插件凭据、或主令牌 + X-IPZSK-Plugin-Token 出示，都记 credential_unverified，
+ * 插件照常可用（用量、模型白名单、任务隔离不变），但不产生开发者分佣或 plugin_earnings。
+ * X-IPZSK-Skill-Version 必须先出示插件凭据才能用，插件身份仍来自凭据，同样不可支付。
+ * 只有 X-IPZSK-Skill-Calls 按登记的 skill 内容哈希独立解析出插件（resolveSkillCalls 的 attributed）
+ * 才记 skill_marker——那条路不出示凭据也成立，凭据不会给它增加任何可支付性。
+ */
+export function pluginAttributionState({ pluginId, credentialPlugin, skillState }) {
+  if (!pluginId) return 'none';
+  return credentialPlugin && skillState !== 'attributed' ? 'credential_unverified' : 'skill_marker';
+}
+
+// Public user responses do not expose the upstream pool's identity, cost or pricing internals.
+// 未知扣款保持 null（不当 0）；净消费 = 原扣款 - 已落账退款。
+export function publicUsageRow({ key_name, upstream_id, cost_cny, cost_reference, cost_recorded_at, estimated_cost_cny, pricing_details,
+  skill_calls, skill_attribution_state, ...row }, more = {}) {
+  const charged = row.charged_cny ?? null, refunded = charged === null ? null : more.refunded_cny ?? '0';
+  return { ...row, charged_points: points(charged), plugin_name: more.plugin_name ?? null, refunded_cny: refunded,
+    net_charged_cny: charged === null ? null : decimal(units(charged) - units(refunded)),
+    pricing_version: more.pricing_version ?? null, attribution_state: more.plugin_attribution_state ?? 'none' };
+}
+
 export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, origin, imageStorage = null, lanehub = null, lanehubCatalog = null, lanehubAccountId = null,
   lanehubSignupCny = 0, lanehubUsdCny = 0, lanehubQuotaPerUnit = 500_000, requestTimeoutMs = 180_000, maxAttempts = 3 }) {
   const limiter = new RateLimiter();
@@ -78,8 +115,13 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
   });
   app.get('/api/me/usage', async (req) => {
     const records = await listRequests(db, req.query, req.apiUser.id);
-    // Public user responses do not expose the upstream pool's identity.
-    records.rows = records.rows.map(({ key_name, upstream_id, cost_cny, cost_reference, cost_recorded_at, estimated_cost_cny, pricing_details, skill_calls, skill_attribution_state, ...row }) => ({...row,charged_points:points(row.charged_cny)}));
+    // 用户可见的明细：插件名、原扣款、退款、净消费、计价版本与归因状态。上游渠道、成本、密钥一律不出。
+    const extra = new Map((await db.query(`SELECT r.id,p.name AS plugin_name,r.plugin_attribution_state,b.refunded_cny,
+      CASE WHEN b.price_snapshot ? 'policy_version' THEN 'policy-'||(b.price_snapshot->>'policy_version')
+        WHEN b.price_snapshot->>'source'='lanehub' THEN 'lanehub' END AS pricing_version
+      FROM requests r LEFT JOIN plugins p ON p.id=r.plugin_id LEFT JOIN request_billing b ON b.request_id=r.id
+      WHERE r.id=ANY($1::uuid[]) AND r.user_id=$2`, [records.rows.map(row => row.id), req.apiUser.id])).rows.map(row => [row.id, row]));
+    records.rows = records.rows.map(row => publicUsageRow(row, extra.get(row.id)));
     const summary = (await db.query(`SELECT count(*) AS requests,coalesce(sum(input_tokens),0) AS input_tokens,
       coalesce(sum(output_tokens),0) AS output_tokens,coalesce(sum(total_tokens),0) AS total_tokens,
       count(*) FILTER(WHERE usage_state='unknown') AS unknown FROM requests WHERE user_id=$1`, [req.apiUser.id])).rows[0];
@@ -114,6 +156,27 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     const image=await fetchResultImage(url);
     return reply.type(image.type).send(image.body);
   });
+  // 图片以外的结果（视频、缩略图、字幕、带字幕视频）：同样只经网关取，按用户/插件归属校验；不把上游（常带签名）的地址交给客户端。
+  // 主视频已归档到自己的存储时直接跳转到那份副本（支持拖动进度），否则从上游流式转发。
+  const MEDIA_FETCH={videos:fetchResultVideo,captioned_videos:fetchResultVideo,thumbnails:fetchResultImage,
+    subtitles:url=>fetchResultMedia(url,fetch,{types:['application/x-subrip','text/plain','text/srt','text/vtt','application/octet-stream','binary/octet-stream'],maxBytes:65_536})};
+  for(const mediaPath of ['/v1/tasks/:id/media/:kind/:index','/api/me/tasks/:id/media/:kind/:index'])app.get(mediaPath, async (req,reply) => {
+    const id=uuid(req.params.id),kind=req.params.kind;
+    if(!Object.hasOwn(MEDIA_FETCH,kind)||!/^[0-9]{1,2}$/.test(req.params.index))throw httpError(404,'media_not_found');
+    const index=Number(req.params.index);
+    const task=(await db.query(`SELECT t.result FROM media_tasks t JOIN requests r ON r.id=t.id
+      WHERE t.id=$1 AND r.user_id=$2 AND t.status='completed' AND ($3::uuid IS NULL OR r.plugin_id=$3)`,[id,req.apiUser.id,req.apiUser.plugin_id??null])).rows[0];
+    if(!task)throw httpError(404,'media_not_found');
+    if(kind==='videos'&&imageStorage){
+      const archived=(await db.query(`SELECT object_key FROM media_assets WHERE task_id=$1 AND result_index=$2 AND user_id=$3 AND kind='video' AND status='ready'`,
+        [id,index,req.apiUser.id])).rows[0];
+      if(archived)return reply.redirect(imageStorage.getUrl(archived.object_key));
+    }
+    const url=resultEntries(task.result,kind)[index]?.url;
+    if(!url)throw httpError(404,'media_not_found');
+    const file=await MEDIA_FETCH[kind](url);
+    return reply.type(file.type).send(file.body);
+  });
   // /api/videos/tasks?task_id= 是官网视频页的轮询入口（同一份任务，只是用 query 传 id）。
   for(const taskPath of ['/v1/tasks/:id','/api/me/tasks/:id','/api/videos/tasks'])app.get(taskPath, async (req) => {
     const id=uuid(req.params.id ?? req.query?.task_id);
@@ -123,7 +186,10 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
     if(!task)throw httpError(404,'task_not_found');
     await refreshMediaTask(db,upstream,id).catch(()=>{});
     const saved=(await db.query('SELECT status,result FROM media_tasks WHERE id=$1',[id])).rows[0];
-    return {code:200,data:publicImageTask(saved.result??{id,status:saved.status,progress:0,result:null},origin),billing:await requestCharge(db,id,req.apiUser.id)};
+    // 网站页面（cookie 会话）拿到的结果地址必须能被 <img>/<video> 直接加载：走 /api/me/tasks（认 cookie）。
+    // /api/videos/tasks 是官网视频页的入口，页面同样带着登录 cookie。Bearer 客户端（插件、桌面）用 /v1/tasks。
+    const base=req.url.startsWith('/v1/')?'/v1/tasks':'/api/me/tasks';
+    return {code:200,data:publicImageTask(saved.result??{id,status:saved.status,progress:0,result:null},origin,base),billing:await requestCharge(db,id,req.apiUser.id)};
   });
   app.addContentTypeParser(/^multipart\/form-data(?:;|$)/i,{parseAs:'buffer'},(req,body,done)=>{
     if(!['/v1/audio/transcriptions','/v1/images/edits','/v1/images/generations','/api/me/images/generations'].includes(req.url.split('?')[0]))return done(httpError(415,'unsupported_content_type'));
@@ -199,6 +265,7 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       if(!claim)throw httpError(403,'plugin_token_denied');
       pluginId=claim.plugin_id;
     }
+    const credentialPlugin=pluginId;
     const skillCalls=await resolveSkillCalls(db,req.headers['x-ipzsk-skill-calls'],body.model,pluginId);
     pluginId=skillCalls.pluginId;
     let plugin;
@@ -213,6 +280,7 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
         WHERE s.plugin_id=$1 AND v.skill_ref=$2 AND v.content_sha256=$3 AND v.enabled`,[pluginId,match[1],match[2]])).rowCount)
         throw httpError(403,'skill_version_denied');
     }
+    const pluginAttribution=pluginAttributionState({pluginId,credentialPlugin,skillState:skillCalls.state});
     const protocolHeaders=agentHeaders(path,req.headers);
     if(audio)protocolHeaders['Content-Type']=audio.contentType;
     const id = randomUUID(), started = Date.now();
@@ -221,13 +289,23 @@ export function gatewayRoutes(app, { db, upstream, scheduler, customerAuth, orig
       throw httpError(400,'invalid_idempotency_key');
     }
     const fingerprint = hash(JSON.stringify(stable({path,body:studio?clientBody:body,...(plugin?{plugin_id:plugin.id}:{}),...(skillCalls.calls.length?{skill_calls:skillCalls.calls}:{})})));
-    const insertRequest = (c) => c.query(`INSERT INTO requests (id,user_id,model,idempotency_key,fingerprint,stream,access_token_id,plugin_id,plugin_publisher_ref,plugin_owner_user_id,plugin_share_bps,skill_calls,skill_attribution_state)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(user_id,idempotency_key) DO NOTHING RETURNING id`,
-    [id,req.apiUser.id,body.model,idempotency,fingerprint,body.stream,req.apiUser.token_id,plugin?.id??null,plugin?.publisher_ref??null,plugin?.owner_user_id??null,plugin?.revenue_share_bps??null,JSON.stringify(skillCalls.calls),skillCalls.state]);
+    const insertRequest = (c) => c.query(`INSERT INTO requests (id,user_id,model,idempotency_key,fingerprint,stream,access_token_id,plugin_id,plugin_publisher_ref,plugin_owner_user_id,plugin_share_bps,skill_calls,skill_attribution_state,plugin_attribution_state)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT(user_id,idempotency_key) DO NOTHING RETURNING id`,
+    [id,req.apiUser.id,body.model,idempotency,fingerprint,body.stream,req.apiUser.token_id,plugin?.id??null,plugin?.publisher_ref??null,plugin?.owner_user_id??null,plugin?.revenue_share_bps??null,JSON.stringify(skillCalls.calls),skillCalls.state,pluginAttribution]);
     // 生成记录与 requests 同一事务：进行中超限（429）会连同 requests 一起回滚。
-    const inserted = studio
-      ? await db.tx(async (c) => { const r = await insertRequest(c); if (r.rowCount) await insertGenerationRecord(c,id,req.apiUser.id,studio.record); return r; })
-      : await insertRequest(db);
+    const insertStudio = () => db.tx(async (c) => { const r = await insertRequest(c); if (r.rowCount) await insertGenerationRecord(c,id,req.apiUser.id,studio.record); return r; });
+    let inserted = studio ? await insertStudio() : await insertRequest(db);
+    // 网页生图重试沿用同一个幂等键。上一次若**确定没在上游执行**（没发出去，或上游 4xx 明确拒绝、冻结已退），
+    // 把旧行的键改名留档，这一次按新请求执行；结果不确定的旧请求一律不重放（见 rerunnableAttempt）。
+    if (!inserted.rowCount && studio) {
+      const prior = (await db.query(`SELECT r.id,r.status,r.usage_state,r.error_code,b.state AS billing_state FROM requests r
+        LEFT JOIN request_billing b ON b.request_id=r.id WHERE r.user_id=$1 AND r.idempotency_key=$2`, [req.apiUser.id,idempotency])).rows[0];
+      if (prior && rerunnableAttempt(prior)) {
+        await db.query(`UPDATE requests SET idempotency_key=idempotency_key||':retired:'||id WHERE id=$1 AND idempotency_key=$2 AND status='failed'`,
+          [prior.id,idempotency]);
+        inserted = await insertStudio();
+      }
+    }
     if (!inserted.rowCount) {
       const old = (await db.query('SELECT id,fingerprint,status FROM requests WHERE user_id=$1 AND idempotency_key=$2',
         [req.apiUser.id,idempotency])).rows[0];

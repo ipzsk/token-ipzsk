@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { httpError } from './security.mjs';
 import { uuid } from './validation.mjs';
 import { units, decimal, wallet } from './billing.mjs';
-import { creditAccount, provisionIfEnabled, lanehubMode } from './lanehub.mjs';
+import { provisionIfEnabled, lanehubMode, lanehubQuota, startAdjustment, applyAdjustment } from './lanehub.mjs';
 
 // 插件作者的分成：计提、退款冲销、结算单。
 //
@@ -124,10 +124,48 @@ export async function accrueEarning(c, requestId) {
            ELSE round((b.charged_cny-b.refunded_cny)*r.plugin_share_bps/10000,8) END
     FROM requests r JOIN request_billing b ON b.request_id=r.id JOIN plugins p ON p.id=r.plugin_id
     WHERE r.id=$1 AND r.plugin_owner_user_id IS NOT NULL AND b.state='settled'
+      AND r.plugin_attribution_state<>'credential_unverified'
       AND NOT EXISTS(SELECT 1 FROM commission_requests WHERE request_id=r.id AND enabled)
       AND (p.price_per_call_cny > 0
            OR (coalesce(r.plugin_share_bps,0)>0 AND (b.charged_cny-b.refunded_cny)>0))
     ON CONFLICT DO NOTHING`, [requestId, randomUUID()]);
+}
+
+/**
+ * 退款落账：refunded_cny 累加、作者计提按比例冲回、审计。本地模式与 lanehub 模式共用。
+ * 没有插件归属或没配比例的请求本来就没计提，这里也不记。
+ */
+async function bookRefund(c,{requestId,value,why,administratorId,seq}) {
+  await c.query('UPDATE request_billing SET refunded_cny=refunded_cny+$2 WHERE request_id=$1',[requestId,value]);
+  const request=(await c.query('SELECT plugin_owner_user_id,plugin_id,plugin_share_bps,plugin_attribution_state FROM requests WHERE id=$1',[requestId])).rows[0];
+  let clawback='0';
+  const profitCommission=(await c.query('SELECT request_id FROM commission_requests WHERE request_id=$1 AND enabled',[requestId])).rowCount>0;
+  // 未核验归属从未计提，也就没有可冲回的。
+  if(!profitCommission&&request?.plugin_owner_user_id&&request.plugin_attribution_state!=='credential_unverified'&&Number(request.plugin_share_bps)>0){
+    clawback=decimal((units(value)*BigInt(request.plugin_share_bps)+5000n)/10000n);
+    if(units(clawback)>0n)await c.query(`INSERT INTO plugin_earnings (id,request_id,owner_user_id,plugin_id,kind,amount_cny)
+      VALUES ($1,$2,$3,$4,'refund',$5)`,[randomUUID(),requestId,request.plugin_owner_user_id,request.plugin_id,'-'+clawback]);
+  }
+  await c.query('INSERT INTO audit_events(action,target_id,administrator_id,details) VALUES($1,$2,$3,$4)',
+    ['billing.refund',requestId,administratorId,JSON.stringify({amount_cny:value,reason:why,clawback_cny:clawback,lanehub_seq:seq})]);
+  return clawback;
+}
+
+/**
+ * lanehub 额度已确认加回后的本地落账。booked_at 是幂等闸：同一 reference 只落一次，
+ * 接口、人工核对与后台补账任意顺序重入都安全。
+ */
+export async function bookServiceRefund(c,reference) {
+  const found=(await c.query(`SELECT user_id,payload FROM lanehub_credits WHERE reference=$1 AND payload->>'booking'='service_refund'`,[reference])).rows[0];
+  if(!found)return null;
+  // 与退款接口同一加锁顺序：用户 → 账单 → 调整行。
+  await c.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[found.user_id]);
+  await c.query('SELECT request_id FROM request_billing WHERE request_id=$1 FOR UPDATE',[found.payload.request_id]);
+  const row=(await c.query(`UPDATE lanehub_credits SET booked_at=now(),updated_at=now()
+    WHERE reference=$1 AND state='applied' AND booked_at IS NULL RETURNING *`,[reference])).rows[0];
+  if(!row)return null;
+  const {request_id:requestId,reason:why,administrator_id:administratorId}=row.payload;
+  return {clawback:await bookRefund(c,{requestId,value:row.amount_cny,why,administratorId,seq:Number(reference.split(':')[2])})};
 }
 
 const amount=(value)=>{
@@ -155,10 +193,11 @@ export function earningsRoutes(app,options){
    *   2. plugin_earnings 记一条负数（已冻结的结算单不回溯，负数落到下一张单里）
    *   3. 钱真的回到用户手里
    *
-   * 第 3 步在 lanehub 模式下是加回对面的额度，幂等键 `refund:<请求 id>:<序号>`；
-   * 本地模式下写一条 wallet_entries。**记账与打款在同一个事务里**：加钱失败或打款未确认时
-   * 整笔回滚，不会出现「账面说退了、钱没到」。序号取自 request_billing.refund_seq 自增，
-   * 不再用「refund 计提行数」——没有插件归属的请求没有计提行，序号永远是 0，第二次退款会被吞掉。
+   * 本地模式：三件事在同一个事务里。
+   * lanehub 模式：第 3 步是远程加额度，没有幂等键，不能放进本地事务（回滚会抹掉占位，重试就重复加钱）。
+   * 分三段：先提交 pending 占位（序号取自 refund_seq），再调用对面，确认生效后由 bookServiceRefund
+   * 幂等地落 1、2 两步。结果未知时占位停在 review，账面不动，等人工核对（见 lanehub-adjustments.mjs）。
+   * 同一笔请求同时只允许一笔在途退款，退款上限因此只需看已落账的 refunded_cny。
    */
   app.post('/admin/api/billing/:id/refund',async(req)=>{
     const id=uuid(req.params.id),value=amount(req.body?.amount_cny),why=reason(req.body?.reason);
@@ -174,33 +213,29 @@ export function earningsRoutes(app,options){
       const bill=(await c.query('SELECT * FROM request_billing WHERE request_id=$1 FOR UPDATE',[id])).rows[0];
       if(bill.state!=='settled')throw httpError(409,'billing_not_settled');
       if((await c.query('SELECT 1 FROM commission_allocations WHERE request_id=$1 AND chargeback_cny>0 LIMIT 1',[id])).rowCount)throw httpError(409,'chargeback_requires_manual_resolution');
-      const remaining=units(bill.charged_cny)-units(bill.refunded_cny);
-      if(units(value)>remaining)throw httpError(409,'refund_exceeds_charge');
-      // 每一笔退款有自己的序号；同一笔重试会落回同一个 reference（幂等），不同笔永远不撞。
-      const seq=(await c.query('UPDATE request_billing SET refunded_cny=refunded_cny+$2,refund_seq=refund_seq+1 WHERE request_id=$1 RETURNING refund_seq',[id,value])).rows[0].refund_seq;
-      // 钱和账在同一事务里落：加钱失败就整笔回滚，重试时会用同一个（已回滚的）序号重新加。
+      if((await c.query(`SELECT 1 FROM lanehub_credits WHERE reference LIKE $1 AND state<>'cancelled' AND (state<>'applied' OR booked_at IS NULL) LIMIT 1`,
+        ['refund:'+id+':%'])).rowCount)throw httpError(409,'refund_in_progress');
+      if(units(value)>units(bill.charged_cny)-units(bill.refunded_cny))throw httpError(409,'refund_exceeds_charge');
+      // 每一笔退款有自己的序号，不同笔永远不撞 reference。
+      const seq=(await c.query('UPDATE request_billing SET refund_seq=refund_seq+1 WHERE request_id=$1 RETURNING refund_seq',[id])).rows[0].refund_seq;
       if(useLanehub){
-        const credited=await creditAccount(c,lanehub,{userId:found.user_id,lanehubUserId:account.lanehub_user_id,amountCny:value,
-          usdCnyRate:rate,quotaPerUnit:options.lanehubQuotaPerUnit,reference:`refund:${id}:${seq}`,remark:'人工退款：'+why});
-        if(!credited.applied)throw httpError(409,'refund_reference_conflict');
-      }else{
-        const balance=decimal(units((await wallet(c,found.user_id)).balance_cny)+units(value));
-        await c.query("INSERT INTO wallet_entries(id,user_id,amount_cny,balance_after_cny,source) VALUES($1,$2,$3,$4,'service_refund')",[randomUUID(),found.user_id,value,balance]);
+        const quota=lanehubQuota(value,rate,options.lanehubQuotaPerUnit);
+        await startAdjustment(c,{reference:`refund:${id}:${seq}`,userId:found.user_id,lanehubUserId:account.lanehub_user_id,amountCny:value,quota,
+          remark:'人工退款：'+why,payload:{booking:'service_refund',request_id:id,reason:why,administrator_id:req.administrator.id}});
+        await c.query('INSERT INTO audit_events(action,target_id,administrator_id,details) VALUES($1,$2,$3,$4)',
+          ['billing.refund.requested',id,req.administrator.id,JSON.stringify({amount_cny:value,reason:why,lanehub_seq:seq})]);
+        return {reference:`refund:${id}:${seq}`};
       }
-      // 作者那边按同样的比例冲回去。没有归属或没配比例的请求本来就没计提，这里也不记。
-      const request=(await c.query('SELECT plugin_owner_user_id,plugin_id,plugin_share_bps FROM requests WHERE id=$1',[id])).rows[0];
-      let clawback='0';
-      const profitCommission=(await c.query('SELECT request_id FROM commission_requests WHERE request_id=$1 AND enabled',[id])).rowCount>0;
-      if(!profitCommission&&request?.plugin_owner_user_id&&Number(request.plugin_share_bps)>0){
-        clawback=decimal((units(value)*BigInt(request.plugin_share_bps)+5000n)/10000n);
-        if(units(clawback)>0n)await c.query(`INSERT INTO plugin_earnings (id,request_id,owner_user_id,plugin_id,kind,amount_cny)
-          VALUES ($1,$2,$3,$4,'refund',$5)`,[randomUUID(),id,request.plugin_owner_user_id,request.plugin_id,'-'+clawback]);
-      }
-      await c.query('INSERT INTO audit_events(action,target_id,administrator_id,details) VALUES($1,$2,$3,$4)',
-        ['billing.refund',id,req.administrator.id,JSON.stringify({amount_cny:value,reason:why,clawback_cny:clawback,lanehub_seq:useLanehub?seq:null})]);
-      return {userId:found.user_id,seq,clawback};
+      const balance=decimal(units((await wallet(c,found.user_id)).balance_cny)+units(value));
+      await c.query("INSERT INTO wallet_entries(id,user_id,amount_cny,balance_after_cny,source) VALUES($1,$2,$3,$4,'service_refund')",[randomUUID(),found.user_id,value,balance]);
+      return {clawback:await bookRefund(c,{requestId:id,value,why,administratorId:req.administrator.id,seq:null})};
     });
-    return {ok:true,refunded_cny:value,clawback_cny:plan.clawback};
+    if(!plan.reference)return {ok:true,refunded_cny:value,clawback_cny:plan.clawback};
+    const result=await applyAdjustment(db,lanehub,plan.reference);
+    if(result.state==='review')throw httpError(409,'lanehub_adjustment_review');
+    if(result.state!=='applied')throw httpError(409,'lanehub_adjustment_not_applied');
+    const booked=await db.tx(c=>bookServiceRefund(c,plan.reference));
+    return {ok:true,refunded_cny:value,clawback_cny:booked?.clawback??'0'};
   });
 
   // ── skill 登记与单价 ─────────────────────────────────────────────────────

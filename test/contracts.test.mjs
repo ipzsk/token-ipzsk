@@ -247,7 +247,8 @@ test('ops (lanehub proxy) GET responses match contracts-schema', async () => {
     await check('GET /api/admin/ops/dashboard/period', '/api/admin/ops/dashboard/period?start=1&end=2');
     await check('GET /api/admin/ops/logs', '/api/admin/ops/logs');
     await check('GET /api/admin/ops/logs/stat', '/api/admin/ops/logs/stat');
-    const failed = await check('PUT /api/admin/ops/lane-matrix', '/api/admin/ops/lane-matrix', { body: { changes: [{ channel_id: 1, status: 2 }] }, status: 502, shape: 'ApiErrorBody' });
+    const failed = await check('PUT /api/admin/ops/lane-matrix', '/api/admin/ops/lane-matrix', { body: { changes: [{ channel_id: 1, status: 2,
+      expected: { priority: 1, status: 1, lanes: ['official'] } }] }, status: 502, shape: 'ApiErrorBody' });
     assert.equal(failed.json().error.detail, 'boom');
   } finally { await app.close(); }
 });

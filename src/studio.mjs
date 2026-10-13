@@ -368,8 +368,12 @@ export function studioRoutes(app, options) {
   app.get('/api/me/voices', heygenList('voices'));
 
   // ── 生成记录 ──
+  // charged_points: null 只表示「还不知道」（结算中、冻结待核对）。确定没在上游执行的失败（没发出去，或上游 4xx 拒绝；
+  // 与 gateway.mjs rerunnableAttempt 同一判定）一定没扣费，给 0——lanehub 模式下这类请求本来就没有本地账单行。
   const generationSelect = `SELECT g.*,g.created_at::text AS cursor_at,r.idempotency_key,
-      coalesce(g.charged_points,CASE WHEN b.state IN ('settled','released') THEN b.charged_cny*100 END)::numeric(20,8)::text AS points
+      coalesce(g.charged_points,CASE WHEN b.state IN ('settled','released') THEN b.charged_cny*100
+        WHEN b.state IS NULL AND r.status='failed' AND (r.usage_state='not_executed' OR r.error_code ~ '^upstream_http_4[0-9][0-9]$') THEN 0
+      END)::numeric(20,8)::text AS points
     FROM generation_records g LEFT JOIN requests r ON r.id=g.request_id LEFT JOIN request_billing b ON b.request_id=g.request_id`;
   async function generationItems(rows) {
     const ids = rows.map((r) => r.id), tasks = rows.map((r) => r.task_id).filter(Boolean);

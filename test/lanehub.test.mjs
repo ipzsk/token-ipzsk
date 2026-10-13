@@ -1,40 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { Lanehub, ensureAccount, creditAccount, provisionCustomer } from '../src/lanehub.mjs';
-
-// 一个够用的内存库：只认这三张表上会发生的那几条语句。
-function fakeDb() {
-  const credits = new Map(), accounts = new Map();
-  const db = {
-    credits, accounts, calls: [],
-    async query(sql, args = []) {
-      db.calls.push({ sql: sql.replace(/\s+/g, ' ').trim(), args });
-      if (/INSERT INTO lanehub_credits/.test(sql)) {
-        const [reference, userId, amount, quota] = args;
-        if (credits.has(reference)) return { rowCount: 0, rows: [] };
-        credits.set(reference, { userId, amount, quota, applied_at: null });
-        return { rowCount: 1, rows: [{ reference }] };
-      }
-      if (/DELETE FROM lanehub_credits/.test(sql)) { credits.delete(args[0]); return { rowCount: 1, rows: [] }; }
-      if (/UPDATE lanehub_credits/.test(sql)) {
-        const row = credits.get(args[0]); if (row) row.applied_at = new Date();
-        return { rowCount: 1, rows: [] };
-      }
-      if (/FROM lanehub_accounts a JOIN upstream_keys/.test(sql)) {
-        const row = accounts.get(args[0]);
-        return { rowCount: row ? 1 : 0, rows: row ? [row] : [] };
-      }
-      if (/INSERT INTO lanehub_accounts/.test(sql)) {
-        const [userId, lanehubUserId, keyId, lane] = args;
-        if (!accounts.has(userId)) accounts.set(userId, { user_id: userId, lanehub_user_id: lanehubUserId, key_id: keyId, lane, secret_ref: keyId + '.key' });
-        return { rowCount: 1, rows: [] };
-      }
-      return { rowCount: 0, rows: [] };
-    },
-  };
-  return db;
-}
+import { fakeDb } from './fixtures/fake-lanehub-db.mjs';
+import { Lanehub, ensureAccount, creditAccount, provisionCustomer, startAdjustment, applyAdjustment, sweepAdjustments, randomPassword } from '../src/lanehub.mjs';
 
 function fakeLanehub(script = {}) {
   const seen = [];
@@ -72,18 +40,87 @@ test('同一个 reference 只入账一次', async () => {
   assert.equal(lanehub.seen.filter((c) => c.path.startsWith('/api/user/quota')).length, 1, '对面只能被加一次');
 });
 
-// 对面加额度失败时，占位必须撤掉——否则这笔钱永远加不上去了（reference 已被占用）。
-test('对面失败时撤掉占位，重试还能入账', async () => {
+// 对面没有幂等键：请求发出后结果未知（超时、断连、5xx、业务错误），对面可能已经加上了。
+// 此时绝不能删除占位或自动重试——旧实现删占位，重试就把同一笔钱加两次。
+test('响应丢失进入 review，同一 reference 重试不再调用对面', async () => {
   const db = fakeDb();
-  const boom = fakeLanehub({ '/api/user/quota/7': new Error('lanehub down') });
+  let applied = 0;
+  // 对面实际已经加上额度，只是响应在回来的路上丢了。
+  const lost = fakeLanehub({ '/api/user/quota/7': () => { applied++; throw new Error('socket hang up'); } });
   const args = { userId: 'u1', lanehubUserId: 7, amountCny: '10', usdCnyRate: 7, quotaPerUnit: 500000, reference: 'pay:order-2' };
 
-  await assert.rejects(() => creditAccount(db, boom, args));
-  assert.equal(db.credits.size, 0, '失败后不能留下占位');
+  const first = await creditAccount(db, lost, args);
+  assert.deepEqual([first.applied, first.state], [false, 'review']);
+  assert.equal(db.credits.get('pay:order-2').state, 'review', '占位必须保留并标记待核对');
+  assert.equal(db.credits.get('pay:order-2').review_reason, 'socket hang up');
 
   const ok = fakeLanehub();
   const retry = await creditAccount(db, ok, args);
-  assert.equal(retry.applied, true, '重试必须能入账');
+  assert.deepEqual([retry.applied, retry.state], [false, 'review']);
+  assert.equal(ok.seen.length, 0, '重试一条都不能发到对面');
+  assert.equal(applied, 1, '对面总共只被加过一次');
+});
+
+test('业务错误（success:false）同样进入 review，不自动重试', async () => {
+  const db = fakeDb();
+  const failing = new Lanehub({ baseUrl: 'https://lane.example', adminToken: 'sk-admin',
+    fetcher: async () => Response.json({ success: false, message: 'db busy' }) });
+  const result = await creditAccount(db, failing, { userId: 'u1', lanehubUserId: 7, amountCny: '1', usdCnyRate: 7, quotaPerUnit: 500000, reference: 'r-biz' });
+  assert.equal(result.state, 'review');
+  assert.equal(db.credits.get('r-biz').review_reason, 'db busy');
+});
+
+// pending = 远程调用还没开始（占位后进程退出），这是唯一可以安全接手重试的状态。
+test('停在 pending 的占位可被同一 reference 接手，且只调用一次对面', async () => {
+  const db = fakeDb(), lanehub = fakeLanehub();
+  await startAdjustment(db, { reference: 'grant:1', userId: 'u1', lanehubUserId: 7, amountCny: '2', quota: 100, remark: 'grant' });
+  const [a, b] = await Promise.all([applyAdjustment(db, lanehub, 'grant:1'), applyAdjustment(db, lanehub, 'grant:1')]);
+  assert.equal([a, b].filter((r) => r.applied).length, 1, '并发接手只能有一个真正调用');
+  assert.equal(lanehub.seen.length, 1);
+  assert.equal(db.credits.get('grant:1').state, 'applied');
+});
+
+test('applying 超时由清扫转 review，清扫不调用对面', async () => {
+  const db = fakeDb(), lanehub = fakeLanehub();
+  await startAdjustment(db, { reference: 'x:1', userId: 'u1', lanehubUserId: 7, amountCny: '2', quota: 100 });
+  Object.assign(db.credits.get('x:1'), { state: 'applying', updated_at: Date.now() - 600_000 });
+  await sweepAdjustments(db);
+  assert.equal(db.credits.get('x:1').state, 'review');
+  assert.equal((await applyAdjustment(db, lanehub, 'x:1')).state, 'review');
+  assert.equal(lanehub.seen.length, 0);
+});
+
+test('扣额度发送负 delta；需要本地落账的调整生效后保持未落账', async () => {
+  const db = fakeDb(), lanehub = fakeLanehub();
+  await startAdjustment(db, { reference: 'payment_refund:r1', userId: 'u1', lanehubUserId: 9, kind: 'debit', amountCny: '3', quota: 1234,
+    payload: { booking: 'payment_refund' } });
+  const result = await applyAdjustment(db, lanehub, 'payment_refund:r1');
+  assert.equal(result.applied, true);
+  assert.equal(lanehub.seen[0].path, '/api/user/quota/9');
+  assert.equal(lanehub.seen[0].body.quota, -1234);
+  assert.equal(db.credits.get('payment_refund:r1').booked_at, null, '由落账函数凭 booked_at 幂等落账');
+});
+
+test('同一 reference 换用户、方向或金额一律冲突', async () => {
+  const db = fakeDb();
+  const base = { reference: 'c:1', userId: 'u1', lanehubUserId: 7, amountCny: '2', quota: 100 };
+  await startAdjustment(db, base);
+  await assert.rejects(() => startAdjustment(db, { ...base, amountCny: '3' }), { code: 'adjustment_reference_conflict' });
+  await assert.rejects(() => startAdjustment(db, { ...base, userId: 'u2' }), { code: 'adjustment_reference_conflict' });
+  await assert.rejects(() => startAdjustment(db, { ...base, kind: 'debit' }), { code: 'adjustment_reference_conflict' });
+});
+
+test('建号密码来自 CSPRNG，长度与字符集符合 lanehub 限制', async () => {
+  const source = await (await import('node:fs/promises')).readFile(new URL('../src/lanehub.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /Math\.random/);
+  const seen = new Set();
+  for (let i = 0; i < 200; i++) {
+    const value = randomPassword();
+    assert.match(value, /^ipz[a-z0-9]{16}$/);
+    assert.ok(value.length <= 20);
+    seen.add(value);
+  }
+  assert.equal(seen.size, 200);
 });
 
 test('金额非正或缺 reference 一律拒绝', async () => {
@@ -170,5 +207,5 @@ test('新人额度发放失败不影响建号', async () => {
   const account = await provisionCustomer(db, lanehub, fakeUpstream(),
     { userId: 'u5', accountId: 'acc', signupCny: 5, usdCnyRate: 7, quotaPerUnit: 500000 });
   assert.equal(account.created, true, '密钥仍要建出来');
-  assert.equal(db.credits.size, 0, '失败后不留占位，之后能补发');
+  assert.equal(db.credits.get('signup:u5').state, 'review', '结果未知，留待人工核对后补发或确认');
 });

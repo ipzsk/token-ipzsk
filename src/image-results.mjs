@@ -8,24 +8,41 @@ export function imageUrls(task) {
   if(!Array.isArray(images))return [];
   return images.flatMap(image=>Array.isArray(image?.url)?image.url:[image?.url]).filter(url=>typeof url==='string');
 }
-export function publicImageTask(task,origin) {
+// Result kinds besides images. Each URL is served by the gateway (gateway.mjs /…/tasks/:id/media/:kind/:index),
+// never handed out: upstream URLs are often signed and name the upstream provider.
+export const MEDIA_KINDS=['videos','thumbnails','subtitles','captioned_videos'];
+const MEDIA_FIELDS=['revised_prompt','mime_type','width','height','duration'];
+/** Flattened result URLs of one kind with their item's public metadata; videos skip stray posters (same order as videoUrls). */
+export function resultEntries(task,key){
+  const items=task?.result?.[key];
+  if(!Array.isArray(items))return [];
+  return items.filter(item=>item&&typeof item==='object').flatMap(item=>{
+    const meta={};
+    for(const field of MEDIA_FIELDS)if(typeof item[field]==='string'||typeof item[field]==='number'&&Number.isFinite(item[field]))meta[field]=item[field];
+    return (Array.isArray(item.url)?item.url:[item.url]).filter(url=>typeof url==='string'&&!(key==='videos'&&NOT_VIDEO.test(url))).map(url=>({url,meta}));
+  });
+}
+/**
+ * Public task shape. `base` follows the caller: '/v1/tasks' for Bearer clients, '/api/me/tasks' for the website's cookie
+ * session (a cookie can ride an <img>/<video> request, a Bearer header cannot).
+ */
+export function publicImageTask(task,origin,base='/v1/tasks') {
   const output={id:task.id,status:task.status,progress:typeof task.progress==='number'&&Number.isFinite(task.progress)?task.progress:0,result:null};
   if(task.error)output.error={message:'Media generation failed.'};
   if(task.result&&typeof task.result==='object'&&!Array.isArray(task.result)){
     output.result={};
-    for(const key of ['images','videos','thumbnails','subtitles','captioned_videos']){
-      if(!Array.isArray(task.result[key]))continue;
-      output.result[key]=task.result[key].filter(item=>item&&typeof item==='object').map(item=>{
-        const value={};
-        for(const field of ['url','b64_json','revised_prompt','mime_type','width','height','duration']){
-          if(typeof item[field]==='string'||typeof item[field]==='number'&&Number.isFinite(item[field]))value[field]=item[field];
-        }
-        if(Array.isArray(item.url))value.url=item.url.filter(url=>typeof url==='string');
-        return value;
-      });
-    }
     const images=imageUrls(task);
-    if(images.length)output.result.images=images.map((_,i)=>({url:[`${origin}/v1/tasks/${task.id}/image/${i}`]}));
+    if(images.length)output.result.images=images.map((_,i)=>({url:[`${origin}${base}/${task.id}/image/${i}`]}));
+    // URL-less images (b64_json) carry no upstream address and pass through allowlisted.
+    else if(Array.isArray(task.result.images))output.result.images=task.result.images.filter(item=>item&&typeof item==='object').map(item=>{
+      const value={};
+      for(const field of ['b64_json',...MEDIA_FIELDS])if(typeof item[field]==='string'||typeof item[field]==='number'&&Number.isFinite(item[field]))value[field]=item[field];
+      return value;
+    });
+    for(const key of MEDIA_KINDS){
+      if(!Array.isArray(task.result[key]))continue;
+      output.result[key]=resultEntries(task,key).map(({meta},i)=>({url:[`${origin}${base}/${task.id}/media/${key}/${i}`],...meta}));
+    }
   }
   return output;
 }
@@ -46,6 +63,15 @@ export function videoUrls(task) {
   const videos=task?.result?.videos;
   if(!Array.isArray(videos))return [];
   return videos.flatMap(video=>Array.isArray(video?.url)?video.url:[video?.url]).filter(url=>typeof url==='string'&&!NOT_VIDEO.test(url));
+}
+/**
+ * Status to settle a media hold with. A task the upstream calls `completed` but that carries no result of its kind
+ * (no image URL; no real video URL) settles as `failed`: the hold is released, never charged for nothing.
+ */
+export function settleStatus(kind,rawStatus,data){
+  if(rawStatus!=='completed')return rawStatus;
+  const task={result:data?.result};
+  return (kind==='video'?videoUrls(task):imageUrls(task)).length?'completed':'failed';
 }
 // lanehub side keys: thumbnails / subtitles (srt) / captioned_videos (burned-in captions).
 export const sideUrls=(task,key)=>{

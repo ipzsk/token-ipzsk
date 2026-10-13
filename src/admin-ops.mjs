@@ -15,6 +15,7 @@ const NO_BALANCE_API = /没有余额接口|未实现余额查询|没有实现 ba
 const META_TTL_MS = 10 * 60_000;
 
 const num = (v, d = 0) => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Number(v) : d);
+const optionalNum = (v) => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Number(v) : null);
 const unix = () => Math.floor(Date.now() / 1000);
 const qs = (o) => new URLSearchParams(Object.entries(o).filter(([, v]) => v !== undefined && v !== '')).toString();
 
@@ -38,12 +39,17 @@ export const usdToCny = (usd, rate) => Math.round(num(usd) * num(rate) * 1e6) / 
 const UNITS = ['USD', 'CNY', 'raw'];
 export const unitOf = (u) => (UNITS.includes(u) ? u : 'raw');
 export const balanceCny = (raw, unit, rate) => (raw === null ? null : unit === 'USD' ? usdToCny(raw, rate) : unit === 'CNY' ? raw : null);
-export const quotaCny = (quota, rate, perUnit) => Number(quotaToCny(Math.trunc(num(quota)), rate, perUnit));
+// 退款、调整会产生负 quota：按绝对值换算再取负，不让一条负数日志把整页变成 500。
+export const quotaCny = (quota, rate, perUnit) => {
+  const q = Math.trunc(num(quota));
+  return q < 0 ? -Number(quotaToCny(-q, rate, perUnit)) : Number(quotaToCny(q, rate, perUnit));
+};
 
 function laneChannel(c, rate) {
   const checked = num(c.balance_updated_time) || null;
-  const supported = c.balance_supported ?? true;
-  const unit = unitOf(c.balance_unit), raw = supported && checked ? num(c.balance) : null;
+  // Missing type metadata cannot prove that a provider has a balance API. Keep it unavailable until the matrix says it is supported.
+  const supported = c.balance_supported === true;
+  const unit = unitOf(c.balance_unit), raw = supported && checked ? optionalNum(c.balance) : null;
   return {
     id: c.id, name: String(c.name ?? ''), type: num(c.type), status: num(c.status), priority: num(c.priority), weight: num(c.weight, 1),
     lanes: Array.isArray(c.lanes) ? c.lanes.map(String) : [], vendor: String(c.vendor ?? ''),
@@ -51,7 +57,9 @@ function laneChannel(c, rate) {
     balance_cny: balanceCny(raw, unit, rate), balance_checked_at: checked, balance_raw: raw, balance_unit: unit, balance_supported: supported,
   };
 }
-const priceOf = (p) => (p ? { unit: String(p.unit ?? ''), cny: num(p.cny), source: PRICE_SOURCES.includes(p.source) ? p.source : 'fallback' } : null);
+const priceOf = (p) => p && optionalNum(p.cny) !== null
+  ? { unit: String(p.unit ?? ''), cny: optionalNum(p.cny), source: PRICE_SOURCES.includes(p.source) ? p.source : 'fallback' }
+  : null;
 
 export function transformLaneMatrix(d, rate) {
   const channels = {}, vendor_icons = {};
@@ -89,7 +97,9 @@ export function channelSummary(c, meta, rate, perUnit) {
 
 export const periodRow = (r, rate, perUnit) => {
   const requests = num(r.RequestCount);
-  return { date: String(r.Date ?? ''), key: String(r.Channel ?? ''), requests, amount_cny: quotaCny(r.Quota, rate, perUnit), cost_cny: quotaCny(r.CostQuota, rate, perUnit),
+  // CostQuota 缺失 = 成本未知（null），不是 0：0 会把毛利显示成 100%。
+  return { date: String(r.Date ?? ''), key: String(r.Channel ?? ''), requests, amount_cny: quotaCny(r.Quota, rate, perUnit),
+    cost_cny: r.CostQuota === undefined || r.CostQuota === null || r.CostQuota === '' ? null : quotaCny(r.CostQuota, rate, perUnit),
     prompt_tokens: num(r.PromptTokens), completion_tokens: num(r.CompletionTokens),
     // statistics.request_time 是每条日志 request_time（毫秒）的和。
     avg_latency_ms: requests ? Math.round(num(r.RequestTime) / requests) : 0 };
@@ -98,11 +108,42 @@ export const periodRow = (r, rate, perUnit) => {
 export const logEntry = (l, rate, perUnit) => ({
   id: l.id, created_at: num(l.created_at), type: num(l.type), username: String(l.username ?? ''), token_name: String(l.token_name ?? ''),
   model: String(l.model_name ?? ''), channel: l.channel?.id ? { id: l.channel.id, name: String(l.channel.name ?? '') } : null,
-  amount_cny: quotaCny(l.quota, rate, perUnit), cost_cny: quotaCny(l.cost_quota, rate, perUnit),
+  // cost_source 不是 real / estimated 的那条没有可信成本：null（未知），不能当 0。
+  amount_cny: quotaCny(l.quota, rate, perUnit),
+  cost_cny: ['real', 'estimated'].includes(l.cost_source) && l.cost_quota !== undefined && l.cost_quota !== null ? quotaCny(l.cost_quota, rate, perUnit) : null,
   cost_source: ['real', 'estimated'].includes(l.cost_source) ? l.cost_source : '',
   prompt_tokens: num(l.prompt_tokens), completion_tokens: num(l.completion_tokens), latency_ms: num(l.request_time), is_stream: Boolean(l.is_stream),
   request_id: String(l.request_id ?? ''), upstream_request_id: String(l.upstream_request_id ?? ''), content: String(l.content ?? ''),
 });
+
+/**
+ * Optimistic concurrency for lane-matrix saves (lanehub's batch API has no version). Each change carries `expected`, the
+ * values the operator's edit was based on. Per change, against the channel's current state:
+ *   · already equal to the target → applied before (a retried save): skip, report as is — idempotent without a key
+ *   · the fields being changed still equal `expected` → apply
+ *   · otherwise someone else changed them, or the channel left the matrix → conflict, nothing is written
+ * Only the fields a change writes are compared, so editing priority never conflicts with someone else's lanes edit.
+ */
+export function laneStates(d) {
+  const out = new Map();
+  for (const r of d?.rows ?? []) for (const c of [...(r.channels ?? []), ...Object.values(r.cells ?? {}).flatMap((x) => x?.channels ?? [])])
+    if (!out.has(c.id)) out.set(c.id, { priority: num(c.priority), status: num(c.status), lanes: Array.isArray(c.lanes) ? c.lanes.map(String) : [] });
+  return out;
+}
+const sameLanes = (a, b) => a.length === b.length && a.every((x) => b.includes(x));
+const fieldsOf = (c) => ['priority', 'status', 'lanes'].filter((k) => c[k] !== undefined);
+const matches = (cur, want, keys) => keys.every((k) => (k === 'lanes' ? sameLanes(cur.lanes, want.lanes ?? []) : cur[k] === want[k]));
+export function planLaneChanges(changes, states) {
+  const apply = [], unchanged = [], conflicts = [];
+  for (const c of changes) {
+    const cur = states.get(c.channel_id), keys = fieldsOf(c);
+    if (!cur) conflicts.push({ channel_id: c.channel_id, reason: 'channel_missing' });
+    else if (matches(cur, c, keys)) unchanged.push({ channel_id: c.channel_id, current: cur });
+    else if (!matches(cur, c.expected, keys)) conflicts.push({ channel_id: c.channel_id, reason: 'changed', current: cur });
+    else apply.push(c);
+  }
+  return { apply, unchanged, conflicts };
+}
 
 export function laneChanges(body) {
   if (!plainObject(body) || Object.keys(body).some((k) => k !== 'changes')) throw fail(400, 'invalid_lane_changes');
@@ -110,12 +151,16 @@ export function laneChanges(body) {
   if (!Array.isArray(changes) || !changes.length || changes.length > 200) throw fail(400, 'invalid_lane_changes');
   return changes.map((c, index) => {
     const bad = () => fail(400, 'invalid_lane_changes', { index });
-    if (!plainObject(c) || Object.keys(c).some((k) => !['channel_id', 'priority', 'status', 'lanes'].includes(k))) throw bad();
+    if (!plainObject(c) || Object.keys(c).some((k) => !['channel_id', 'priority', 'status', 'lanes', 'expected'].includes(k))) throw bad();
     if (!Number.isSafeInteger(c.channel_id) || c.channel_id < 1) throw bad();
     if (c.priority !== undefined && !Number.isSafeInteger(c.priority)) throw bad();
     if (c.status !== undefined && c.status !== 1 && c.status !== 2) throw bad();
     if (c.lanes !== undefined && (!Array.isArray(c.lanes) || c.lanes.length > 50 || c.lanes.some((s) => typeof s !== 'string' || !s || s.length > 64))) throw bad();
-    return { channel_id: c.channel_id, priority: c.priority, status: c.status, lanes: c.lanes };
+    const e = c.expected;
+    if (!plainObject(e) || Object.keys(e).some((k) => !['priority', 'status', 'lanes'].includes(k)) || !Number.isFinite(e.priority)
+      || ![1, 2, 3].includes(e.status) || !Array.isArray(e.lanes) || e.lanes.length > 50 || e.lanes.some((s) => typeof s !== 'string')) throw bad();
+    if (c.priority === undefined && c.status === undefined && c.lanes === undefined) throw bad();
+    return { channel_id: c.channel_id, priority: c.priority, status: c.status, lanes: c.lanes, expected: { priority: e.priority, status: e.status, lanes: e.lanes } };
   });
 }
 
@@ -127,7 +172,13 @@ export function adminOpsRoutes(app, options) {
   const audit = (req, action, target, details) => db.query('INSERT INTO audit_events(action,target_id,details,actor_user_id) VALUES($1,$2,$3,$4)',
     [action, target, JSON.stringify(details), req.apiUser.id]);
   const hub = () => { if (!options.lanehub) throw fail(503, 'lanehub_unavailable'); return options.lanehub; };
-  const rate = () => options.lanehub.usdRate().catch(() => options.lanehubUsdCny);
+  // 汇率读不到、配置也没有（LANEHUB_USD_CNY 默认 0）时不能按 0 换算：余额会显示 ¥0、触发假的低余额告警，
+  // quota 换算还会抛出成 500。明确返回 503 lanehub_rate_unavailable。
+  const rate = async () => {
+    const r = Number(await hub().usdRate().catch(() => options.lanehubUsdCny));
+    if (!(r > 0) || !Number.isFinite(r)) throw fail(503, 'lanehub_rate_unavailable');
+    return r.toFixed(8);
+  };
   // Lanehub.call 的 502 只带 detail 属性；换成 fail() 才会出现在响应体里。网络错误 / 超时同样算 lanehub 失败。
   const call = async (path, init) => {
     try { return await hub().call(path, init); } catch (e) {
@@ -163,16 +214,26 @@ export function adminOpsRoutes(app, options) {
     await requireRole(req, 'operator', 'admin');
     const changes = laneChanges(req.body);
     writeLimit(req);
-    let data;
-    try {
-      data = await call('/api/lane_matrix/batch', { method: 'PUT', body: { changes } });
-    } catch (e) {
-      await audit(req, 'ops.lane_matrix.save', null, { changes, error: e.code, detail: e.fields?.detail ?? null });
-      throw e;
+    const plan = planLaneChanges(changes, laneStates(await call('/api/lane_matrix')));
+    if (plan.conflicts.length) {
+      await audit(req, 'ops.lane_matrix.save', null, { changes, error: 'lane_matrix_conflict', conflicts: plan.conflicts });
+      throw fail(409, 'lane_matrix_conflict', { conflicts: plan.conflicts });
+    }
+    const send = plan.apply.map(({ expected: _expected, ...c }) => c);
+    let data = [];
+    if (send.length) {
+      try {
+        data = await call('/api/lane_matrix/batch', { method: 'PUT', body: { changes: send } });
+      } catch (e) {
+        await audit(req, 'ops.lane_matrix.save', null, { changes: send, error: e.code, detail: e.fields?.detail ?? null });
+        throw e;
+      }
     }
     const state = (s) => ({ group: String(s?.group ?? ''), priority: num(s?.priority), status: num(s?.status) });
-    const results = (Array.isArray(data) ? data : []).map((r) => ({ channel_id: r.channel_id, name: String(r.name ?? ''), before: state(r.before), after: state(r.after) }));
-    await audit(req, 'ops.lane_matrix.save', null, { changes, results });
+    const now = (cur) => ({ group: cur.lanes.join(','), priority: cur.priority, status: cur.status });
+    const results = [...(Array.isArray(data) ? data : []).map((r) => ({ channel_id: r.channel_id, name: String(r.name ?? ''), before: state(r.before), after: state(r.after) })),
+      ...plan.unchanged.map((u) => ({ channel_id: u.channel_id, name: '', before: now(u.current), after: now(u.current) }))];
+    if (send.length) await audit(req, 'ops.lane_matrix.save', null, { changes: send, results, already_applied: plan.unchanged.map((u) => u.channel_id) });
     meta = null;
     return { results };
   });
@@ -203,12 +264,24 @@ export function adminOpsRoutes(app, options) {
       out = { state: NO_BALANCE_API.test(message) ? 'unsupported' : 'failed', balance: null, message };
     }
     const latency_ms = Date.now() - started;
-    // 渠道不在线路矩阵里（没挂任何档位）就不知道类型，按 raw 处理。
-    const m = await channelMeta();
-    const unit = unitOf(m.types.get(m.channelTypes.get(id))?.balance_unit);
     const raw = out.state === 'ok' ? num(out.balance) : null;
-    const probe = { channel_id: id, state: out.state, balance_cny: balanceCny(raw, unit, await rate()), balance_raw: raw, balance_unit: unit,
-      latency_ms, message: out.message, checked_at: unix() };
+    // update_balance 已成功时，后续元数据/汇率读取失败不能把成功误报成失败。未知口径保留 raw 值供人工核对。
+    let unit = 'raw', cny = null, message = out.message;
+    if (out.state === 'ok') {
+      try {
+        const m = await channelMeta();
+        unit = unitOf(m.types.get(m.channelTypes.get(id))?.balance_unit);
+      } catch {
+        message = '余额已刷新，渠道元数据暂时不可用；当前按上游原始单位显示。';
+      }
+      if (unit === 'CNY') cny = raw;
+      else if (unit === 'USD') {
+        try { cny = balanceCny(raw, unit, await rate()); }
+        catch { message = '余额已刷新，美元汇率暂时不可用；人民币余额待核对。'; }
+      }
+    }
+    const probe = { channel_id: id, state: out.state, balance_cny: cny, balance_raw: raw, balance_unit: unit,
+      latency_ms, message, checked_at: unix() };
     await audit(req, 'ops.channel.probe', String(id), { state: probe.state, latency_ms, balance_raw: raw, balance_unit: unit, balance_cny: probe.balance_cny, message: probe.message || undefined });
     return probe;
   });
@@ -216,7 +289,8 @@ export function adminOpsRoutes(app, options) {
   app.get('/api/admin/ops/dashboard/realtime', async (req) => {
     await requireRole(req, 'viewer', 'operator', 'admin');
     const d = await call('/api/analytics/rpm');
-    return { rpm: num(d?.rpm), tpm: num(d?.tpm), cost_per_min_cny: usdToCny(d?.cpm, await rate()) };
+    const cpm = optionalNum(d?.cpm);
+    return { rpm: num(d?.rpm), tpm: num(d?.tpm), cost_per_min_cny: cpm === null ? null : usdToCny(cpm, await rate()) };
   });
 
   app.get('/api/admin/ops/dashboard/period', async (req) => {
@@ -264,7 +338,9 @@ const logQuery = { start: opt(int(0)), end: opt(int(0)), model: opt(string), use
   upstream_request_id: opt(string), type: opt(lit(1, 2, 3, 4)) };
 const laneState = object({ group: string, priority: number, status: int(0) });
 Object.assign(schemas, {
-  LaneChange: object({ channel_id: int(1), priority: opt(int()), status: opt(lit(1, 2)), lanes: opt(array(string, 50)) }),
+  // expected: the channel's values the edit was based on (optimistic concurrency; 409 lane_matrix_conflict when they changed).
+  LaneChange: object({ channel_id: int(1), priority: opt(int()), status: opt(lit(1, 2)), lanes: opt(array(string, 50)),
+    expected: object({ priority: number, status: lit(1, 2, 3), lanes: array(string, 50) }) }),
   LaneMatrixSave: object({ changes: array(ref('LaneChange'), 200) }),
   LaneMatrixSaveResult: object({ results: array(object({ channel_id: int(1), name: string, before: laneState, after: laneState })) }),
   LaneMatrixQuery: object({ resolution: opt(string), duration: opt(int(1, 3600)) }),
@@ -284,15 +360,15 @@ Object.assign(schemas, {
   OpsChannelPage: object({ items: array(ref('ChannelSummary')), page: int(1), size: int(1), total: int(0) }),
   Probe: object({ channel_id: int(1), state: lit('ok', 'unsupported', 'failed'), balance_cny: nullable(number),
     balance_raw: nullable(number), balance_unit: lit('USD', 'CNY', 'raw'), latency_ms: int(0), message: string, checked_at: int(0) }),
-  OpsRealtime: object({ rpm: number, tpm: number, cost_per_min_cny: number }),
+  OpsRealtime: object({ rpm: number, tpm: number, cost_per_min_cny: nullable(number) }),
   OpsPeriodQuery: object({ start: int(0), end: int(0), group_by: opt(lit('model', 'channel')), channel_id: opt(int(1)), model: opt(string) }),
-  OpsPeriod: object({ rows: array(object({ date: string, key: string, requests: int(0), amount_cny: number, cost_cny: number, prompt_tokens: int(0),
+  OpsPeriod: object({ rows: array(object({ date: string, key: string, requests: int(0), amount_cny: number, cost_cny: nullable(number), prompt_tokens: int(0),
     completion_tokens: int(0), avg_latency_ms: int(0) })) }),
   OpsLogQuery: object({ page: opt(int(1)), size: opt(int(1, 100)), ...logQuery }),
   OpsLogStatQuery: object(logQuery),
   LogEntry: object({
     id: int(1), created_at: int(0), type: lit(1, 2, 3, 4), username: string, token_name: string, model: string,
-    channel: nullable(object({ id: int(1), name: string })), amount_cny: number, cost_cny: number, cost_source: lit('real', 'estimated', ''),
+    channel: nullable(object({ id: int(1), name: string })), amount_cny: number, cost_cny: nullable(number), cost_source: lit('real', 'estimated', ''),
     prompt_tokens: int(0), completion_tokens: int(0), latency_ms: int(0), is_stream: boolean, request_id: string, upstream_request_id: string, content: string,
   }),
   OpsLogPage: object({ items: array(ref('LogEntry')), page: int(1), size: int(1), total: int(0) }),

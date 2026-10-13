@@ -615,6 +615,11 @@ export interface LaneChange {
   priority?: number
   status?: 1 | 2
   lanes?: string[] // max 50 items
+  expected: {
+    priority: number
+    status: 1 | 2 | 3
+    lanes: string[] // max 50 items
+  }
 }
 export interface LaneChannel {
   id: number // integer 1..
@@ -694,7 +699,7 @@ export interface LogEntry {
     name: string
   } | null
   amount_cny: number
-  cost_cny: number
+  cost_cny: number | null
   cost_source: "real" | "estimated" | ""
   prompt_tokens: number // integer 0..
   completion_tokens: number // integer 0..
@@ -811,7 +816,7 @@ export interface OpsPeriod {
     key: string
     requests: number // integer 0..
     amount_cny: number
-    cost_cny: number
+    cost_cny: number | null
     prompt_tokens: number // integer 0..
     completion_tokens: number // integer 0..
     avg_latency_ms: number // integer 0..
@@ -827,7 +832,7 @@ export interface OpsPeriodQuery {
 export interface OpsRealtime {
   rpm: number
   tpm: number
-  cost_per_min_cny: number
+  cost_per_min_cny: number | null
 }
 export interface ParamSpec {
   field: string

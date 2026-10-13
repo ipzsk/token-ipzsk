@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { randomInt } from 'node:crypto';
 import { hash, httpError } from './security.mjs';
 
 // lanehub 接入：**额度真源在 lanehub**，这一侧只负责账号映射、充值入账和转发。
@@ -128,8 +129,12 @@ function lanehubUsername(userId) {
   return 'ipz' + short;
 }
 
-function randomPassword() {
-  return 'ipz' + Math.random().toString(36).slice(2, 12) + Math.random().toString(36).slice(2, 6);
+const PASSWORD_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
+// 建号密码不给人用，但必须不可预测：用 CSPRNG（node:crypto），字符集与长度沿用 lanehub 已接受的格式。
+export function randomPassword() {
+  let value = 'ipz';
+  for (let i = 0; i < 16; i++) value += PASSWORD_ALPHABET[randomInt(PASSWORD_ALPHABET.length)];
+  return value;
 }
 
 /**
@@ -206,34 +211,81 @@ export async function provisionCustomer(db, lanehub, upstream, {
 }
 
 /**
+ * lanehub 额度调整（加额度 / 扣额度）的状态机，一行 lanehub_credits 对应一次调整：
+ *
+ *   pending → applying → applied
+ *                     ↘ review → applied | pending（人工确认未生效后重试）| cancelled
+ *
+ * lanehub 的 /api/user/quota/:id 是增量接口（quota = quota + delta），没有幂等键。
+ * 所以 applying 一旦提交到库，远程调用的任何未知结果（超时、断连、非 2xx、业务错误）
+ * 都只能进 review，由人工到 lanehub 核对后再处理；绝不删除占位、绝不自动重试。
+ * 只有 pending（远程调用尚未开始）可以被重试接手。占位行必须在调用前**独立提交**，
+ * 因此本函数不能在调用方事务里执行（db 必须是连接池）。
+ */
+export const lanehubQuota = (amountCny, usdCnyRate, quotaPerUnit) =>
+  Math.round((Number(amountCny) / Number(usdCnyRate)) * Number(quotaPerUnit));
+
+/** 落一行 pending 占位；同一 reference 已存在时返回原行（用户、方向、金额不同则冲突）。 */
+export async function startAdjustment(db, { reference, userId, lanehubUserId, kind = 'credit', amountCny, quota, remark, payload = {} }) {
+  if (!reference) throw httpError(400, 'credit_reference_required');
+  if (!(Number(amountCny) > 0) || !Number.isSafeInteger(quota) || quota <= 0) throw httpError(400, 'invalid_credit_amount');
+  if (!Number.isInteger(Number(lanehubUserId))) throw httpError(400, 'lanehub_user_required');
+  await db.query(`INSERT INTO lanehub_credits (reference,user_id,amount_cny,quota,kind,lanehub_user_id,remark,payload,state)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending') ON CONFLICT (reference) DO NOTHING`,
+  [reference, userId, String(amountCny), quota, kind, Number(lanehubUserId), remark ?? reference, JSON.stringify(payload)]);
+  const row = (await db.query('SELECT * FROM lanehub_credits WHERE reference=$1', [reference])).rows[0];
+  if (String(row.user_id) !== String(userId) || row.kind !== kind || Number(row.amount_cny) !== Number(amountCny))
+    throw httpError(409, 'adjustment_reference_conflict');
+  return row;
+}
+
+/**
+ * 接手一行 pending 并调用 lanehub。返回 { applied: 本次是否生效, state, quota }。
+ * 远程失败不抛错：行已进 review，调用方按 state 决定怎么回应。
+ */
+export async function applyAdjustment(db, lanehub, reference) {
+  const row = (await db.query(`UPDATE lanehub_credits SET state='applying',updated_at=now()
+    WHERE reference=$1 AND state='pending' RETURNING *`, [reference])).rows[0];
+  if (!row) {
+    const current = (await db.query('SELECT state FROM lanehub_credits WHERE reference=$1', [reference])).rows[0];
+    return { applied: false, state: current?.state ?? 'missing', quota: 0 };
+  }
+  const quota = Number(row.quota);
+  try {
+    await lanehub.addQuota(row.lanehub_user_id, row.kind === 'debit' ? -quota : quota, row.remark ?? reference);
+  } catch (error) {
+    // 请求已发出，对面是否已改额度未知：只能人工核对。
+    await db.query(`UPDATE lanehub_credits SET state='review',review_reason=$2,updated_at=now() WHERE reference=$1 AND state='applying'`,
+      [reference, String(error?.detail ?? error?.code ?? error?.message ?? 'unknown').slice(0, 200)]);
+    return { applied: false, state: 'review', quota: 0 };
+  }
+  // 这一步失败时行停在 applying，由 sweepAdjustments 超时转 review，同样不会重放。
+  const done = await db.query(`UPDATE lanehub_credits SET state='applied',applied_at=now(),updated_at=now(),
+    booked_at=CASE WHEN payload ? 'booking' THEN NULL ELSE now() END WHERE reference=$1 AND state='applying'`, [reference]);
+  // 行已被超时清扫转成 review（理论上不会发生：调用 15 秒超时）时以库中状态为准，交人工核对。
+  if (!done.rowCount) return { applied: false, state: 'review', quota: 0 };
+  return { applied: true, state: 'applied', quota };
+}
+
+/** 进程在 applying 期间退出的行：结果未知，转人工核对。 */
+export function sweepAdjustments(db) {
+  return db.query(`UPDATE lanehub_credits SET state='review',review_reason='adjustment_interrupted',updated_at=now()
+    WHERE state='applying' AND updated_at<now()-interval '5 minutes'`);
+}
+
+/**
  * 充值入账：把人民币加到这个客户在 lanehub 的额度上。
  *
- * **幂等键是 reference**（注册赠送 / 迁移批次+客户）。注册流程重试、
- * 迁移脚本重跑都必须落到同一个 reference 上——否则每重放一次就是白送一次钱。
- *
- * 先占位再调对面：反过来的话（先加额度再写库）进程在两步之间挂掉，重跑会加两次。
- * 占位失败 = 已经入过账，直接返回。
+ * **幂等键是 reference**（注册赠送 / 迁移批次+客户 / 补发）。重试必须落到同一个 reference 上。
+ * 已存在的 reference：pending 会被接手执行；applying / applied / review / cancelled 一律不再调用对面。
  */
 export async function creditAccount(db, lanehub, { userId, lanehubUserId, amountCny, usdCnyRate, quotaPerUnit, reference, remark }) {
   if (!(amountCny > 0)) throw httpError(400, 'invalid_credit_amount');
   if (!reference) throw httpError(400, 'credit_reference_required');
-  const quota = Math.round((Number(amountCny) / Number(usdCnyRate)) * Number(quotaPerUnit));
+  const quota = lanehubQuota(amountCny, usdCnyRate, quotaPerUnit);
   if (!Number.isSafeInteger(quota) || quota <= 0) throw httpError(400, 'invalid_credit_amount');
-
-  const claimed = await db.query(
-    `INSERT INTO lanehub_credits (reference,user_id,amount_cny,quota) VALUES ($1,$2,$3,$4)
-     ON CONFLICT (reference) DO NOTHING RETURNING reference`, [reference, userId, String(amountCny), quota]);
-  if (!claimed.rowCount) return { applied: false, quota: 0 };
-
-  try {
-    await lanehub.addQuota(lanehubUserId, quota, remark ?? reference);
-  } catch (error) {
-    // 对面没加成就把占位撤掉，否则这笔钱永远加不上去了（reference 已被占用）。
-    await db.query('DELETE FROM lanehub_credits WHERE reference=$1', [reference]);
-    throw error;
-  }
-  await db.query('UPDATE lanehub_credits SET applied_at=now() WHERE reference=$1', [reference]);
-  return { applied: true, quota };
+  await startAdjustment(db, { reference, userId, lanehubUserId, amountCny, quota, remark });
+  return applyAdjustment(db, lanehub, reference);
 }
 
 /**

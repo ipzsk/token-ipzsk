@@ -187,6 +187,9 @@ test('B5 admin API: permission matrix and behaviour', async (t) => {
       const replay = await call('operator', 'POST', '/api/admin/cases', draft, { 'idempotency-key': 'k1' });
       assert.equal(replay.statusCode, 201); assert.equal(replay.json().id, c.id);
       assert.equal((await call('operator', 'POST', '/api/admin/cases', { ...draft, title: 'other' }, { 'idempotency-key': 'k1' })).json().error.code, 'idempotency_conflict');
+      // wallet-grant: is reserved for wallet grants; a case must not occupy a grant's idempotency row.
+      assert.equal((await call('operator', 'POST', '/api/admin/cases', draft, { 'idempotency-key': 'wallet-grant:g1' })).json().error.code, 'invalid_idempotency_key');
+      assert.equal((await db.query("SELECT count(*)::int n FROM admin_idempotency WHERE key LIKE 'wallet-grant:%'")).rows[0].n, 0);
       assert.equal((await db.query('SELECT count(*)::int AS n FROM inspiration_cases WHERE title=$1', ['极简'])).rows[0].n, 1);
       assert.ok(c.position < (await db.query('SELECT min(position) AS p FROM inspiration_cases WHERE id<>$1', [c.id])).rows[0].p, 'new cases go first');
       assert.equal((await call('operator', 'POST', '/api/admin/cases', { ...draft, id: c.id })).json().error.code, 'case_id_taken');
@@ -416,6 +419,11 @@ test('B5 admin API: permission matrix and behaviour', async (t) => {
       assert.equal(replay.grant.id, first.grant.id, 'same key replays the same grant');
       assert.equal(replay.wallet.available_points, '5000.00000000', 'replay credits nothing');
       assert.equal((await post('admin', { ...body, amount_cny: '60' })).json().error.code, 'idempotency_conflict');
+      // The key is permanent: after a long manual review the same key still replays the same grant, and never re-credits.
+      await db.query("UPDATE admin_idempotency SET created_at=now()-interval '48 hours'");
+      assert.equal((await post('admin')).json().grant.id, first.grant.id, 'stale key still replays the original grant');
+      assert.equal((await post('admin', { ...body, amount_cny: '60' })).json().error.code, 'idempotency_conflict', 'stale key still conflicts on other params');
+      assert.equal((await db.query("SELECT count(*)::int n FROM wallet_entries WHERE source='admin_grant'")).rows[0].n, 1);
       const audits = await auditRows('wallet.grant', U.target);
       assert.deepEqual(audits.map((a) => [a.actor_user_id, a.details.amount_cny, a.details.reason]), [[U.admin, '50.00', '测试补发']]);
       const mine = (await call('target', 'GET', '/api/me/wallet')).json();
@@ -423,12 +431,17 @@ test('B5 admin API: permission matrix and behaviour', async (t) => {
       await assert.rejects(() => db.query(`INSERT INTO wallet_entries(id,user_id,amount_cny,balance_after_cny,source,granted_by) VALUES($1,$2,1,1,'admin_grant',$3)`,
         [randomUUID(), U.target, U.admin]), { code: '23514' }, 'admin_grant without a reason violates the ledger constraint');
 
-      // Lanehub mode: quota lands on lanehub once per grant, even when the first attempt fails and is retried with the same key.
+      // Lanehub mode: an unknown LaneHub result goes to review and is never replayed by a retry with the same key.
       await db.query(`INSERT INTO lanehub_accounts(user_id,lanehub_user_id,key_id) VALUES($1,4242,$2)`, [U.target, keyId]);
       await db.query("INSERT INTO app_settings(key,value) VALUES('lanehub_mode','on')");
       lane.failQuota = true;
-      assert.equal((await post('admin', { amount_cny: '7', reason: '补偿失败任务' }, 'g2')).statusCode, 500);
-      assert.equal((await auditRows('wallet.grant', U.target)).length, 1, 'nothing recorded when lanehub refused');
+      assert.equal((await post('admin', { amount_cny: '7', reason: '补偿失败任务' }, 'g2')).json().error.code, 'lanehub_adjustment_review');
+      assert.equal((await auditRows('wallet.grant', U.target)).length, 1, 'nothing recorded while the result is unknown');
+      assert.equal((await post('admin', { amount_cny: '7', reason: '补偿失败任务' }, 'g2')).json().error.code, 'lanehub_adjustment_review');
+      assert.deepEqual(lane.quota, [], 'the retry did not call LaneHub again');
+      // An operator verifies LaneHub (more than a day later) and chooses retry, as /admin/api/lanehub-adjustments/resolve does.
+      await db.query("UPDATE admin_idempotency SET created_at=now()-interval '48 hours'");
+      await db.query("UPDATE lanehub_credits SET state='pending',updated_at=now() WHERE reference LIKE 'admin_grant:%' AND state='review'");
       const retried = (await post('admin', { amount_cny: '7', reason: '补偿失败任务' }, 'g2')).json();
       const again = (await post('admin', { amount_cny: '7', reason: '补偿失败任务' }, 'g2')).json();
       assert.equal(again.grant.id, retried.grant.id);
@@ -469,6 +482,10 @@ test('B5 admin API: permission matrix and behaviour', async (t) => {
       assert.equal(detail.failure_code, 'media_task_failed'); assert.equal(detail.failure_message, 'boom at [url] key [redacted]');
       assert.match(detail.upstream.task_id, /^task_/); assert.match(detail.upstream.request_id, /^lh-/); assert.equal(detail.upstream.provider, 'lanehub');
       assert.ok(detail.deleted_at); assert.equal(detail.prompt.length, 'prompt '.repeat(60).length);
+      // viewer sees neither upstream cost nor the client idempotency key; operator gets the key, only admin the cost.
+      assert.equal(detail.billing.cost_cny, null); assert.equal(detail.idempotency_key, null);
+      const opDetail = (await call('operator', 'GET', `/api/admin/generations/${g.b}`)).json();
+      assert.equal(opDetail.billing.cost_cny, null);
       assert.equal((await call('viewer', 'GET', `/api/admin/generations/${randomUUID()}`)).json().error.code, 'generation_not_found');
 
       // resync

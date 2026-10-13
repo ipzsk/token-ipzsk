@@ -47,7 +47,9 @@ export function workspaceRoutes(app,options){
     let available;
     if(viaLanehub){
       const account=await provisionIfEnabled(db,options,{userId:req.apiUser.id,name:req.apiUser.name}).catch(()=>null);
-      available=account?await lanehubBalance(options.lanehub,account,{usdCnyRate:options.lanehubUsdCny,quotaPerUnit:options.lanehubQuotaPerUnit}):await wallet(db,req.apiUser.id);
+      // 本地账本不含 LaneHub 侧消费，不能拿来报可用额度。
+      if(!account)throw httpError(503,'billing_unavailable');
+      available=await lanehubBalance(options.lanehub,account,{usdCnyRate:options.lanehubUsdCny,quotaPerUnit:options.lanehubQuotaPerUnit});
     }else available=await wallet(db,req.apiUser.id);
     return {reserved_points:points(hold),available_points:points(available.available_cny),can_afford:Number(available.available_cny)>=Number(hold),reserved_cny:hold,billing_enabled:viaLanehub||policy.enabled,policy_version:policy.version,output_limit:4096};
   });

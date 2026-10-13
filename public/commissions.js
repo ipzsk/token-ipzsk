@@ -34,7 +34,7 @@ export function setupCommissions({api,action,el,table,cell,button,charge,time,no
     dialog.append(box);document.body.append(dialog);dialog.addEventListener('close',()=>{input.value='';dialog.remove();});dialog.showModal();
   }
   async function refresh() {
-    const [data,invitations]=await Promise.all([api('/commissions'),api('/commissions/invitations')]);section.replaceChildren();
+    const [data,invitations,adjustments]=await Promise.all([api('/commissions'),api('/commissions/invitations'),api('/lanehub-adjustments')]);section.replaceChildren();
     const percent=value=>`${Number(value)/100}%`;
     const policy=panel('API 消费分佣');policy.append(el('p',`当前${data.policy.enabled?'已启用':'未启用'}。BD 永久分有效付费 API 消费的 ${percent(data.policy.bd_share_bps)}；插件开发者永久分扣除实际上游成本和 BD 佣金后剩余利润的 ${percent(data.policy.developer_share_bps)}。赠送额度不分佣。`));
     policy.append(button(data.policy.enabled?'暂停新请求计佣':'启用新请求计佣',()=>ask('确认切换计佣规则',reason,b=>api('/commissions/policy','POST',{...b,enabled:!data.policy.enabled}))),button('重新核对待处理账目',action(async()=>{await api('/commissions/reconcile','POST',{});await refresh();})));
@@ -57,6 +57,9 @@ export function setupCommissions({api,action,el,table,cell,button,charge,time,no
       for(const [state,label] of transitions)actions.append(button(label,()=>ask(label+' · '+charge(p.amount_cny),receipt,b=>api('/commissions/payouts/'+p.id,'POST',{...b,state}))));return actions;})()]));
     const conversions=panel('收益转余额 · 不确定结果只人工核对，不自动重试');const conversionList=el('div');conversions.append(conversionList);
     table(conversionList,['用户 / 申请','金额','状态','操作'],data.conversions.map(p=>[cell(p.user_id,p.id),charge(p.amount_cny),states[p.state],(()=>{const actions=el('div');if(p.state==='review')for(const [result,label] of [['applied','确认上游已入账'],['not_applied','确认未入账并退回收益']])actions.append(button(label,()=>ask(label,receipt,b=>api('/commissions/conversions/'+p.id+'/resolve','POST',{...b,result}))));return actions;})()]));
+    const lane=panel('LaneHub 额度调整 · 结果未知只人工核对，不自动重试');lane.append(el('p','先在 LaneHub 后台核对该用户的额度日志（备注含引用号），再选择处理方式。确认未生效才可重试；重试结果仍未知会再次进入待核对。远程尚未开始的待执行项由后台约两分钟内自动执行，也可直接终止。'));const laneList=el('div');lane.append(laneList);
+    const laneStates={pending:'待后台执行（远程未开始）',applying:'执行中',applied:'已生效待落账',review:'待人工核对'};
+    table(laneList,['引用号 / 用户','方向 / 金额','状态 / 原因','操作'],adjustments.rows.map(a=>[cell(a.reference,a.user_id),cell(a.kind==='debit'?'扣回':'加额度',charge(a.amount_cny)),cell(laneStates[a.state]??a.state,a.review_reason??''),(()=>{const actions=el('div');for(const [result,label] of a.state==='review'?[['applied','确认已生效'],['retry','确认未生效并重试'],['cancel','确认未生效并终止']]:a.state==='pending'?[['cancel','终止（远程尚未开始）']]:[])actions.append(button(label,()=>ask(label+' · '+a.reference,reason,b=>api('/lanehub-adjustments/resolve','POST',{...b,reference:a.reference,result}))));return actions;})()]));
     const requests=panel('逐请求计提');const requestList=el('div');requests.append(requestList);
     const basis={profit:'剩余利润',consumption:'付费消费',legacy_profit:'旧版利润'};
     table(requestList,['请求','扣款 / 本金','BD','开发者','比例快照','状态'],data.requests.map(p=>[p.request_id,cell(charge(p.charged_cny),charge(p.paid_cny)),charge(p.bd_cny),charge(p.developer_cny),`BD ${percent(p.bd_share_bps)} · 开发者 ${percent(p.developer_share_bps)} ${basis[p.developer_basis]}`,states[p.state]]));

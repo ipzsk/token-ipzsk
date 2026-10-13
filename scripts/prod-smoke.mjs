@@ -29,7 +29,7 @@ try {
   const day = new Date().toISOString().slice(0, 10);
   const credit = await creditAccount(db, lanehub, { userId: user.id, lanehubUserId: acc.lanehub_user_id, amountCny: '2',
     usdCnyRate: Number(process.env.LANEHUB_USD_CNY), quotaPerUnit: 500000, reference: 'smoke:' + day, remark: '上线自检充值' });
-  console.log('lanehub 用户', acc.lanehub_user_id, '充值', credit.applied ? '已入账' : '今天已入过');
+  console.log('lanehub 用户', acc.lanehub_user_id, '充值', credit.applied ? '已入账' : credit.state === 'applied' ? '今天已入过' : '状态 ' + credit.state + '，待人工核对');
 
   const value = token('ipz_'), tokenId = randomUUID();
   await db.query('INSERT INTO access_tokens(id,user_id,token_hash,prefix,name) VALUES($1,$2,$3,$4,$5)',

@@ -13,7 +13,7 @@
 - 成本按扣款时的本金占比分摊；消费退款不退还上游成本，所以部分退款后 C×q 不变，只有 E 和 B 变小。成本修正只追加开发者差额流水，BD 金额不变。
 - 请求创建时快照 BD 比例、开发者比例和开发者口径 `developer_basis`。新请求为 `profit`；schema 31 期间创建的请求为 `consumption`（开发者 35% 付费消费）；schema 30 及更早的请求为 `legacy_profit`（BD 与开发者都按扣成本后的利润）。退款、拒付和成本修正都按原快照重算，历史请求保持可审计。
 - LaneHub 管理端消费日志的 `cost_source=real`、`cost_quota` 可自动回填成本；请求 ID、日志 ID、用户归属及完整性必须通过校验，多行全部为真实成本后才汇总。已记消费但成本迟到的请求继续核对，沿用原销售账单的汇率及 quota 单位。若销售 quota 同时变化，标记 `lanehub_receipt_changed` 待人工核账。DeepSeek 文本上游目前没有真实费用回执适配，这类请求的开发者收益会停在 `pending_cost`，需管理员按可信账单录入成本后才计提。
-- 请求创建时快照邀请人当时的 BD 身份及经插件凭证验证的作者归属。以后调身份或插件归属不改历史。自消费不产生自身 BD／作者收益。
+- 请求创建时快照邀请人当时的 BD 身份及作者归属；仅凭插件凭证的作者归属不可支付（schema 34）。以后调身份或插件归属不改历史。自消费不产生自身 BD／作者收益。
 - 新规则关闭 Skill 固定调用费和十分钟窗口计佣，正文 Skill 标签只保留观测。每笔请求最多一个作者池；生图插件凭证归生图作者，主 Skill 不再重复取得这一池。不能可靠归属的请求不凭正文给作者计佣。
 - 观察期 30 天。上月已成熟收益可按月申请人工提现，单笔至少 100 元、保留到分；分以下尾款留账。系统预留申请金额，管理员审核、转账后登记回执。取消申请原额解冻。
 - 已成熟收益可从 0.01 元起 1:1 转使用余额，不可逆，也不再分佣。LaneHub 通过持久化待办入账，响应丢失转人工核对，不自动重复加额度；额度最小单位的上舍入由平台承担。
@@ -78,9 +78,38 @@ BD 和插件开发者只能由管理员邀请、被邀请账号本人接受后�
 
 使用已有 `/admin/api/requests/:id/charge` 录入经核实的实际成本，`/admin/api/billing/:id/refund` 处理服务退款。已经拒付的请求禁止再走普通服务退款，须人工核对，避免重复返还本金。
 
+## LaneHub 额度调整与资金约束（schema 34）
+
+LaneHub 的 `/api/user/quota/:id` 是增量接口（允许负 delta），没有幂等键。所有经 `lanehub_credits` 的加额度（注册赠送、补发、迁移、消费退款）和扣额度（LaneHub 充值订单退款）都按同一状态机执行：
+
+| 状态 | 含义 | 后续 |
+| --- | --- | --- |
+| pending | 占位已独立提交，远程调用尚未开始 | 同一 reference 重试可接手执行；进程在调用前退出时，后台循环（约 2 分钟一次，宽限 60 秒）以 CAS 接手执行一次并完成落账；未配置 LaneHub 时不执行；管理员也可直接终止 |
+| applying | 已领取并发出远程调用 | 成功转 applied；任何未知结果转 review；超过 5 分钟未收尾由后台转 review |
+| applied | 已确认生效 | 需要本地落账的（消费退款、充值退款）由 `booked_at` 幂等落账 |
+| review | 远程结果未知 | 只能由超级管理员核对 LaneHub 额度日志后处理，绝不自动重试 |
+| cancelled | 人工确认未生效并终止 | 充值退款预留的本金退回，订单保持 refund_review 待重新登记 |
+
+- 管理端“分佣与提现 → LaneHub 额度调整”列出 pending／applying／review 及已生效未落账的行。review 可选：确认已生效（随后自动落本地账）、确认未生效并重试一次、确认未生效并终止。每次处理都写审计并要求填写核对依据。迁移前缺少 LaneHub 用户号的历史行只能确认生效或终止。
+- 旧数据迁移：有 `applied_at` 的行视为已生效并已落账；没有的行是历史中断调用，标为 review（`legacy_unconfirmed`）。
+- 消费退款（LaneHub 模式）：先提交占位和退款序号，再加额度，确认生效后才累加 `refunded_cny` 并冲回作者计提。同一请求同时只允许一笔在途退款。
+- 充值退款（订单 `target=lanehub`）：未消费本金部分按订单入账时的 quota/金额比例换算后扣回 LaneHub，先在本地预留对应本金并把订单置为 refund_review，确认扣回后才写 `commission_payment_refunds`。同一订单同时只允许一笔在途退款。纯拒付部分不涉及 LaneHub 额度。本次修复前已登记的 LaneHub 订单退款只写了本地 `balance_deduction_cny`，需要人工核对是否已在 LaneHub 扣回。
+- 管理员补发在 LaneHub 结果未知时不写本地流水；人工确认生效后用同一幂等键重提即可补齐。补发幂等键永久有效：同一管理员、同一 key、同参数永远复用原 grant，参数不同永远冲突。键以 `wallet-grant:` 前缀存入 `admin_idempotency`，这是保留前缀，案例创建等其他路径拒绝以它开头的 Idempotency-Key；迁移把历史补发键复制进该命名空间。
+- 数据库约束：`request_billing.refunded_cny <= charged_cny`，`commission_allocations.returned_cny + chargeback_cny <= amount_cny`。约束以 NOT VALID 加入，所有新写入都受检查；旧数据满足时启动即完成校验，不满足时只记 WARNING、不阻断启动。
+
+## 插件归属的可支付边界（schema 34）
+
+服务端没有可信的插件安装记录。桌面 bootstrap 签发的插件凭证只是使用授权，不是安装证明：
+
+- 新客户端可在 bootstrap 请求体上报 `installed_packages`（包名数组），服务端只为这些包签发凭证，本会话其余插件凭证立即过期（不吊销，之后可续签）。上报仍属客户端声明。
+- 未上报清单的旧客户端为保持已装插件可用，仍获得全部启用插件的凭证。审计 `desktop.bootstrap` 的 `installed_declared` 区分两条路径。
+- 无论哪条路径，凭插件凭证产生的归属（直接使用凭证、主令牌加 `X-IPZSK-Plugin-Token`，或再加只能配合凭证使用的 `X-IPZSK-Skill-Version`）都记为 `requests.plugin_attribution_state='credential_unverified'`。插件照常可用，用量、模型白名单和任务隔离不变；`commission_snapshot` 不设开发者，旧版 `plugin_earnings` 不计提也不冲回。
+- 只有 `X-IPZSK-Skill-Calls` 按后台登记的 Skill 内容哈希独立解析出插件时记为 `skill_marker`，沿用原规则。这条路不依赖凭证，出示凭证也不会增加可支付性。注意它仍是客户端上报的哈希。
+- 历史请求保持 `none`，不回溯。
+
 ## Skill 接入边界
 
-插件自行调用使用其用户专属凭证；主模型代表 Skill 调用时，通过已有 `X-IPZSK-Plugin-Token` 出示同一用户的该插件凭证，网关查验启用状态与模型白名单，客户端不能直接指定收款作者或比例。普通正文标签、未注册 Skill 和跨用户凭证不能取得作者池。
+插件自行调用使用其用户专属凭证；主模型代表 Skill 调用时，通过已有 `X-IPZSK-Plugin-Token` 出示同一用户的该插件凭证，网关查验启用状态与模型白名单，客户端不能直接指定收款作者或比例。自 schema 34 起，这两种凭证归属都只记录、不可支付（见上一节）。普通正文标签、未注册 Skill 和跨用户凭证不能取得作者池。
 
 桌面 Host 已上报 Skill 名称／内容哈希及任务边界，网关依据登记版本校验并决定归属，详见 [客户端模拟验收](COMMISSION-DESKTOP-SIMULATION.md)。插件凭证路径继续校验用户、启用状态及模型权限。组合 Skill 的多作者份额编排和跨调用总预算尚未实现；有多个作者候选时后台保留 ambiguous，不自动拆分作者池。
 

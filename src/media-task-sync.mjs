@@ -1,10 +1,23 @@
 import { recordTaskCharge } from './task-charges.mjs';
 import { settleMediaRequest } from './billing.mjs';
 import { recordStatus } from './studio.mjs';
-import { videoUrls } from './image-results.mjs';
+import { settleStatus } from './image-results.mjs';
 import { avatarErrorFor } from './avatar-contract.mjs';
 
 const terminal = ['completed', 'failed', 'cancelled'];
+
+/**
+ * What a task status means for the generation record and for billing. A `completed` task only counts as succeeded
+ * with a real result (an image URL, or a video URL — thumbnails / subtitles live in separate keys); otherwise it is a
+ * failure and the hold is released, never charged for nothing.
+ */
+export function taskOutcome(kind, rawStatus, task, failReason) {
+  const settle = settleStatus(kind, rawStatus, task);
+  if (settle !== rawStatus) { const failureCode = kind === 'video' ? 'video_result_missing' : 'image_result_missing'; return { status: 'failed', failureCode, settle, settleReason: failureCode }; }
+  const status = recordStatus(rawStatus);
+  const failureCode = ['failed', 'cancelled'].includes(status) ? (avatarErrorFor(null, failReason)?.code ?? 'media_task_' + rawStatus) : null;
+  return { status, failureCode, settle, settleReason: undefined };
+}
 // A database lock deduplicates browser polling and workers, including across processes.
 // Returns 'upstream_unavailable' when the upstream could not be read (callers other than the admin resync ignore it).
 export async function refreshMediaTask(db, upstream, id) {
@@ -25,14 +38,13 @@ export async function refreshMediaTask(db, upstream, id) {
       const result = {id,status:data.status,progress:data.progress??0,result:data.result??null,
         ...(terminal.includes(data.status) && data.status !== 'completed' ? {error:{message:'Media generation failed.'}} : {})};
       await c.query('UPDATE media_tasks SET status=$2,result=$3 WHERE id=$1',[id,data.status,JSON.stringify(result)]);
-      let next=recordStatus(data.status),failureCode=['failed','cancelled'].includes(next)?(avatarErrorFor(null,data.fail_reason)?.code??'media_task_'+data.status):null;
-      // A completed video task only counts as succeeded with a real video URL (thumbnails / subtitles live in separate keys).
-      if(next==='succeeded'&&task.kind==='video'&&!videoUrls(result).length){next='failed';failureCode='video_result_missing';}
+      const outcome=taskOutcome(task.kind,data.status,result,data.fail_reason);
       await c.query(`UPDATE generation_records SET status=$2,failure_code=$3,updated_at=now()
-        WHERE task_id=$1 AND status IN ('queued','running') AND status<>$2`,[id,next,failureCode]);
+        WHERE task_id=$1 AND status IN ('queued','running') AND status<>$2`,[id,outcome.status,outcome.failureCode]);
       await recordTaskCharge({tx:fn=>fn(c)},task,data);
-      // A terminal task must not leave funds frozen, even when the upstream reports no cost.
-      if (terminal.includes(data.status)) await settleMediaRequest(c,id,data.status);
+      // A terminal task must not leave funds frozen, even when the upstream reports no cost; a completed task without a
+      // result settles as failed (released).
+      if (terminal.includes(data.status)) await settleMediaRequest(c,id,outcome.settle,outcome.settleReason);
     } catch {
       // A transient network error leaves the remote task pending, with backoff.
       return 'upstream_unavailable';

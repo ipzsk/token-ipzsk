@@ -40,6 +40,12 @@ export function desktopRoutes(app,options) {
   app.post('/api/me/desktop/bootstrap',async req=>{
     if(!req.apiUser.session_id)throw httpError(403,'customer_login_required');
     limiter.take('desktop:'+req.apiUser.id,20,600000);
+    // 服务端没有可信的插件安装记录。新客户端可上报本机已安装的插件包名，只为这些包签发凭证；
+    // 不上报的旧客户端仍拿到全部插件凭证——否则已装插件立即不可用。两种情况的凭证都只是**使用授权**，
+    // 不是安装证明：凭它产生的归属一律记 credential_unverified，永远不进入可支付分成（gateway.mjs pluginAttributionState）。
+    const installed=req.body?.installed_packages;
+    if(installed!==undefined&&(!Array.isArray(installed)||installed.length>100||installed.some(name=>typeof name!=='string'||!name||name.length>214)))
+      throw httpError(400,'invalid_installed_packages');
     // 登录后就把 lanehub 的账号与密钥备好：一个客户一个密钥（映射表主键是 user_id），
     // 首次建号时发新人额度。放在这里而不是注册事务里——那是个 db.tx，把一次跨网络调用
     // 塞进去会把事务拖长，失败还会把注册一起回滚掉。
@@ -73,8 +79,11 @@ export function desktopRoutes(app,options) {
         expires_at=EXCLUDED.expires_at WHERE access_tokens.revoked_at IS NULL RETURNING id`,
         [randomUUID(),req.apiUser.id,hash(value),value.slice(0,12),session.expiresAt,req.apiUser.session_id]);
       if(!result.rowCount)throw httpError(403,'desktop_access_revoked');
-      await c.query('INSERT INTO audit_events(action,target_id) VALUES($1,$2)',['desktop.bootstrap',result.rows[0].id]);
-      const plugins=(await c.query(`SELECT p.* FROM plugins p WHERE enabled AND allowed_models && $1::text[] AND runtime_id IS NOT NULL ORDER BY slug`,[[...available]])).rows;
+      const plugins=(await c.query(`SELECT p.* FROM plugins p WHERE enabled AND allowed_models && $1::text[] AND runtime_id IS NOT NULL
+        AND ($2::text[] IS NULL OR package_name=ANY($2::text[])) ORDER BY slug`,[[...available],installed??null])).rows;
+      // 本会话里已不在清单中的插件凭证立即过期（不吊销：之后重新安装时同一会话还能续签）。
+      if(installed)await c.query(`UPDATE access_tokens SET expires_at=least(expires_at,now()) WHERE auth_session_id=$1 AND plugin_id IS NOT NULL
+        AND revoked_at IS NULL AND NOT (plugin_id=ANY($2::uuid[]))`,[req.apiUser.session_id,plugins.map(p=>p.id)]);
       const plugin_configs=[];
       for(const plugin of plugins){
         const credential=token('ipz_');
@@ -87,6 +96,9 @@ export function desktopRoutes(app,options) {
         if(plugin.runtime_id)plugin_configs.push({package:plugin.package_name,id:plugin.runtime_id,plugin_id:plugin.id,
           config:plugin.runtime_config,credential_paths:plugin.credential_paths,credential});
       }
+      // 审计记下这次是否有上报清单、签发了哪些插件凭证，事后可区分兼容路径与清单路径。
+      await c.query('INSERT INTO audit_events(action,target_id,details) VALUES($1,$2,$3)',['desktop.bootstrap',result.rows[0].id,
+        JSON.stringify({installed_declared:Boolean(installed),plugin_ids:plugin_configs.map(p=>p.plugin_id)})]);
       return {token:value,expires_at:session.expiresAt,default_model,models,image_models,video_models,canonical_params,plugin_configs};
     });
   });

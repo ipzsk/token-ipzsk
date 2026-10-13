@@ -147,7 +147,8 @@ BEGIN
       SELECT NEW.id,p.enabled,
         (SELECT f.referrer_id FROM referrals f JOIN referral_profiles profile ON profile.user_id=f.referrer_id
           WHERE f.user_id=NEW.user_id AND profile.bd_active AND f.referrer_id<>NEW.user_id),
-        CASE WHEN NEW.plugin_owner_user_id<>NEW.user_id AND EXISTS(
+        -- Unverified plugin attribution (bootstrap credential, see v34) never creates a payable developer share.
+        CASE WHEN NEW.plugin_owner_user_id<>NEW.user_id AND NEW.plugin_attribution_state<>'credential_unverified' AND EXISTS(
           SELECT 1 FROM developer_profiles WHERE user_id=NEW.plugin_owner_user_id AND state='approved')
           THEN NEW.plugin_owner_user_id END,
         p.bd_share_bps,p.developer_share_bps,'profit'
@@ -311,3 +312,61 @@ CREATE TABLE IF NOT EXISTS role_invitations (
 CREATE UNIQUE INDEX IF NOT EXISTS role_invitations_one_pending ON role_invitations(user_id,role) WHERE state='pending';
 CREATE INDEX IF NOT EXISTS role_invitations_recent ON role_invitations(created_at DESC);
 INSERT INTO schema_version(version) VALUES(33) ON CONFLICT DO NOTHING;
+
+-- v34: LaneHub quota adjustments (credit / debit) form an auditable state machine; see src/lanehub.mjs.
+-- Legacy rows: applied_at proves delivery and those rows were booked in the same step. A legacy row without
+-- applied_at survived an interrupted remote call, so its result is unknown and it goes to manual review.
+ALTER TABLE lanehub_credits ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'credit';
+ALTER TABLE lanehub_credits ADD COLUMN IF NOT EXISTS state text;
+ALTER TABLE lanehub_credits ADD COLUMN IF NOT EXISTS lanehub_user_id integer;
+ALTER TABLE lanehub_credits ADD COLUMN IF NOT EXISTS remark text;
+ALTER TABLE lanehub_credits ADD COLUMN IF NOT EXISTS payload jsonb NOT NULL DEFAULT '{}';
+ALTER TABLE lanehub_credits ADD COLUMN IF NOT EXISTS review_reason text;
+ALTER TABLE lanehub_credits ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+ALTER TABLE lanehub_credits ADD COLUMN IF NOT EXISTS booked_at timestamptz;
+UPDATE lanehub_credits SET state=CASE WHEN applied_at IS NOT NULL THEN 'applied' ELSE 'review' END,
+  review_reason=CASE WHEN applied_at IS NULL THEN 'legacy_unconfirmed' END, booked_at=applied_at WHERE state IS NULL;
+ALTER TABLE lanehub_credits ALTER COLUMN state SET DEFAULT 'pending', ALTER COLUMN state SET NOT NULL;
+CREATE INDEX IF NOT EXISTS lanehub_credits_open ON lanehub_credits(state,updated_at) WHERE state<>'applied' OR booked_at IS NULL;
+-- Plugin credentials from desktop bootstrap do not prove the plugin is installed; such attribution is kept
+-- for usage statistics but never becomes payable. Existing rows keep 'none' so settled history is unchanged.
+ALTER TABLE requests ADD COLUMN IF NOT EXISTS plugin_attribution_state text NOT NULL DEFAULT 'none';
+-- Financial invariants. NOT VALID keeps startup working on legacy rows while every new write is checked;
+-- the constraint is validated as soon as the existing data allows it.
+-- Each constraint is added only if missing (not keyed on schema_version): migrate() re-runs this file, and a
+-- schema_version row can be removed to replay older steps without re-adding existing constraints.
+DO $$ DECLARE item record; BEGIN
+  FOR item IN SELECT * FROM (VALUES
+    ('lanehub_credits','lanehub_credits_kind_check',$c$CHECK(kind IN ('credit','debit'))$c$),
+    ('lanehub_credits','lanehub_credits_state_check',$c$CHECK(state IN ('pending','applying','applied','review','cancelled'))$c$),
+    ('lanehub_credits','lanehub_credits_applied_check',$c$CHECK((state='applied')=(applied_at IS NOT NULL))$c$),
+    ('requests','requests_plugin_attribution_state_check',$c$CHECK(plugin_attribution_state IN ('none','credential_unverified','skill_marker'))$c$),
+    ('request_billing','request_billing_refund_within_charge',$c$CHECK(refunded_cny<=coalesce(charged_cny,0)) NOT VALID$c$),
+    ('commission_allocations','commission_allocations_reversal_within_amount',$c$CHECK(returned_cny+chargeback_cny<=amount_cny) NOT VALID$c$)
+  ) AS t(tbl,name,definition) LOOP
+    IF NOT EXISTS(SELECT 1 FROM pg_constraint WHERE conname=item.name AND connamespace=current_schema()::regnamespace) THEN
+      EXECUTE format('ALTER TABLE %I ADD CONSTRAINT %I %s', item.tbl, item.name, item.definition);
+    END IF;
+  END LOOP;
+END $$;
+DO $$ DECLARE item record; BEGIN
+  FOR item IN SELECT conrelid::regclass::text AS tbl,conname FROM pg_constraint WHERE NOT convalidated
+    AND conname IN ('request_billing_refund_within_charge','commission_allocations_reversal_within_amount')
+    AND connamespace=current_schema()::regnamespace LOOP
+    BEGIN
+      EXECUTE format('ALTER TABLE %s VALIDATE CONSTRAINT %I', item.tbl, item.conname);
+    EXCEPTION WHEN check_violation THEN
+      RAISE WARNING 'legacy rows violate %; new writes are still checked', item.conname;
+    END;
+  END LOOP;
+END $$;
+-- Wallet-grant idempotency keys are permanent and live under the `wallet-grant:` prefix (src/grant-idempotency.mjs).
+-- Copy legacy grant rows (identified by their grant id in wallet_entries or lanehub_credits) so an old key keeps
+-- resolving to its original grant even if the shared row is later rotated by case creation.
+INSERT INTO admin_idempotency(user_id,key,fingerprint,case_id,created_at)
+  SELECT i.user_id,'wallet-grant:'||i.key,i.fingerprint,i.case_id,i.created_at FROM admin_idempotency i
+  WHERE i.key NOT LIKE 'wallet-grant:%' AND (
+    EXISTS(SELECT 1 FROM wallet_entries w WHERE w.id::text=i.case_id AND w.source='admin_grant')
+    OR EXISTS(SELECT 1 FROM lanehub_credits l WHERE l.reference='admin_grant:'||i.case_id))
+  ON CONFLICT (user_id,key) DO NOTHING;
+INSERT INTO schema_version(version) VALUES(34) ON CONFLICT DO NOTHING;

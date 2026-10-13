@@ -229,6 +229,11 @@ test('gateway integration against an isolated PostgreSQL test schema', async (t)
       assert.equal(result.json().data.status,'completed');
       assert.equal(result.json().data.credits_cost,undefined);
       assert.ok(result.json().data.result.images[0].url[0].endsWith(`/v1/tasks/${id}/image/0`));
+      assert.doesNotMatch(result.body,/cdn\.example/,'no upstream URL reaches the client');
+      // Non-image result proxy: same ownership rule as the image proxy; unknown kinds and other users get 404.
+      assert.equal((await app.inject({url:`/v1/tasks/${id}/media/videos/0`,headers:{authorization:'Bearer '+bob.token}})).statusCode,404);
+      assert.equal((await app.inject({url:`/v1/tasks/${id}/media/secrets/0`,headers})).statusCode,404);
+      assert.equal((await app.inject({url:`/v1/tasks/${id}/media/videos/0`,headers})).json().error.code,'media_not_found','an image task has no video result');
       assert.equal((await app.inject({url:'/v1/tasks/'+id,headers})).json().data.status,'completed');
       const charge=(await db.query('SELECT cost_cny,cost_reference FROM requests WHERE id=$1',[id])).rows[0];
       assert.equal(charge.cost_cny,'0.5');

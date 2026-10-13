@@ -1,4 +1,5 @@
 import { settleMediaRequest } from './billing.mjs';
+import { settleStatus } from './image-results.mjs';
 
 // This account's APIMart credits are CNY, as confirmed by the account owner.
 // `cost` is a different unit; never substitute it for `credits_cost`.
@@ -18,7 +19,9 @@ export async function recordTaskCharge(db, task, data) {
     await c.query('INSERT INTO audit_events(action,target_id,details) VALUES($1,$2,$3)',
       ['request.cost.sync',task.id,JSON.stringify({cost_cny:amount,source:reference})]);
     // The user-side charge settles in the same transaction as the upstream cost; the two amounts stay separate.
-    await settleMediaRequest(c,task.id,data.status);
+    // kind comes from media_tasks; a completed task without a result of that kind settles as failed (released).
+    const status = task.kind ? settleStatus(task.kind,data.status,data) : data.status;
+    await settleMediaRequest(c,task.id,status,status===data.status?undefined:(task.kind==='video'?'video_result_missing':'image_result_missing'));
     return true;
   });
 }

@@ -134,3 +134,15 @@ test('retries exhausted on 429 also release, but a 5xx stays for review',async()
   await settleRequest(f.c,uncertain,{status:'uncertain',submitted:true,errorCode:'upstream_result_uncertain'});
   assert.equal(f.state.billing.get(uncertain).state,'pending');
 });
+
+// 上游报 completed 但没有任何图片：不能标成功，更不能扣费。
+test('a completed image task without images is released, never charged',async()=>{
+  const f=fake('100');
+  const id=await reserve(f,{model:'gpt-image-2',prompt:'cat',quality:'high'});
+  const task={id,upstream_task_id:'up-empty',kind:'image'},data={id:'up-empty',status:'completed',credits_cost:0.4,result:{images:[]}};
+  assert.equal(await recordTaskCharge(f.db,task,data),true);
+  assert.deepEqual(f.state.debits,[]);
+  const bill=f.state.billing.get(id);
+  assert.equal(bill.state,'released');assert.equal(bill.charged_cny,'0');assert.equal(bill.reason,'image_result_missing');
+  assert.equal(f.state.costs.get(id),'0.4','the upstream cost is still recorded separately');
+});

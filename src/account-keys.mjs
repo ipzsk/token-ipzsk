@@ -25,14 +25,20 @@ export function accountKeyRoutes(app,{db}){
     const base=admin?'/admin/api/users/:userId/tokens':'/api/me/tokens';
     const owner=req=>admin?v.uuid(req.params.userId):req.apiUser.id;
     const guard=req=>{if(!admin&&!req.apiUser.session_id)throw httpError(403,'email_login_required');};
-    app.get(base,async req=>{guard(req);return {rows:(await db.query(`SELECT ${columns} FROM access_tokens WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200`,[owner(req)])).rows};});
+    // 用户自己管理的只有长期手工 Key：登录会话签发的网页/桌面/插件凭证随会话轮换与注销，不进列表也不能在这里撤销——
+    // 混在一起既会把手工 Key 挤出 200 行，又会让用户撤掉当前网页会话的 /v1 凭证（之后该会话永久 403）。
+    const manual=admin?'':' AND auth_session_id IS NULL AND plugin_id IS NULL';
+    app.get(base,async req=>{guard(req);return {rows:(await db.query(`SELECT ${columns} FROM access_tokens WHERE user_id=$1${manual} ORDER BY created_at DESC LIMIT 200`,[owner(req)])).rows};});
     app.post(base,async req=>{guard(req);return db.tx(c=>issueKey(c,owner(req),req.body));});
     app.post(base+'/:id/revoke',async req=>{
       guard(req);const userId=owner(req),id=v.uuid(req.params.id);
       return db.tx(async c=>{
         await c.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[userId]);
-        const r=await c.query('UPDATE access_tokens SET revoked_at=coalesce(revoked_at,now()) WHERE id=$1 AND user_id=$2 RETURNING id',[id,userId]);
-        if(!r.rowCount)throw httpError(404,'not_found');
+        const found=(await c.query(`SELECT revoked_at FROM access_tokens WHERE id=$1 AND user_id=$2${manual} FOR UPDATE`,[id,userId])).rows[0];
+        if(!found)throw httpError(404,'not_found');
+        // 重复撤销是幂等的：不改时间、不再写审计。
+        if(found.revoked_at)return {ok:true};
+        await c.query('UPDATE access_tokens SET revoked_at=now() WHERE id=$1',[id]);
         await c.query('INSERT INTO audit_events(action,target_id,details) VALUES($1,$2,$3)',['access_token.revoke',id,JSON.stringify({user_id:userId})]);return {ok:true};
       });
     });

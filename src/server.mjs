@@ -19,6 +19,7 @@ import { reconcileLanehubCharges } from './lanehub-charges.mjs';
 import { reconcileCommissions, deliverConversions } from './commissions.mjs';
 import { loadWaffo } from './waffo.mjs';
 import { deliverPayments } from './payments.mjs';
+import { finalizeAdjustments } from './lanehub-adjustments.mjs';
 
 const db = await databaseFromEnv();
 const secretDir = process.env.UPSTREAM_SECRET_DIR ?? '/run/upstream';
@@ -93,7 +94,10 @@ const syncCharges = () => upstream.syncTaskCharges().then(result => {
     if (charges.failed) app.log.warn({failed:charges.failed},'lanehub_charge_sync_failed');
   }).catch(() => app.log.error('lanehub_charge_sync_failed'))
   .then(() => reconcileCommissions(db)).then(() => deliverConversions(db,appOptions))
-  .catch(() => app.log.error('commission_sync_failed'));
+  .catch(() => app.log.error('commission_sync_failed'))
+  // lanehub 额度调整：applying 超时转人工核对；pending（远程未开始）以 CAS 接手执行；已生效未落账的退款补落账。
+  // 从不重放 applying / review。
+  .then(() => finalizeAdjustments(db,lanehub)).catch(() => app.log.error('lanehub_adjustment_sync_failed'));
 const chargeTimer = setInterval(syncCharges,120_000);
 chargeTimer.unref();
 // 形象列表预热：每次目录刷新成功后后台跑一次（10 分钟一次），失败只记日志，不挡启动。

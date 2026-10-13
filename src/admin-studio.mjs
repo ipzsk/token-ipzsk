@@ -5,6 +5,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { hash, RateLimiter } from './security.mjs';
 import { stable } from './validation.mjs';
 import { fail, isUuid, plainObject } from './studio.mjs';
+import { claimWalletGrant, reservedIdempotencyKey } from './grant-idempotency.mjs';
 import { publicAsset, OBJECT_CACHE_CONTROL } from './uploads.mjs';
 import { CASE_ID, CASE_KINDS, validCaseTemplate, withTemplateKeys, encodeCaseCursor } from './cases.mjs';
 import { enqueueThumb } from './media-thumbs.mjs';
@@ -243,7 +244,7 @@ export function adminStudioRoutes(app, options) {
     if (values.prompt === undefined) throw fail(400, 'invalid_prompt');
     if (values.category === undefined) throw fail(400, 'invalid_category');
     const key = req.headers['idempotency-key'];
-    if (key !== undefined && (typeof key !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(key))) throw fail(400, 'invalid_idempotency_key');
+    if (key !== undefined && (typeof key !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(key) || reservedIdempotencyKey(key))) throw fail(400, 'invalid_idempotency_key');
     const fingerprint = hash(JSON.stringify(stable(b)));
     const replay = async () => {
       const prior = (await db.query(`SELECT fingerprint,case_id FROM admin_idempotency WHERE user_id=$1 AND key=$2 AND created_at>now()-interval '24 hours'`,
@@ -262,7 +263,7 @@ export function adminStudioRoutes(app, options) {
         if (key) {
           const won = await c.query(`INSERT INTO admin_idempotency(user_id,key,fingerprint,case_id) VALUES($1,$2,$3,$4)
             ON CONFLICT (user_id,key) DO UPDATE SET fingerprint=EXCLUDED.fingerprint,case_id=EXCLUDED.case_id,created_at=now()
-            WHERE admin_idempotency.created_at<=now()-interval '24 hours'`, [actor, key, fingerprint, id]);
+            WHERE admin_idempotency.created_at<=now()-interval '24 hours' AND admin_idempotency.key NOT LIKE 'wallet-grant:%'`, [actor, key, fingerprint, id]);
           if (!won.rowCount) throw lostRace;
         }
         await insertCopy(c, copy);
@@ -480,14 +481,17 @@ export function adminStudioRoutes(app, options) {
     if (!g) throw fail(404, 'generation_not_found');
     return g;
   }
-  async function generationDetail(g) {
+  // Upstream cost is platform finance (admin only, like the legacy console); the client idempotency key is an
+  // operator debugging aid. viewer gets null for both (contract: nullable).
+  async function generationDetail(g, roles) {
+    const admin = roles.includes('admin'), operator = admin || roles.includes('operator');
     const refs = (await db.query(`SELECT a.* FROM generation_references gr JOIN media_assets a ON a.id=gr.asset_id WHERE gr.record_id=$1 ORDER BY gr.position`, [g.id])).rows;
     const results = g.task_id ? (await db.query(`SELECT * FROM media_assets WHERE task_id=$1 AND status='ready' ORDER BY result_index`, [g.task_id])).rows : [];
-    return { ...genSummary(g, true), failure_message: sanitizeFailure(g.task_error ?? g.error_code), request_id: g.request_id, idempotency_key: g.idempotency_key ?? null,
+    return { ...genSummary(g, true), failure_message: sanitizeFailure(g.task_error ?? g.error_code), request_id: g.request_id, idempotency_key: operator ? g.idempotency_key ?? null : null,
       upstream: { provider: g.provider_type ?? null, request_id: g.upstream_id ?? null, task_id: g.upstream_task_id ?? null, task_status: g.task_status ?? null,
         last_synced_at: g.task_synced_at ?? null },
       billing: { mode: g.provider_type === 'lanehub' ? 'lanehub' : 'local', state: { settled: 'charged', released: 'released' }[g.billing_state] ?? 'pending',
-        cost_cny: g.cost_text ?? null },
+        cost_cny: admin ? g.cost_text ?? null : null },
       thread_id: g.thread_id, anchor_record_id: g.anchor_record_id, parent_record_id: g.parent_record_id, source_case_id: g.source_case_id,
       references: refs.map(recordAsset), results: results.map(recordAsset), deleted_at: g.deleted_at };
   }
@@ -544,23 +548,23 @@ export function adminStudioRoutes(app, options) {
   });
 
   app.get('/api/admin/generations/:id', async (req) => {
-    await requireRole(req, 'viewer', 'operator', 'admin');
-    return generationDetail(await oneGeneration(req.params.id));
+    const roles = await requireRole(req, 'viewer', 'operator', 'admin');
+    return generationDetail(await oneGeneration(req.params.id), roles);
   });
 
   app.post('/api/admin/generations/:id/resync', async (req) => {
-    await requireRole(req, 'operator', 'admin');
+    const roles = await requireRole(req, 'operator', 'admin');
     writeLimit(req);
     const g = await oneGeneration(req.params.id);
     if (!(['queued', 'running'].includes(g.status) || (g.status === 'succeeded' && g.charged_points === null))) throw fail(409, 'generation_not_syncable');
     if (await resync(g) === 'upstream_unavailable') throw fail(502, 'upstream_unavailable');
     const after = await oneGeneration(g.id);
     await audit(db, req, 'generation.resync', g.id, { status_before: g.status, status_after: after.status });
-    return generationDetail(after);
+    return generationDetail(after, roles);
   });
 
   app.post('/api/admin/generations/:id/cancel', async (req) => {
-    await requireRole(req, 'operator', 'admin');
+    const roles = await requireRole(req, 'operator', 'admin');
     writeLimit(req);
     const b = body(req), reason = typeof b.reason === 'string' ? b.reason.trim() : '';
     if (!reason || reason.length > 200) throw fail(400, 'invalid_reason');
@@ -576,7 +580,7 @@ export function adminStudioRoutes(app, options) {
       await c.query(`UPDATE generation_records SET status='cancelled',failure_code='admin_cancelled',updated_at=now() WHERE id=$1`, [g.id]);
       await audit(c, req, 'generation.cancel', g.id, { from_status: cur.status, reason });
     });
-    return generationDetail(await oneGeneration(g.id));
+    return generationDetail(await oneGeneration(g.id), roles);
   });
 
   // ── 用户与角色 ──
@@ -676,7 +680,7 @@ export function adminStudioRoutes(app, options) {
   });
 
   // ── 补发余额（唯一动钱的管理接口）──
-  // Idempotency-Key 必填：同一个 key 重放只会落到同一笔补发（grant id 记在 admin_idempotency.case_id 里），
+  // Idempotency-Key 必填且永久有效：同一个 key 同参数永远落到同一笔补发（见 grant-idempotency.mjs），
   // 每一步都幂等（lanehub 侧按 reference、本地按主键），中途失败用同一个 key 重试即可补齐，不会多发。
   app.post('/api/admin/users/:id/wallet-grants', async (req) => {
     await requireRole(req, 'admin');
@@ -691,19 +695,16 @@ export function adminStudioRoutes(app, options) {
     if (typeof key !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(key)) throw fail(400, 'invalid_idempotency_key');
     const u = await userFor(req.params.id);
     const fingerprint = hash(JSON.stringify(stable({ user: u.id, amount_cny: amount.toFixed(2), reason })));
-    // A stale (>24h) key starts a new grant, same as case creation.
-    const claim = (await db.query(`INSERT INTO admin_idempotency(user_id,key,fingerprint,case_id) VALUES($1,$2,$3,$4)
-      ON CONFLICT (user_id,key) DO UPDATE SET fingerprint=EXCLUDED.fingerprint,case_id=EXCLUDED.case_id,created_at=now()
-      WHERE admin_idempotency.created_at<=now()-interval '24 hours' RETURNING case_id`, [actor, key, fingerprint, randomUUID()])).rows[0]
-      ?? (await db.query('SELECT fingerprint,case_id FROM admin_idempotency WHERE user_id=$1 AND key=$2', [actor, key])).rows[0];
-    if (claim.fingerprint && claim.fingerprint !== fingerprint) throw fail(409, 'idempotency_conflict');
-    const grantId = claim.case_id, value = amount.toFixed(2);
+    const grantId = await claimWalletGrant(db, actor, key, fingerprint), value = amount.toFixed(2);
     if (options.lanehub && await lanehubMode(db)) {
       const account = await provisionIfEnabled(db, options, { userId: u.id, name: u.name });
       if (!account) throw fail(503, 'lanehub_account_missing');
-      await creditAccount(db, options.lanehub, { userId: u.id, lanehubUserId: account.lanehub_user_id, amountCny: amount,
+      const credit = await creditAccount(db, options.lanehub, { userId: u.id, lanehubUserId: account.lanehub_user_id, amountCny: amount,
         usdCnyRate: await options.lanehub.usdRate().catch(() => options.lanehubUsdCny), quotaPerUnit: options.lanehubQuotaPerUnit,
         reference: `admin_grant:${grantId}`, remark: '平台补发：' + reason });
+      // 远程结果未知（review）或已终止时不写本地流水；人工核对确认生效后，用同一个幂等键重提即可补齐。
+      if (credit.state === 'review') throw fail(409, 'lanehub_adjustment_review');
+      if (credit.state !== 'applied') throw fail(409, 'lanehub_adjustment_not_applied');
     }
     await db.tx(async (c) => {
       await c.query('SELECT id FROM users WHERE id=$1 FOR UPDATE', [u.id]);

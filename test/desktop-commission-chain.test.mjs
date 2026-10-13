@@ -159,10 +159,12 @@ test('desktop Skill call → gateway receipt → BD and developer balances', { t
     }
     const snapshots = (await db.query('SELECT bd_cny,developer_cny FROM commission_requests ORDER BY created_at,request_id')).rows;
     assert.deepEqual(snapshots.map(r => r.bd_cny), Array(5).fill('20.00000000'));
-    assert.deepEqual(snapshots.map(r => r.developer_cny).sort(), ['0.00000000', '0.00000000', '16.00000000', '16.00000000', '16.00000000']);
-    assert.equal((await db.query('SELECT count(*) FROM commission_ledger')).rows[0].count, '8');
+    // Runtime plugin credentials come from bootstrap without install proof: only the verified Skill call pays the author.
+    assert.deepEqual(requests.map(r => r.plugin_attribution_state), ['skill_marker', 'none', 'credential_unverified', 'none', 'credential_unverified']);
+    assert.deepEqual(snapshots.map(r => r.developer_cny).sort(), ['0.00000000', '0.00000000', '0.00000000', '0.00000000', '16.00000000']);
+    assert.equal((await db.query('SELECT count(*) FROM commission_ledger')).rows[0].count, '6');
     assert.equal((await db.query('SELECT count(*) FROM commission_ledger WHERE user_id=$1',[otherDeveloper])).rows[0].count,'0');
-    for (const [role, total, kind] of [['bd', '100.00000000', 'bd'], ['developer', '48.00000000', 'developer']]) {
+    for (const [role, total, kind] of [['bd', '100.00000000', 'bd'], ['developer', '16.00000000', 'developer']]) {
       const accountAuth = auth(role); await accountAuth.restore();
       const accountView = parseIpzskCommissions(await accountAuth.commissions());
       assert.equal(accountView.balance.total_cny, total);
